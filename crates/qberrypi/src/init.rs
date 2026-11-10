@@ -51,9 +51,9 @@ const FATAL_PAUSE: Duration = Duration::from_secs(5);
 
 /// The log, from step 1 on. `fatal` saves it to the card.
 static LOG: OnceLock<&'static Mutex<LogBuf>> = OnceLock::new();
-/// The configuration, from step 4 on. `fatal` asks it whether to restore.
+/// The configuration, from step 3 on. `fatal` asks it whether to restore.
 static CONFIG: OnceLock<Config> = OnceLock::new();
-/// The watchdog; a stand-in that does nothing until step 3 opens the real one.
+/// The watchdog; a stand-in that does nothing until step 5 opens the real one.
 static WATCHDOG: Mutex<Watchdog> = Mutex::new(Watchdog::absent());
 /// Set once `fatal` has begun, so that a failure inside it ends at once.
 static FATAL_BEGUN: AtomicBool = AtomicBool::new(false);
@@ -77,9 +77,9 @@ pub fn run() -> ! {
     install_panic_hook();
     let log = start_logging(); // 1
     keep_clock_after_build(); // 2
-    open_watchdog(); // 3
-    let cfg = read_config(); // 4
-    restore_if_one_shot(cfg, &mut SdCard); // 5
+    let cfg = read_config(); // 3
+    restore_if_one_shot(cfg, &mut SdCard); // 4
+    open_watchdog(); // 5
     load_wifi_driver(cfg); // 6
     show_serving(); // 7
     provoke_module_request(); // 7, under the self-test only
@@ -117,15 +117,7 @@ fn keep_clock_after_build() {
     }
 }
 
-/// Step 3: starts the hardware watchdog. The system runs without one if it must.
-fn open_watchdog() {
-    match Watchdog::open(WATCHDOG_SECS) {
-        Ok(watchdog) => *lock(&WATCHDOG) = watchdog,
-        Err(error) => log::warn!("watchdog: {error}"),
-    }
-}
-
-/// Step 4: waits for the card and reads the configuration from it.
+/// Step 3: waits for the card and reads the configuration from it.
 fn read_config() -> &'static Config {
     if !wait_for(BOOT_DEV_WAIT, || Path::new(BOOT_DEV).exists()) {
         fatal(&format!("boot partition {BOOT_DEV} did not appear"));
@@ -145,7 +137,7 @@ fn load_config(card: &mut dyn Card) -> Result<Config, String> {
     config::parse(&text).map_err(|error| error.to_string())
 }
 
-/// Step 5: in one-shot mode, makes the next start one of Raspberry Pi OS.
+/// Step 4: in one-shot mode, makes the next start one of Raspberry Pi OS.
 ///
 /// From here on, a restart for any reason leaves qberrypi. A restore that
 /// cannot be done is logged and the boot goes on: stopping would not bring
@@ -159,6 +151,18 @@ fn restore_if_one_shot(cfg: &Config, card: &mut dyn Card) {
         Ok(Ok(outcome)) => log::info!("config.txt: {outcome:?}"),
         Ok(Err(error)) => log::error!("config.txt: {error}"),
         Err(error) => log::error!("config.txt: mounting {BOOT_DEV}: {error}"),
+    }
+}
+
+/// Step 5: starts the hardware watchdog. The system runs without one if it must.
+///
+/// Only now, with the one-shot restore done: should a board ever restart on
+/// the watchdog being started, it restarts into Raspberry Pi OS. Until here
+/// the waits and `fatal` pet the stand-in, which does nothing.
+fn open_watchdog() {
+    match Watchdog::open(WATCHDOG_SECS) {
+        Ok(watchdog) => *lock(&WATCHDOG) = watchdog,
+        Err(error) => log::warn!("watchdog: {error}"),
     }
 }
 
@@ -882,7 +886,7 @@ mod tests {
         assert_eq!(next_tick(u64::MAX, secs(600)), Some(PET_EVERY));
     }
 
-    // Step 4: the configuration.
+    // Step 3: the configuration.
 
     #[test]
     fn the_config_is_read_from_a_read_only_mount() {
@@ -945,7 +949,7 @@ mod tests {
         assert_eq!(load_config(&mut card).unwrap().hostname, "qberrypi");
     }
 
-    // Step 5: one-shot mode.
+    // Step 4: one-shot mode.
 
     #[test]
     fn one_shot_restores_config_txt_then_syncs_and_unmounts() {
