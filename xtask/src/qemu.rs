@@ -56,6 +56,11 @@ const KERNEL_ARGS_NO_CONSOLE: &str = "earlycon=pl011,0x3f201000 console=ttyAMA0,
                                       loglevel=7 qberrypi.selftest \
                                       initcall_blacklist=bcm2835_wdt_driver_init";
 
+/// The kernel arguments of the boot that keeps the watchdog driver: `KERNEL_ARGS` without
+/// the blacklist. In QEMU that boot ends where init arms the watchdog.
+const KERNEL_ARGS_WITH_WATCHDOG: &str =
+    "console=ttyAMA1,115200 panic=5 loglevel=7 qberrypi.selftest";
+
 /// How long one boot may take. The guest is emulated, not virtualised, so it is slow.
 const BOOT_TIMEOUT: Duration = Duration::from_secs(300);
 /// How often a running guest is looked at.
@@ -73,6 +78,11 @@ const NO_INITIAL_CONSOLE: &str = "Warning: unable to open an initial console.";
 const JUDGED_BY_THE_CARD: &str = "init has no console in this boot, so nothing it does can show \
     on the serial port; what it did is judged from the card alone. The serial log holds only \
     the kernel's early console";
+
+/// Printed with the scenario that keeps the watchdog driver.
+const RESET_ON_ARMING: &str = "this boot keeps the watchdog driver, and QEMU's raspi3b resets \
+    the machine the moment init arms the watchdog. It stands for a board that would do the \
+    same: by then init must have put Raspberry Pi OS's config.txt back";
 
 /// Why a guest that restarts does not end QEMU here, printed with every scenario it applies to.
 const RESTART_UNCHECKED: &str = "QEMU's raspi3b resets the machine the moment the watchdog is \
@@ -236,20 +246,23 @@ fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
-/// What the guest's kernel has for a console.
+/// The machine a scenario's guest finds itself on.
 #[derive(Debug, Clone, Copy, PartialEq)]
-enum Console {
-    /// The serial port, which is captured.
-    Serial,
-    /// None that init can open.
-    Missing,
+enum Machine {
+    /// A serial console, and no watchdog driver: `KERNEL_ARGS`.
+    Usual,
+    /// No console that init can open: `KERNEL_ARGS_NO_CONSOLE`.
+    NoConsole,
+    /// The watchdog driver left in, which resets QEMU's machine when the
+    /// watchdog is armed: `KERNEL_ARGS_WITH_WATCHDOG`.
+    WithWatchdog,
 }
 
 /// One of the boots: what is on the card, and what must hold afterwards.
 struct Scenario {
     /// As the result line names it.
     name: &'static str,
-    console: Console,
+    machine: Machine,
     /// Printed under the result line, if the result needs a word of explanation.
     note: Option<&'static str>,
     /// The name of its image and its serial log in `out/qemu/`, without the ending.
@@ -379,6 +392,15 @@ impl Evidence {
         }
     }
 
+    /// For the boot that keeps the watchdog driver: there QEMU does end when the machine is reset.
+    fn machine_was_reset(&self) -> Condition {
+        Condition::new(
+            "QEMU exited by itself: the machine was reset",
+            self.exited,
+            || "QEMU had to be stopped".into(),
+        )
+    }
+
     fn image_is_unchanged(&self) -> Condition {
         Condition::new(
             "the card image has the SHA-256 it had before the boot",
@@ -430,6 +452,18 @@ fn no_console_conditions(evidence: &Evidence) -> Vec<Condition> {
     ]
 }
 
+fn watchdog_conditions(evidence: &Evidence) -> Vec<Condition> {
+    vec![
+        evidence.serial_has("INFO  config.txt: Restored"),
+        // What the scenario is about: the reset came where init arms the
+        // watchdog, before the step after it. If init gets further, QEMU's
+        // model has changed, and `exited` can be checked in every scenario.
+        evidence.serial_lacks("INFO  modules: inserted"),
+        evidence.machine_was_reset(),
+        evidence.pios_config_is_active(),
+    ]
+}
+
 fn permanent_conditions(evidence: &Evidence) -> Vec<Condition> {
     vec![
         // Without this the two below would hold for a guest that never started init.
@@ -440,8 +474,8 @@ fn permanent_conditions(evidence: &Evidence) -> Vec<Condition> {
     ]
 }
 
-/// Makes the four scenarios from the text of `qberrypi.example.toml`.
-fn scenarios(example: &str) -> Result<[Scenario; 4]> {
+/// Makes the five scenarios from the text of `qberrypi.example.toml`.
+fn scenarios(example: &str) -> Result<[Scenario; 5]> {
     let returns = ("return_after_secs = 0", "return_after_secs = 5");
     let one_shot = edited(
         example,
@@ -471,7 +505,7 @@ fn scenarios(example: &str) -> Result<[Scenario; 4]> {
     Ok([
         Scenario {
             name: "one-shot",
-            console: Console::Serial,
+            machine: Machine::Usual,
             note: None,
             file_stem: "one-shot",
             system_config: one_shot.clone(),
@@ -479,7 +513,7 @@ fn scenarios(example: &str) -> Result<[Scenario; 4]> {
         },
         Scenario {
             name: "broken config",
-            console: Console::Serial,
+            machine: Machine::Usual,
             note: None,
             file_stem: "broken-config",
             system_config: broken,
@@ -487,7 +521,7 @@ fn scenarios(example: &str) -> Result<[Scenario; 4]> {
         },
         Scenario {
             name: "permanent",
-            console: Console::Serial,
+            machine: Machine::Usual,
             note: None,
             file_stem: "permanent",
             system_config: permanent,
@@ -495,11 +529,19 @@ fn scenarios(example: &str) -> Result<[Scenario; 4]> {
         },
         Scenario {
             name: "no console",
-            console: Console::Missing,
+            machine: Machine::NoConsole,
             note: Some(JUDGED_BY_THE_CARD),
             file_stem: "no-console",
-            system_config: one_shot,
+            system_config: one_shot.clone(),
             conditions: no_console_conditions,
+        },
+        Scenario {
+            name: "watchdog resets on arming",
+            machine: Machine::WithWatchdog,
+            note: Some(RESET_ON_ARMING),
+            file_stem: "watchdog-resets-on-arming",
+            system_config: one_shot,
+            conditions: watchdog_conditions,
         },
     ])
 }
@@ -516,7 +558,7 @@ fn edited(example: &str, edits: &[(&str, &str)]) -> Result<String> {
     Ok(text)
 }
 
-/// Boots the four scenarios and prints how each went; an error if one did not hold.
+/// Boots the five scenarios and prints how each went; an error if one did not hold.
 ///
 /// `root` is the repository root. The build in `out/qberrypi/` must be
 /// complete; the images and the serial logs go to `out/qemu/`.
@@ -572,9 +614,10 @@ fn run_scenario(scenario: &Scenario, folder: &Path) -> Result<Vec<Condition>> {
     // Taken once the image is written whole and closed.
     let image_before = file_sha256(&image)?;
 
-    let outcome = match scenario.console {
-        Console::Serial => boot(&image, BOOT_TIMEOUT)?,
-        Console::Missing => boot_with(&image, KERNEL_ARGS_NO_CONSOLE, BOOT_TIMEOUT)?,
+    let outcome = match scenario.machine {
+        Machine::Usual => boot(&image, BOOT_TIMEOUT)?,
+        Machine::NoConsole => boot_with(&image, KERNEL_ARGS_NO_CONSOLE, BOOT_TIMEOUT)?,
+        Machine::WithWatchdog => boot_with(&image, KERNEL_ARGS_WITH_WATCHDOG, BOOT_TIMEOUT)?,
     };
     fs::write(&log, &outcome.serial).with_context(|| format!("cannot write {}", log.display()))?;
 
@@ -842,13 +885,18 @@ mod tests {
 
     #[test]
     fn the_scenarios_differ_from_the_example_only_in_their_debug_settings() {
-        let [one_shot, broken, permanent, no_console] = scenarios(EXAMPLE).unwrap();
+        let [one_shot, broken, permanent, no_console, watchdog] = scenarios(EXAMPLE).unwrap();
 
         assert_eq!(
-            (one_shot.name, broken.name, permanent.name, no_console.name),
-            ("one-shot", "broken config", "permanent", "no console")
+            (one_shot.name, broken.name, permanent.name),
+            ("one-shot", "broken config", "permanent")
+        );
+        assert_eq!(
+            (no_console.name, watchdog.name),
+            ("no console", "watchdog resets on arming")
         );
         assert_eq!(no_console.system_config, one_shot.system_config);
+        assert_eq!(watchdog.system_config, one_shot.system_config);
         let changed = |text: &str| -> Vec<String> {
             let lines = text.lines().zip(EXAMPLE.lines());
             lines
@@ -870,19 +918,24 @@ mod tests {
     }
 
     #[test]
-    fn only_the_no_console_scenario_boots_without_a_console_and_says_so() {
+    fn a_scenario_on_another_machine_than_the_usual_one_says_so() {
         let scenarios = scenarios(EXAMPLE).unwrap();
 
-        let without: Vec<&str> = scenarios
-            .iter()
-            .filter(|scenario| scenario.console == Console::Missing)
-            .map(|scenario| scenario.name)
-            .collect();
-        assert_eq!(without, ["no console"]);
+        let machines: Vec<Machine> = scenarios.iter().map(|s| s.machine).collect();
+        assert_eq!(
+            machines,
+            [
+                Machine::Usual,
+                Machine::Usual,
+                Machine::Usual,
+                Machine::NoConsole,
+                Machine::WithWatchdog
+            ]
+        );
         for scenario in &scenarios {
             assert_eq!(
                 scenario.note.is_some(),
-                scenario.console == Console::Missing,
+                scenario.machine != Machine::Usual,
                 "{}",
                 scenario.name
             );
@@ -890,7 +943,106 @@ mod tests {
         let stems: Vec<&str> = scenarios.iter().map(|s| s.file_stem).collect();
         assert_eq!(
             stems,
-            ["one-shot", "broken-config", "permanent", "no-console"]
+            [
+                "one-shot",
+                "broken-config",
+                "permanent",
+                "no-console",
+                "watchdog-resets-on-arming"
+            ]
+        );
+    }
+
+    #[test]
+    fn the_boot_with_the_watchdog_differs_only_in_keeping_its_driver() {
+        let usual: Vec<&str> = KERNEL_ARGS.split(' ').collect();
+        let with_watchdog: Vec<&str> = KERNEL_ARGS_WITH_WATCHDOG.split(' ').collect();
+
+        let kept: Vec<&str> = usual
+            .iter()
+            .copied()
+            .filter(|arg| !arg.starts_with("initcall_blacklist="))
+            .collect();
+        assert_eq!(with_watchdog, kept);
+        assert_eq!(usual.len(), kept.len() + 1);
+        assert!(!KERNEL_ARGS_WITH_WATCHDOG.contains("blacklist"));
+    }
+
+    /// What the boot with the watchdog driver leaves behind when it went well, in QEMU.
+    fn good_watchdog_evidence() -> Evidence {
+        Evidence {
+            serial: format!(
+                "[    1.6] Run /init as init process\n\
+                 [   0.001] INFO  qberrypi {} (build 1700000000)\n\
+                 [   0.008] INFO  clock: set to the build time\n\
+                 [   0.050] INFO  config.txt: Restored\n",
+                qberrypi::VERSION
+            ),
+            exited: true,
+            system_log: Err("cannot read qberrypi/log.txt".into()),
+            ..good_evidence()
+        }
+    }
+
+    #[test]
+    fn a_reset_on_arming_after_the_restore_fails_no_condition() {
+        let conditions = watchdog_conditions(&good_watchdog_evidence());
+
+        assert_eq!(failures(&conditions), [""; 0]);
+        assert_eq!(conditions.len(), 4);
+        // Here QEMU does end by itself, so nothing is left unchecked.
+        assert!(
+            conditions
+                .iter()
+                .all(|condition| condition.verdict == Verdict::Holds)
+        );
+    }
+
+    #[test]
+    fn a_reset_on_arming_before_the_restore_leaves_the_card_starting_qberrypi() {
+        // The watchdog opened before the configuration was read: the reset comes first.
+        let mut evidence = good_watchdog_evidence();
+        evidence.serial = evidence
+            .serial
+            .replace("[   0.050] INFO  config.txt: Restored\n", "");
+        evidence.active_config = Ok(CONFIG_TXT.as_bytes().to_vec());
+
+        let conditions = watchdog_conditions(&evidence);
+
+        assert_eq!(
+            failures(&conditions),
+            [
+                "the serial console has `INFO  config.txt: Restored`",
+                "config.txt on the card equals config.pios.txt",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_boot_that_got_past_the_arming_is_not_the_watchdog_scenario() {
+        let mut evidence = good_watchdog_evidence();
+        evidence
+            .serial
+            .push_str("[   0.170] INFO  modules: inserted rfkill, cfg80211\n");
+
+        let conditions = watchdog_conditions(&evidence);
+
+        assert_eq!(
+            failures(&conditions),
+            ["the serial console does not have `INFO  modules: inserted`"]
+        );
+    }
+
+    #[test]
+    fn a_boot_with_the_watchdog_that_had_to_be_stopped_fails() {
+        let mut evidence = good_watchdog_evidence();
+        evidence.exited = false;
+
+        let conditions = watchdog_conditions(&evidence);
+
+        assert_eq!(
+            failures(&conditions),
+            ["QEMU exited by itself: the machine was reset"]
         );
     }
 
