@@ -44,6 +44,18 @@ const CHECKSUMS: &str = "SHA256SUMS";
 const KERNEL_ARGS: &str = "console=ttyAMA1,115200 panic=5 loglevel=7 qberrypi.selftest \
                            initcall_blacklist=bcm2835_wdt_driver_init";
 
+/// The kernel arguments of the boot without a console: `KERNEL_ARGS` but for the console.
+///
+/// - `console=ttyAMA0`: a serial port this device tree does not have. The
+///   kernel then has no console to open for init, and starts it with nothing
+///   open, which is what a mistyped `console=` does on the Pi.
+/// - `earlycon=pl011,0x3f201000`: lets the kernel's own messages through to
+///   the serial port, so that the end of the boot can be seen. It is not a
+///   console a program can open; nothing init writes goes there.
+const KERNEL_ARGS_NO_CONSOLE: &str = "earlycon=pl011,0x3f201000 console=ttyAMA0,115200 panic=5 \
+                                      loglevel=7 qberrypi.selftest \
+                                      initcall_blacklist=bcm2835_wdt_driver_init";
+
 /// How long one boot may take. The guest is emulated, not virtualised, so it is slow.
 const BOOT_TIMEOUT: Duration = Duration::from_secs(300);
 /// How often a running guest is looked at.
@@ -53,6 +65,14 @@ const POLL_EVERY: Duration = Duration::from_millis(100);
 const RESTART_REQUESTED: &str = "reboot: Restarting system";
 /// What the kernel prints when it has no way to restart the machine. Nothing follows it.
 const GUEST_HALTED: &str = "Reboot failed -- System halted";
+
+/// What the kernel prints when it starts init with no console open.
+const NO_INITIAL_CONSOLE: &str = "Warning: unable to open an initial console.";
+
+/// Printed with the scenario that boots without a console.
+const JUDGED_BY_THE_CARD: &str = "init has no console in this boot, so nothing it does can show \
+    on the serial port; what it did is judged from the card alone. The serial log holds only \
+    the kernel's early console";
 
 /// Why a guest that restarts does not end QEMU here, printed with every scenario it applies to.
 const RESTART_UNCHECKED: &str = "QEMU's raspi3b resets the machine the moment the watchdog is \
@@ -93,8 +113,14 @@ pub struct Outcome {
 /// Returns when QEMU ends, when the guest's kernel has halted, or after
 /// `timeout`, whichever is first. QEMU is not left running in any case.
 pub fn boot(image: &Path, timeout: Duration) -> Result<Outcome> {
+    boot_with(image, KERNEL_ARGS, timeout)
+}
+
+/// Like `boot`, with the kernel arguments given.
+fn boot_with(image: &Path, kernel_args: &str, timeout: Duration) -> Result<Outcome> {
     let boot_folder = crate::workspace_root().join(BOOT_FOLDER);
-    let (serial, exited) = run_guest(qemu_command(&boot_folder, image), timeout)?;
+    let command = qemu_command(&boot_folder, image, kernel_args);
+    let (serial, exited) = run_guest(command, timeout)?;
     Ok(Outcome {
         serial,
         exited,
@@ -103,7 +129,7 @@ pub fn boot(image: &Path, timeout: Duration) -> Result<Outcome> {
 }
 
 /// The QEMU invocation that boots the build in `boot_folder` from a card image.
-fn qemu_command(boot_folder: &Path, image: &Path) -> Command {
+fn qemu_command(boot_folder: &Path, image: &Path, kernel_args: &str) -> Command {
     // A comma ends a value in QEMU's option lists; a doubled one stands for itself.
     let image = image.to_string_lossy().replace(',', ",,");
     let mut command = Command::new(QEMU);
@@ -116,7 +142,7 @@ fn qemu_command(boot_folder: &Path, image: &Path) -> Command {
         .arg(boot_folder.join(DEVICE_TREE))
         .arg("-initrd")
         .arg(boot_folder.join(INITRAMFS))
-        .args(["-append", KERNEL_ARGS])
+        .args(["-append", kernel_args])
         .arg("-drive")
         .arg(format!("file={image},if=sd,format=raw"));
     command
@@ -210,10 +236,22 @@ fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
-/// One of the three boots: what is on the card, and what must hold afterwards.
+/// What the guest's kernel has for a console.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Console {
+    /// The serial port, which is captured.
+    Serial,
+    /// None that init can open.
+    Missing,
+}
+
+/// One of the boots: what is on the card, and what must hold afterwards.
 struct Scenario {
     /// As the result line names it.
     name: &'static str,
+    console: Console,
+    /// Printed under the result line, if the result needs a word of explanation.
+    note: Option<&'static str>,
     /// The name of its image and its serial log in `out/qemu/`, without the ending.
     file_stem: &'static str,
     /// The text of `qberrypi/qberrypi.toml` on its card.
@@ -380,6 +418,18 @@ fn broken_config_conditions(evidence: &Evidence) -> Vec<Condition> {
     ]
 }
 
+fn no_console_conditions(evidence: &Evidence) -> Vec<Condition> {
+    vec![
+        // What the scenario is about: without this it would be one-shot over again.
+        evidence.serial_has(NO_INITIAL_CONSOLE),
+        evidence.restart_requested(),
+        evidence.exited(),
+        evidence.pios_config_is_active(),
+        evidence.log_has(&banner_start()),
+        evidence.log_lacks(PASSPHRASE),
+    ]
+}
+
 fn permanent_conditions(evidence: &Evidence) -> Vec<Condition> {
     vec![
         // Without this the two below would hold for a guest that never started init.
@@ -390,8 +440,8 @@ fn permanent_conditions(evidence: &Evidence) -> Vec<Condition> {
     ]
 }
 
-/// Makes the three scenarios from the text of `qberrypi.example.toml`.
-fn scenarios(example: &str) -> Result<[Scenario; 3]> {
+/// Makes the four scenarios from the text of `qberrypi.example.toml`.
+fn scenarios(example: &str) -> Result<[Scenario; 4]> {
     let returns = ("return_after_secs = 0", "return_after_secs = 5");
     let one_shot = edited(
         example,
@@ -421,21 +471,35 @@ fn scenarios(example: &str) -> Result<[Scenario; 3]> {
     Ok([
         Scenario {
             name: "one-shot",
+            console: Console::Serial,
+            note: None,
             file_stem: "one-shot",
-            system_config: one_shot,
+            system_config: one_shot.clone(),
             conditions: one_shot_conditions,
         },
         Scenario {
             name: "broken config",
+            console: Console::Serial,
+            note: None,
             file_stem: "broken-config",
             system_config: broken,
             conditions: broken_config_conditions,
         },
         Scenario {
             name: "permanent",
+            console: Console::Serial,
+            note: None,
             file_stem: "permanent",
             system_config: permanent,
             conditions: permanent_conditions,
+        },
+        Scenario {
+            name: "no console",
+            console: Console::Missing,
+            note: Some(JUDGED_BY_THE_CARD),
+            file_stem: "no-console",
+            system_config: one_shot,
+            conditions: no_console_conditions,
         },
     ])
 }
@@ -452,7 +516,7 @@ fn edited(example: &str, edits: &[(&str, &str)]) -> Result<String> {
     Ok(text)
 }
 
-/// Boots the three scenarios and prints how each went; an error if one did not hold.
+/// Boots the four scenarios and prints how each went; an error if one did not hold.
 ///
 /// `root` is the repository root. The build in `out/qberrypi/` must be
 /// complete; the images and the serial logs go to `out/qemu/`.
@@ -471,7 +535,8 @@ pub fn run_all(root: &Path) -> Result<()> {
         let started = Instant::now();
         let conditions = run_scenario(scenario, &folder)
             .with_context(|| format!("{}: could not be run", scenario.name))?;
-        let (report, held) = scenario_report(scenario.name, &conditions, started.elapsed());
+        let (report, held) =
+            scenario_report(scenario.name, scenario.note, &conditions, started.elapsed());
         print!("{report}");
         if !held {
             let log = folder.join(scenario.file_stem).with_extension("log");
@@ -507,7 +572,10 @@ fn run_scenario(scenario: &Scenario, folder: &Path) -> Result<Vec<Condition>> {
     // Taken once the image is written whole and closed.
     let image_before = file_sha256(&image)?;
 
-    let outcome = boot(&image, BOOT_TIMEOUT)?;
+    let outcome = match scenario.console {
+        Console::Serial => boot(&image, BOOT_TIMEOUT)?,
+        Console::Missing => boot_with(&image, KERNEL_ARGS_NO_CONSOLE, BOOT_TIMEOUT)?,
+    };
     fs::write(&log, &outcome.serial).with_context(|| format!("cannot write {}", log.display()))?;
 
     let read =
@@ -525,9 +593,15 @@ fn run_scenario(scenario: &Scenario, folder: &Path) -> Result<Vec<Condition>> {
 
 /// Lays out a scenario's result, and says whether every condition that can be checked held.
 ///
-/// The first line is `{name}: ok` or `{name}: FAILED`. Each condition that
-/// failed or could not be checked follows on lines of its own.
-fn scenario_report(name: &str, conditions: &[Condition], took: Duration) -> (String, bool) {
+/// The first line is `{name}: ok` or `{name}: FAILED`. The scenario's note,
+/// if it has one, and each condition that failed or could not be checked
+/// follow on lines of their own.
+fn scenario_report(
+    name: &str,
+    note: Option<&str>,
+    conditions: &[Condition],
+    took: Duration,
+) -> (String, bool) {
     let count = |wanted: fn(&Verdict) -> bool| {
         conditions
             .iter()
@@ -548,6 +622,9 @@ fn scenario_report(name: &str, conditions: &[Condition], took: Duration) -> (Str
         report.push_str(&format!(", {unchecked} cannot be checked in QEMU"));
     }
     report.push_str(")\n");
+    if let Some(note) = note {
+        report.push_str(&format!("  note: {note}.\n"));
+    }
     for condition in conditions {
         match &condition.verdict {
             Verdict::Holds => {}
@@ -726,7 +803,11 @@ mod tests {
 
     #[test]
     fn qemu_gets_the_build_the_card_and_nothing_of_this_machine() {
-        let command = qemu_command(Path::new("/repo/out/qberrypi"), Path::new("/x/a,b.img"));
+        let command = qemu_command(
+            Path::new("/repo/out/qberrypi"),
+            Path::new("/x/a,b.img"),
+            KERNEL_ARGS,
+        );
 
         assert_eq!(command.get_program(), OsStr::new("qemu-system-aarch64"));
         let args: Vec<&str> = command.get_args().map(|a| a.to_str().unwrap()).collect();
@@ -761,12 +842,13 @@ mod tests {
 
     #[test]
     fn the_scenarios_differ_from_the_example_only_in_their_debug_settings() {
-        let [one_shot, broken, permanent] = scenarios(EXAMPLE).unwrap();
+        let [one_shot, broken, permanent, no_console] = scenarios(EXAMPLE).unwrap();
 
         assert_eq!(
-            (one_shot.name, broken.name, permanent.name),
-            ("one-shot", "broken config", "permanent")
+            (one_shot.name, broken.name, permanent.name, no_console.name),
+            ("one-shot", "broken config", "permanent", "no console")
         );
+        assert_eq!(no_console.system_config, one_shot.system_config);
         let changed = |text: &str| -> Vec<String> {
             let lines = text.lines().zip(EXAMPLE.lines());
             lines
@@ -785,6 +867,112 @@ mod tests {
         assert_eq!(changed(&permanent.system_config), ["return_after_secs = 5"]);
         assert_eq!(broken.system_config, "this is not toml");
         assert!(one_shot.system_config.contains(PASSPHRASE));
+    }
+
+    #[test]
+    fn only_the_no_console_scenario_boots_without_a_console_and_says_so() {
+        let scenarios = scenarios(EXAMPLE).unwrap();
+
+        let without: Vec<&str> = scenarios
+            .iter()
+            .filter(|scenario| scenario.console == Console::Missing)
+            .map(|scenario| scenario.name)
+            .collect();
+        assert_eq!(without, ["no console"]);
+        for scenario in &scenarios {
+            assert_eq!(
+                scenario.note.is_some(),
+                scenario.console == Console::Missing,
+                "{}",
+                scenario.name
+            );
+        }
+        let stems: Vec<&str> = scenarios.iter().map(|s| s.file_stem).collect();
+        assert_eq!(
+            stems,
+            ["one-shot", "broken-config", "permanent", "no-console"]
+        );
+    }
+
+    #[test]
+    fn the_boot_without_a_console_names_a_serial_port_that_is_not_there() {
+        let with: Vec<&str> = KERNEL_ARGS.split(' ').collect();
+        let without: Vec<&str> = KERNEL_ARGS_NO_CONSOLE.split(' ').collect();
+
+        // The one port the guest has is ttyAMA1; an early console is not one init can open.
+        assert!(with.contains(&"console=ttyAMA1,115200"));
+        assert!(without.contains(&"console=ttyAMA0,115200"));
+        assert!(without.contains(&"earlycon=pl011,0x3f201000"));
+        // Everything else is the same in both.
+        let rest = |args: &[&'static str]| -> Vec<&'static str> {
+            let other = |arg: &&str| !arg.starts_with("console=") && !arg.starts_with("earlycon=");
+            args.iter().copied().filter(other).collect()
+        };
+        assert_eq!(rest(&with), rest(&without));
+    }
+
+    /// What the boot without a console leaves behind when it went well, in QEMU.
+    fn good_no_console_evidence() -> Evidence {
+        Evidence {
+            serial: "[    1.5] Warning: unable to open an initial console.\n\
+                     [    1.6] Run /init as init process\n\
+                     [   22.1] reboot: Restarting system\n\
+                     [   22.2] Reboot failed -- System halted\n"
+                .to_owned(),
+            system_log: Ok(format!(
+                "==== boot, build 1700000000 ====\n\
+                 [   0.003] INFO  qberrypi {} (build 1700000000)\n\
+                 [   0.005] WARN  /dev/console: No such device (os error 19)\n",
+                qberrypi::VERSION
+            )),
+            ..good_evidence()
+        }
+    }
+
+    #[test]
+    fn a_good_boot_without_a_console_fails_no_condition() {
+        let conditions = no_console_conditions(&good_no_console_evidence());
+
+        assert_eq!(failures(&conditions), [""; 0]);
+        assert_eq!(conditions.len(), 6);
+    }
+
+    #[test]
+    fn a_boot_without_a_console_is_judged_by_the_card() {
+        // Init died before it did anything: nothing restored, no log.
+        let mut evidence = good_no_console_evidence();
+        evidence.active_config = Ok(CONFIG_TXT.as_bytes().to_vec());
+        evidence.system_log = Err("cannot read qberrypi/log.txt".into());
+        evidence.serial = evidence.serial.replace("reboot: Restarting system\n", "");
+
+        let conditions = no_console_conditions(&evidence);
+
+        assert_eq!(
+            failures(&conditions),
+            [
+                "the serial console has the kernel's `reboot: Restarting system`",
+                "QEMU exited by itself: the guest restarted the machine",
+                "config.txt on the card equals config.pios.txt",
+                &format!(
+                    "qberrypi/log.txt on the card has `qberrypi {} (build `",
+                    qberrypi::VERSION
+                ),
+                "qberrypi/log.txt on the card does not have `example-passphrase`",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_boot_that_had_a_console_after_all_is_not_the_no_console_scenario() {
+        let mut evidence = good_no_console_evidence();
+        evidence.serial = good_serial();
+
+        let conditions = no_console_conditions(&evidence);
+
+        assert_eq!(
+            failures(&conditions),
+            ["the serial console has `Warning: unable to open an initial console.`"]
+        );
     }
 
     #[test]
@@ -970,7 +1158,8 @@ mod tests {
     fn a_report_starts_with_the_name_and_ok_when_nothing_failed() {
         let conditions = one_shot_conditions(&good_evidence());
 
-        let (report, held) = scenario_report("one-shot", &conditions, Duration::from_secs(42));
+        let (report, held) =
+            scenario_report("one-shot", None, &conditions, Duration::from_secs(42));
 
         assert!(held);
         let mut lines = report.lines();
@@ -994,7 +1183,7 @@ mod tests {
         evidence.active_config = Ok(b"os_prefix=qberrypi/\n".to_vec());
 
         let conditions = one_shot_conditions(&evidence);
-        let (report, held) = scenario_report("one-shot", &conditions, Duration::from_secs(7));
+        let (report, held) = scenario_report("one-shot", None, &conditions, Duration::from_secs(7));
 
         assert!(!held);
         assert_eq!(
@@ -1003,6 +1192,28 @@ mod tests {
              FAILED: config.txt on the card equals config.pios.txt: \
              it is \"os_prefix=qberrypi/\\n\"\n"
         );
+    }
+
+    #[test]
+    fn a_report_puts_the_scenarios_note_under_its_first_line() {
+        let conditions = no_console_conditions(&good_no_console_evidence());
+
+        let (report, held) = scenario_report(
+            "no console",
+            Some("judged by the card"),
+            &conditions,
+            Duration::from_secs(23),
+        );
+
+        assert!(held);
+        let lines: Vec<&str> = report.lines().collect();
+        assert_eq!(
+            lines[0],
+            "no console: ok (23 s; 5 of 6 conditions hold, 1 cannot be checked in QEMU)"
+        );
+        assert_eq!(lines[1], "  note: judged by the card.");
+        assert!(lines[2].starts_with("  cannot be checked in QEMU: "));
+        assert_eq!(lines.len(), 3);
     }
 
     #[test]
