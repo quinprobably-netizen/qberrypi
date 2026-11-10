@@ -153,6 +153,20 @@ disable_overscan=1
 # Run as fast as the firmware and the board allow.
 arm_boost=1
 
+# How much memory the graphics processor keeps for itself, in megabytes.
+#gpu_mem=64
+
+# Settings for a display that the automatic detection gets wrong.
+#hdmi_force_hotplug=1
+#hdmi_group=1
+#hdmi_mode=16
+
+# Turn the picture for a display that is mounted on its side.
+#display_rotate=1
+
+# The remote control receiver, and the pin it is wired to.
+#dtoverlay=gpio-ir,gpio_pin=17
+
 [cm4]
 # On the compute module, the USB controller is off unless it is asked for.
 otg_mode=1
@@ -1309,7 +1323,7 @@ mod tests {
     #[test]
     fn the_saved_configuration_is_as_long_as_a_stock_one_and_one_that_init_restores() {
         // Longer than qberrypi's own config.txt: the restore has to make the file grow.
-        assert!(PIOS.len() > 1000, "{} bytes", PIOS.len());
+        assert!(PIOS.len() > 1400, "{} bytes", PIOS.len());
         assert!(PIOS.len() > 4 * CONFIG_TXT.len());
         assert!(PIOS.is_ascii() && PIOS.ends_with('\n'));
 
