@@ -1,6 +1,8 @@
 //! qberrypi: everything above the kernel, in one executable.
 
 pub mod config;
+pub mod kmsg;
+pub mod logbuf;
 
 /// Crate version, shown in the boot banner.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
