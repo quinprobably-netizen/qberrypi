@@ -14,11 +14,14 @@
 //! 5. Copy: the staged files go into the `qberrypi` folder.
 //! 6. Verify: the copies are read back against `SHA256SUMS`.
 //! 7. The stage directory is removed.
-//! 8. Select: qberrypi's `config.txt` is copied over `config.txt`.
+//! 8. Select: qberrypi's `config.txt` is written over `config.txt`. If that
+//!    fails, the saved file is put back.
 //! 9. `sync`, then the restart.
 //!
 //! Up to step 8 the script only ever moves `config.txt` towards Raspberry Pi
 //! OS, so a script that stops early leaves a Pi that starts Raspberry Pi OS.
+//! Like init, it writes `config.txt` in place and then cuts it to length, so
+//! the file is never empty on the way.
 //!
 //! Every external command is built as a program with its arguments by a
 //! function of its own and run through a [`Runner`], so tests can read the
@@ -471,9 +474,11 @@ const SCRIPT_HEAD: &str = r"#!/bin/sh
 #   5. Copy: the staged files go into the qberrypi folder.
 #   6. Verify: the copies are read back against SHA256SUMS.
 #   7. The stage directory is removed.
-#   8. Select: qberrypi's config.txt is copied over config.txt.
+#   8. Select: qberrypi's config.txt is written over config.txt. If that
+#      fails, config.pios.txt is put back.
 #   9. sync, then the restart.
-# Before step 8, config.txt is only ever moved towards Raspberry Pi OS.
+# Before step 8, config.txt is only ever moved towards Raspberry Pi OS. It is
+# always written in place and then cut to length, never emptied first.
 #
 # The work is done by main, which the last line calls: a script that arrives
 # cut short does nothing.
@@ -523,6 +528,21 @@ restorable() {
     reason='cannot be read'
     [ "$found" -eq 1 ] || return 1
     reason=
+}
+
+# Makes config.txt hold what the file "$1" holds, the way init does it: the new
+# bytes go over the old ones and only then is an old tail cut off. The file is
+# at no moment empty and keeps its place on the card, which a copy that
+# empties it first would not promise. Then the card is synced and the file
+# read back. Fails if any of that does, or if "$1" is empty.
+write_config() {
+    # Without the blanks that some versions of wc put before the number.
+    new_size=$(wc -c <"$1" | tr -d ' \t')
+    [ "$new_size" -gt 0 ] || return 1
+    dd if="$1" of="$active" conv=notrunc 2>/dev/null || return 1
+    truncate -s "$new_size" "$active" || return 1
+    sync || return 1
+    cmp -s -- "$1" "$active"
 }
 
 # Copies the staged files into the folder on the card and reads them back
@@ -598,6 +618,9 @@ main() {
         cp -- "$active" "$backup.new"
         cmp -s -- "$active" "$backup.new" ||
             die "$backup_refused" "the copy of config.txt does not read back the same; config.txt was not changed"
+        # The copy is on the card before it gets the name, so the name never
+        # stands for bytes that were not written yet.
+        sync
         mv -- "$backup.new" "$backup"
         sync
     fi
@@ -626,10 +649,8 @@ main() {
         # configuration goes back first: from here to step 8 a restart, or a
         # stop of this script, leaves Raspberry Pi OS.
         say "config.txt selects qberrypi from an earlier deploy; putting config.pios.txt back while the build is replaced"
-        if ! cp -- "$backup" "$active" || ! cmp -s -- "$backup" "$active"; then
-            die "$config_not_written" "config.txt could not be written and may be damaged. Before the Pi restarts, put the saved one back, on the Pi: sudo cp $backup $active"
-        fi
-        sync
+        write_config "$backup" ||
+            die "$config_not_written" "the saved configuration could not be put back: config.txt may still select qberrypi, or may be damaged. The folder $own was not touched. Before the Pi restarts, put the saved one back, on the Pi: sudo cp $backup $active"
     fi
 
     # 5 and 6. Copy and verify. The build goes beside whatever the folder holds
@@ -644,8 +665,11 @@ main() {
 
     # 8. Select. From here on the next start is qberrypi.
     say "selecting qberrypi"
-    if ! cp -- "$own/config.txt" "$active" || ! cmp -s -- "$own/config.txt" "$active"; then
-        die "$config_not_written" "config.txt could not be written and may be damaged. Before the Pi restarts, put the saved one back, on the Pi: sudo cp $backup $active"
+    if ! write_config "$own/config.txt"; then
+        if write_config "$backup"; then
+            die "$config_not_written" "config.txt could not be made to select qberrypi. The saved configuration was put back and reads back the same, so the next restart is Raspberry Pi OS"
+        fi
+        die "$config_not_written" "config.txt could not be made to select qberrypi, and putting the saved configuration back failed too: config.txt may be damaged. Before the Pi restarts, put the saved one back, on the Pi: sudo cp $backup $active"
     fi
     say "qberrypi is selected; restarting"
 
@@ -1723,6 +1747,7 @@ mod tests {
                     "sync: PIOS / OLD KERNEL",
                     "sync: PIOS / KERNEL",
                     "sync: os_prefix=qberrypi/ / KERNEL",
+                    "sync: os_prefix=qberrypi/ / KERNEL",
                     "restart: os_prefix=qberrypi/",
                 ],
                 "{shell}"
@@ -2090,22 +2115,236 @@ mod tests {
 
     #[test]
     fn the_card_is_synced_after_selecting_and_before_the_restart() {
+        // This stand-in for sync also records how far the saving of the backup has come.
+        let sync = "sync() { printf 'sync: %s new=%s saved=%s\\n' \
+            \"$(cat \"$QBERRYPI_TEST_BOOT/config.txt\")\" \
+            \"$(test -e \"$QBERRYPI_TEST_BOOT/config.pios.txt.new\" && echo yes || echo no)\" \
+            \"$(test -e \"$QBERRYPI_TEST_BOOT/config.pios.txt\" && echo yes || echo no)\" \
+            >>\"$QBERRYPI_TEST_TRACE\"; }\n";
         for shell in shells() {
             let card = Card::fresh();
-            assert_eq!(card.run(shell).status, Some(0));
+            let ran = card.run_text(shell, &card.script().render(), sync);
+            assert_eq!(ran.status, Some(0), "{shell}: {}", ran.stderr);
             let trace = card.trace();
             let lines: Vec<&str> = trace.lines().collect();
-            let last_two = &lines[lines.len() - 2..];
             assert_eq!(
-                last_two,
-                ["sync: os_prefix=qberrypi/", "restart: os_prefix=qberrypi/"],
-                "{trace}"
+                lines,
+                [
+                    // The copy is on the card before it gets the name of the backup.
+                    "sync: PIOS new=yes saved=no",
+                    "sync: PIOS new=no saved=yes",
+                    // Before the copies of the build are read back.
+                    "sync: PIOS new=no saved=yes",
+                    // The write of config.txt, and once more before the restart.
+                    "sync: os_prefix=qberrypi/ new=no saved=yes",
+                    "sync: os_prefix=qberrypi/ new=no saved=yes",
+                    "restart: os_prefix=qberrypi/",
+                ],
+                "{shell}"
             );
-            assert_eq!(trace.matches("restart").count(), 1, "{trace}");
-            // Every earlier sync saw the configuration of Raspberry Pi OS.
-            for line in &lines[..lines.len() - 2] {
-                assert_eq!(*line, "sync: PIOS", "{trace}");
+        }
+    }
+
+    /// Makes every write of `config.txt` fail before it has written anything.
+    const DD_FAILS: &str = "dd() { return 1; }\n";
+    /// Makes every write of `config.txt` fail after it has ruined the file.
+    const DD_RUINS: &str =
+        "dd() { printf 'GARBAGE' >\"$QBERRYPI_TEST_BOOT/config.txt\"; return 1; }\n";
+    /// The same, but only for the write that selects qberrypi; other writes work.
+    const DD_RUINS_THE_SELECT: &str = "dd() { case \"$*\" in \
+        *qberrypi/config.txt*) printf 'GARBAGE' >\"$QBERRYPI_TEST_BOOT/config.txt\"; return 1 ;; \
+        *) command dd \"$@\" ;; esac; }\n";
+    /// Makes every write of `config.txt` report success after writing something else.
+    const DD_LIES: &str =
+        "dd() { printf 'GARBAGE-GARBAGE-GARBAGE-GARBAGE' >\"$QBERRYPI_TEST_BOOT/config.txt\"; }\n";
+    /// Lets the write through but not the cutting of the old tail.
+    const TRUNCATE_FAILS: &str = "truncate() { return 1; }\n";
+
+    /// What the script tells the owner to run when it leaves a `config.txt` it could not write.
+    fn put_back_command(card: &Card) -> String {
+        format!(
+            "sudo cp {} {}",
+            card.boot.join("config.pios.txt").display(),
+            card.boot.join("config.txt").display()
+        )
+    }
+
+    #[test]
+    fn a_select_that_fails_puts_raspberry_pi_os_back_itself() {
+        for shell in shells() {
+            let card = Card::fresh();
+            let fakes = format!("{FAKE_SYNC}{DD_RUINS_THE_SELECT}");
+            let ran = card.run_text(shell, &card.script().render(), &fakes);
+            assert_eq!(
+                ran.status,
+                Some(CONFIG_NOT_WRITTEN),
+                "{shell}: {}",
+                ran.stderr
+            );
+            assert_eq!(CONFIG_NOT_WRITTEN, 9);
+            // The ruined file is whole again: the saved bytes and nothing after them.
+            assert_eq!(card.read_boot("config.txt"), PIOS.as_bytes());
+            assert_eq!(card.read_boot("config.pios.txt"), PIOS.as_bytes());
+            assert!(
+                ran.stderr.contains("the next restart is Raspberry Pi OS"),
+                "{}",
+                ran.stderr
+            );
+            assert!(!ran.stdout.contains(SELECTED_MARKER));
+            assert!(!card.trace().contains("restart"));
+        }
+    }
+
+    #[test]
+    fn a_select_that_fails_and_cannot_be_undone_says_what_state_the_card_is_in() {
+        for shell in shells() {
+            for (fake, left) in [
+                (DD_FAILS, Some(PIOS)),
+                (DD_RUINS, Some("GARBAGE")),
+                // Only reading the file back shows that these two went wrong.
+                (DD_LIES, None),
+                (TRUNCATE_FAILS, None),
+            ] {
+                let card = Card::fresh();
+                let fakes = format!("{FAKE_SYNC}{fake}");
+                let ran = card.run_text(shell, &card.script().render(), &fakes);
+                assert_eq!(
+                    ran.status,
+                    Some(CONFIG_NOT_WRITTEN),
+                    "{shell}: {}",
+                    ran.stderr
+                );
+                if let Some(left) = left {
+                    assert_eq!(card.read_boot("config.txt"), left.as_bytes());
+                }
+                assert_eq!(card.read_boot("config.pios.txt"), PIOS.as_bytes());
+                assert!(ran.stderr.contains("may be damaged"), "{}", ran.stderr);
+                assert!(
+                    ran.stderr.contains(&put_back_command(&card)),
+                    "{}",
+                    ran.stderr
+                );
+                assert!(!ran.stdout.contains(SELECTED_MARKER));
+                assert!(!card.trace().contains("restart"));
             }
+        }
+    }
+
+    #[test]
+    fn a_deselect_that_fails_stops_before_the_folder_is_touched() {
+        for shell in shells() {
+            for (fake, left) in [(DD_FAILS, OWN_CONFIG), (DD_RUINS, "GARBAGE")] {
+                let card = selected_card();
+                let fakes = format!("{FAKE_SYNC}{fake}");
+                let ran = card.run_text(shell, &card.script().render(), &fakes);
+                assert_eq!(
+                    ran.status,
+                    Some(CONFIG_NOT_WRITTEN),
+                    "{shell}: {}",
+                    ran.stderr
+                );
+                assert_eq!(card.read_boot("config.txt"), left.as_bytes());
+                assert_eq!(card.read_boot("config.pios.txt"), PIOS.as_bytes());
+                assert_eq!(card.read_boot("qberrypi/kernel8.img"), b"OLD KERNEL");
+                assert!(ran.stderr.contains("may be damaged"), "{}", ran.stderr);
+                assert!(
+                    ran.stderr.contains(&put_back_command(&card)),
+                    "{}",
+                    ran.stderr
+                );
+                assert!(!card.trace().contains("restart"));
+            }
+        }
+    }
+
+    #[test]
+    fn a_read_only_config_txt_ends_the_deploy_with_the_file_as_it_was() {
+        // Nothing is faked here: the write itself is refused. Root would not be refused.
+        let probe = tempfile::NamedTempFile::new().unwrap();
+        if std::os::unix::fs::MetadataExt::uid(&probe.as_file().metadata().unwrap()) == 0 {
+            return;
+        }
+        for shell in shells() {
+            for (card, was) in [(Card::fresh(), PIOS), (selected_card(), OWN_CONFIG)] {
+                let active = card.boot.join("config.txt");
+                fs::set_permissions(&active, Permissions::from_mode(0o444)).unwrap();
+                let ran = card.run(shell);
+                assert_eq!(
+                    ran.status,
+                    Some(CONFIG_NOT_WRITTEN),
+                    "{shell}: {}",
+                    ran.stderr
+                );
+                assert_eq!(card.read_boot("config.txt"), was.as_bytes());
+                assert_eq!(card.read_boot("config.pios.txt"), PIOS.as_bytes());
+                assert!(!card.trace().contains("restart"));
+            }
+        }
+    }
+
+    #[test]
+    fn config_txt_ends_with_exactly_the_bytes_written_whether_shorter_or_longer() {
+        let padding = "# a line that makes this configuration longer\n".repeat(120);
+        let long_pios = format!("{PIOS}{padding}");
+        let long_own = format!("{OWN_CONFIG}{padding}");
+        for shell in shells() {
+            // Selecting: (what Raspberry Pi OS had, what qberrypi brings).
+            for (pios, own) in [(long_pios.as_str(), OWN_CONFIG), (PIOS, long_own.as_str())] {
+                let card = Card::new();
+                card.write_boot("config.txt", pios);
+                let staged: Vec<(&str, &[u8])> = STAGED
+                    .iter()
+                    .map(|&(name, data)| {
+                        (
+                            name,
+                            if name == "config.txt" {
+                                own.as_bytes()
+                            } else {
+                                data
+                            },
+                        )
+                    })
+                    .collect();
+                card.stage_files(&staged);
+                let ran = card.run(shell);
+                assert_eq!(ran.status, Some(0), "{shell}: {}", ran.stderr);
+                assert_eq!(card.read_boot("config.txt"), own.as_bytes());
+                assert_eq!(card.read_boot("config.pios.txt"), pios.as_bytes());
+            }
+            // Deselecting: (what was selected, what was saved). The copy then fails,
+            // so the deselected file is what stays.
+            for (own, pios) in [(long_own.as_str(), PIOS), (OWN_CONFIG, long_pios.as_str())] {
+                let card = selected_card();
+                card.write_boot("config.txt", own);
+                card.write_boot("config.pios.txt", pios);
+                fs::write(card.stage.path().join("kernel8.img"), b"DAMAGED").unwrap();
+                let ran = card.run(shell);
+                assert_eq!(ran.status, Some(BAD_COPY), "{shell}: {}", ran.stderr);
+                assert_eq!(card.read_boot("config.txt"), pios.as_bytes());
+                assert_eq!(card.read_boot("config.pios.txt"), pios.as_bytes());
+            }
+        }
+    }
+
+    #[test]
+    fn the_write_of_config_txt_creates_a_missing_file_and_refuses_an_empty_one() {
+        for shell in shells() {
+            let card = Card::new();
+            card.write_boot("source", "arm_64bit=1\n");
+            // The script's own definitions, with one call of the write in place of main.
+            let script = card.script().render();
+            let definitions = script.strip_suffix("main\n").unwrap();
+            let call = "active=\"$QBERRYPI_TEST_BOOT/config.txt\"\n\
+                        write_config \"$QBERRYPI_TEST_BOOT/source\"\n";
+            let ran = card.run_text(shell, &format!("{definitions}{call}"), FAKE_SYNC);
+            assert_eq!(ran.status, Some(0), "{shell}: {}", ran.stderr);
+            assert_eq!(card.read_boot("config.txt"), b"arm_64bit=1\n");
+
+            // An empty source is never written over a config.txt.
+            card.write_boot("source", "");
+            let ran = card.run_text(shell, &format!("{definitions}{call}"), FAKE_SYNC);
+            assert_ne!(ran.status, Some(0), "{shell}");
+            assert_eq!(card.read_boot("config.txt"), b"arm_64bit=1\n");
         }
     }
 

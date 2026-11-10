@@ -13,9 +13,15 @@ boot on a real board is still to come. The design is in
 
 The Pi keeps its Raspberry Pi OS install. qberrypi lives in a folder on the
 same card's boot partition and is started for one boot at a time, so the card
-never leaves the Pi. Copy `qberrypi.example.toml` to `qberrypi.toml`, fill it
-in and turn `debug.one_shot` on; the file holds the Wi-Fi passphrase and is
-ignored by git.
+never leaves the Pi. Copy `qberrypi.example.toml` to `qberrypi.toml` and fill
+it in; the file holds the Wi-Fi passphrase and is ignored by git. For a
+development boot, set three things under `[debug]`:
+
+- `one_shot = true`, so qberrypi puts Raspberry Pi OS's `config.txt` back as
+  soon as it starts and any restart returns to Raspberry Pi OS;
+- `log_to_sd = true`, so it leaves a log on the card for `collect` to fetch;
+- `return_after_secs = 40` or so, so it restarts by itself after that long.
+  With 0 it stays up until the Pi is switched off and on.
 
 | Command | What it does |
 |---|---|
