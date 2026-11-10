@@ -28,7 +28,7 @@ development boot, set three things under `[debug]`:
 | `cargo xtask fetch` | Downloads the pinned Raspberry Pi kernel and firmware packages, checks them and extracts what the image needs. |
 | `cargo xtask build` | Cross-compiles qberrypi and writes the boot folder to `out/qberrypi/`. |
 | `cargo xtask qemu-test` | Boots the built image in QEMU and checks that it behaves. |
-| `cargo xtask deploy --host <ssh-alias>` | Copies the build to the Pi over SSH, starts it for one boot, waits for Raspberry Pi OS to come back and collects the log. |
+| `cargo xtask deploy --host <ssh-alias>` | Copies the build to the Pi over SSH, starts it for one boot, waits for Raspberry Pi OS to come back, checks that the Pi went through qberrypi, and collects the log, which must be this build's. |
 | `cargo xtask collect --host <ssh-alias>` | Fetches the log qberrypi left on the card into `out/logs/`. |
 
 `--host` can be left out when the environment variable `QBERRYPI_HOST` names

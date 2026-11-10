@@ -126,6 +126,12 @@ without touching the card:
    is cycled, the Pi restarts into Raspberry Pi OS.
 4. `cargo xtask collect` fetches the log over SSH.
 
+`deploy` waits for step 3 and does step 4 itself. Before it fetches the log
+it checks that `config.txt` is the saved one again, which it is not if the
+firmware ignored the prefix and started Raspberry Pi OS's kernel. Afterwards
+it checks that the last boot in the log is of the build it sent: a boot's
+entry in the log starts with one header line that names the build time.
+
 Making qberrypi permanent is turning `debug.one_shot` and
 `debug.log_to_sd` off. Only then does success criterion 3 hold.
 
@@ -166,10 +172,14 @@ with no knowledge of the rest. The others are modules of the main crate.
 
 1. Mount `/proc`, `/sys`, `/dev`, a tmpfs at `/run`. Open the console.
 2. Set the clock to the image build time, so it is never earlier than that.
-3. Mount the boot partition read-only, read `qberrypi/qberrypi.toml`,
-   unmount. In one-shot mode, remount it writable, restore `config.txt`,
-   sync and unmount. If the configuration cannot be read or parsed, the
-   restore happens anyway, so a bad file cannot strand the Pi in qberrypi.
+3. Wait for the kernel to find the card, for up to two minutes. Mount the
+   boot partition read-only, read `qberrypi/qberrypi.toml`, unmount. In
+   one-shot mode, remount it writable, restore `config.txt`, sync and
+   unmount. With `debug.log_to_sd` on, the log so far is appended in that
+   same writable mount (in one of its own when one-shot mode is off), so a
+   boot that dies in a later step has left its first lines on the card. If
+   the configuration cannot be read or parsed, the restore happens anyway,
+   so a bad file cannot strand the Pi in qberrypi.
 4. Open the hardware watchdog with a 15-second timeout. This comes after
    the restore on purpose: a board that misbehaved when the watchdog
    started would otherwise reset before `config.txt` was put back, on
@@ -185,8 +195,9 @@ with no knowledge of the rest. The others are modules of the main crate.
 9. Start the status server and the list refresher.
 
 A failure in steps 1 to 5 is fatal, the missing watchdog aside: the message
-goes to the console, `config.txt` is restored where the rules below say so,
-and the board restarts after five seconds. From step 6 on, failures are
+goes to the console, `config.txt` is restored where the rules below say so
+(waiting up to half a minute for the card, if the failure came before the
+kernel had found it), and the board restarts after five seconds. From step 6 on, failures are
 handled by the supervisor.
 
 ## Wi-Fi
