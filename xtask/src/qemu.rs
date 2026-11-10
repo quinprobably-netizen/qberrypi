@@ -17,7 +17,9 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, anyhow, bail};
 use sha2::{Digest, Sha256};
 
-use crate::build::{CMDLINE_TXT, CONFIG_TXT};
+use qberrypi::bootpart;
+
+use crate::build::{CMDLINE_TXT, CONFIG_TXT, read_build_epoch};
 use crate::sdimage;
 
 const QEMU: &str = "qemu-system-aarch64";
@@ -112,7 +114,56 @@ const RESTART_UNCHECKED: &str = "QEMU's raspi3b resets the machine the moment th
     Pi the driver is there";
 
 /// A `config.txt` that starts Raspberry Pi OS, which every image holds as `config.pios.txt`.
-const PIOS: &str = "# raspberry pi os\narm_64bit=1\n";
+///
+/// Made up for this test, and as long as the one a stock install has, which
+/// is several times as long as qberrypi's own. The restore then has to make
+/// `config.txt` grow on the card, as it has to on the Pi.
+const PIOS: &str = "\
+# A stand-in for the config.txt of Raspberry Pi OS, made up for qberrypi's
+# tests: ordinary settings, each with a comment, as a stock install has them.
+
+# Optional hardware interfaces. Remove the # in front of one to turn it on.
+#dtparam=i2c_arm=on
+#dtparam=i2s=on
+#dtparam=spi=on
+
+# Sound through the board's own output.
+dtparam=audio=on
+
+# Load the overlays for whatever camera and display are found.
+camera_auto_detect=1
+display_auto_detect=1
+
+# Load the initramfs that belongs to the kernel, if there is one.
+auto_initramfs=1
+
+# The graphics driver, and how many framebuffers it may have.
+dtoverlay=vc4-kms-v3d
+max_framebuffers=2
+
+# Leave the setting up of the display to the kernel.
+disable_fw_kms_setup=1
+
+# Run the kernel and everything above it in 64-bit mode.
+arm_64bit=1
+
+# Draw to the very edge of the screen.
+disable_overscan=1
+
+# Run as fast as the firmware and the board allow.
+arm_boost=1
+
+[cm4]
+# On the compute module, the USB controller is off unless it is asked for.
+otg_mode=1
+
+[cm5]
+dtoverlay=dwc2,dr_mode=host
+
+[all]
+# What the owner adds goes below this line.
+enable_uart=0
+";
 
 // Where the files the scenarios look at are on the card.
 const ACTIVE_CONFIG: &str = "config.txt";
@@ -151,7 +202,7 @@ pub struct Outcome {
     pub image: PathBuf,
 }
 
-/// Boots this repository's build (`out/qberrypi/`) in QEMU from a card image.
+/// Boots the build in `boot_folder` in QEMU from a card image.
 ///
 /// Returns when QEMU ends, when the guest's kernel has halted or has not
 /// restarted a few seconds after it was asked to, or after `timeout`,
@@ -160,14 +211,18 @@ pub struct Outcome {
 /// The serial console is also saved beside the image, under the image's
 /// name with the ending `.log`, whether the boot ends well or in an error.
 /// The log of an earlier boot from that image is removed first.
-pub fn boot(image: &Path, timeout: Duration) -> Result<Outcome> {
-    boot_with(image, KERNEL_ARGS, timeout)
+pub fn boot(boot_folder: &Path, image: &Path, timeout: Duration) -> Result<Outcome> {
+    boot_with(boot_folder, image, KERNEL_ARGS, timeout)
 }
 
 /// Like `boot`, with the kernel arguments given.
-fn boot_with(image: &Path, kernel_args: &str, timeout: Duration) -> Result<Outcome> {
-    let boot_folder = crate::workspace_root().join(BOOT_FOLDER);
-    let command = qemu_command(&boot_folder, image, kernel_args);
+fn boot_with(
+    boot_folder: &Path,
+    image: &Path,
+    kernel_args: &str,
+    timeout: Duration,
+) -> Result<Outcome> {
+    let command = qemu_command(boot_folder, image, kernel_args);
     let (serial, exited) = run_guest(command, timeout, Some(&serial_log_of(image)))?;
     Ok(Outcome {
         serial,
@@ -443,6 +498,8 @@ struct Evidence {
     /// The SHA-256 of the whole image before the boot and after it.
     image_before: String,
     image_after: String,
+    /// The build time of the build that was booted.
+    build_epoch: u64,
 }
 
 /// One thing that must hold after a boot, and whether it does.
@@ -551,6 +608,28 @@ impl Evidence {
         }
     }
 
+    /// The log is of one boot, however many times that boot saved it, and names this build.
+    ///
+    /// It is also what `cargo xtask deploy` goes by to tell that a log is of the run it started.
+    fn log_is_of_one_boot_of_this_build(&self) -> Condition {
+        let what = "qberrypi/log.txt on the card has one boot header, which names this build";
+        match &self.system_log {
+            Ok(log) => {
+                let headers = log.lines().filter(|l| l.starts_with("==== boot")).count();
+                let build = bootpart::last_boot_build(log);
+                let holds = headers == 1 && build == Some(self.build_epoch);
+                Condition::new(what, holds, || {
+                    let named = build.map_or("no build".to_owned(), |b| format!("build {b}"));
+                    format!(
+                        "it has {headers}; the last names {named}, and this is build {}",
+                        self.build_epoch
+                    )
+                })
+            }
+            Err(error) => Condition::new(what, false, || error.clone()),
+        }
+    }
+
     /// Init complained of nothing on the serial console but what the scenario expects.
     fn serial_has_no_unexpected_complaint(&self, allowed: &Allowed) -> Condition {
         Self::no_unexpected_complaint("on the serial console", &self.serial, allowed)
@@ -609,6 +688,10 @@ fn one_shot_conditions(evidence: &Evidence) -> Vec<Condition> {
         evidence.exited(),
         evidence.pios_config_is_active(),
         evidence.log_has("==== boot"),
+        // Saved three times: with the restore, with the kernel's log, at the return.
+        evidence.log_is_of_one_boot_of_this_build(),
+        evidence.log_has(&banner_start()),
+        evidence.log_has("INFO  config.txt: Restored"),
         evidence.log_has("kernel: "),
         evidence.log_has("wlan0: absent"),
         evidence.log_lacks(PASSPHRASE),
@@ -628,6 +711,7 @@ fn broken_config_conditions(evidence: &Evidence) -> Vec<Condition> {
         evidence.exited(),
         evidence.pios_config_is_active(),
         evidence.log_has("qberrypi.toml"),
+        evidence.log_is_of_one_boot_of_this_build(),
         // The card's configuration breaks on the line that holds the passphrase.
         evidence.log_lacks(PASSPHRASE),
         evidence.serial_lacks(PASSPHRASE),
@@ -648,6 +732,7 @@ fn no_console_conditions(evidence: &Evidence) -> Vec<Condition> {
         evidence.pios_config_is_active(),
         evidence.log_has(&banner_start()),
         evidence.log_has("INFO  returning"),
+        evidence.log_is_of_one_boot_of_this_build(),
         evidence.log_lacks(PASSPHRASE),
         evidence.log_has_no_unexpected_complaint(&allowed),
     ]
@@ -661,6 +746,7 @@ fn shipped_conditions(evidence: &Evidence) -> Vec<Condition> {
         evidence.pios_config_is_active(),
         evidence.log_has(&banner_start()),
         evidence.log_has("INFO  returning"),
+        evidence.log_is_of_one_boot_of_this_build(),
         evidence.log_lacks(PASSPHRASE),
         evidence.log_has_no_unexpected_complaint(&Allowed::NO_WATCHDOG_NO_LED),
     ]
@@ -678,6 +764,13 @@ fn watchdog_conditions(evidence: &Evidence) -> Vec<Condition> {
         evidence.serial_lacks("Kernel panic"),
         evidence.machine_was_reset(),
         evidence.pios_config_is_active(),
+        // The log was saved with the restore, so the reset did not take it:
+        // a boot that dies as soon as the watchdog runs, or in a driver, can
+        // still be read afterwards.
+        evidence.log_has(&banner_start()),
+        evidence.log_has("INFO  config.txt: Restored"),
+        evidence.log_is_of_one_boot_of_this_build(),
+        evidence.log_lacks(PASSPHRASE),
         evidence.serial_has_no_unexpected_complaint(&Allowed::NOTHING),
     ]
 }
@@ -792,11 +885,16 @@ fn edited(example: &str, edits: &[(&str, &str)]) -> Result<String> {
 
 /// Boots the six scenarios and prints how each went; an error if one did not hold.
 ///
-/// `root` is the repository root. The build in `out/qberrypi/` must be
-/// complete; the images and the serial logs go to `out/qemu/`.
+/// `root` is the repository root. The build in its `out/qberrypi/` must be
+/// complete, and is the one that is booted; the images and the serial logs
+/// go to its `out/qemu/`.
 pub fn run_all(root: &Path) -> Result<()> {
     require_qemu(QEMU)?;
-    verify_boot_folder(&root.join(BOOT_FOLDER))?;
+    let build = Build {
+        folder: root.join(BOOT_FOLDER),
+        epoch: read_build_epoch(root)?,
+    };
+    verify_boot_folder(&build.folder)?;
     let example_path = root.join(EXAMPLE_CONFIG);
     let example = fs::read_to_string(&example_path)
         .with_context(|| format!("cannot read {}", example_path.display()))?;
@@ -807,7 +905,7 @@ pub fn run_all(root: &Path) -> Result<()> {
     let mut failed = Vec::new();
     for scenario in &scenarios {
         let started = Instant::now();
-        let conditions = run_scenario(scenario, &folder)
+        let conditions = run_scenario(scenario, &build, &folder)
             .with_context(|| format!("{}: could not be run", scenario.name))?;
         let (report, held) =
             scenario_report(scenario.name, scenario.note, &conditions, started.elapsed());
@@ -831,8 +929,16 @@ pub fn run_all(root: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Makes a scenario's card, boots it and judges the boot.
-fn run_scenario(scenario: &Scenario, folder: &Path) -> Result<Vec<Condition>> {
+/// The build the scenarios boot.
+struct Build {
+    /// Its boot folder.
+    folder: PathBuf,
+    /// The build time it was given, which the log of each of its boots names.
+    epoch: u64,
+}
+
+/// Makes a scenario's card in `folder`, boots the build from it and judges the boot.
+fn run_scenario(scenario: &Scenario, build: &Build, folder: &Path) -> Result<Vec<Condition>> {
     let image = folder.join(scenario.file_stem).with_extension("img");
     sdimage::build(
         &image,
@@ -846,8 +952,8 @@ fn run_scenario(scenario: &Scenario, folder: &Path) -> Result<Vec<Condition>> {
     let image_before = file_sha256(&image)?;
 
     let outcome = match scenario.machine {
-        Machine::Usual => boot(&image, BOOT_TIMEOUT)?,
-        other => boot_with(&image, &other.kernel_args(), BOOT_TIMEOUT)?,
+        Machine::Usual => boot(&build.folder, &image, BOOT_TIMEOUT)?,
+        other => boot_with(&build.folder, &image, &other.kernel_args(), BOOT_TIMEOUT)?,
     };
 
     let read =
@@ -857,6 +963,7 @@ fn run_scenario(scenario: &Scenario, folder: &Path) -> Result<Vec<Condition>> {
         system_log: read(SYSTEM_LOG).map(|log| String::from_utf8_lossy(&log).into_owned()),
         image_after: file_sha256(&outcome.image)?,
         image_before,
+        build_epoch: build.epoch,
         serial: outcome.serial,
         exited: outcome.exited,
     };
@@ -976,6 +1083,7 @@ fn file_sha256(path: &Path) -> Result<String> {
 mod tests {
     use super::*;
     use crate::build::{CMDLINE_TXT, sha256sums};
+    use qberrypi::bootpart::{Restore, restore_pios_config};
     use std::ffi::OsStr;
 
     const EXAMPLE: &str = include_str!("../../qberrypi.example.toml");
@@ -1195,6 +1303,23 @@ mod tests {
                 "-drive",
                 "file=/x/a,,b.img,if=sd,format=raw",
             ]
+        );
+    }
+
+    #[test]
+    fn the_saved_configuration_is_as_long_as_a_stock_one_and_one_that_init_restores() {
+        // Longer than qberrypi's own config.txt: the restore has to make the file grow.
+        assert!(PIOS.len() > 1000, "{} bytes", PIOS.len());
+        assert!(PIOS.len() > 4 * CONFIG_TXT.len());
+        assert!(PIOS.is_ascii() && PIOS.ends_with('\n'));
+
+        let card = tempfile::tempdir().unwrap();
+        fs::write(card.path().join(ACTIVE_CONFIG), CONFIG_TXT).unwrap();
+        fs::write(card.path().join(PIOS_CONFIG), PIOS).unwrap();
+        assert_eq!(restore_pios_config(card.path()).unwrap(), Restore::Restored);
+        assert_eq!(
+            fs::read_to_string(card.path().join(ACTIVE_CONFIG)).unwrap(),
+            PIOS
         );
     }
 
@@ -1474,13 +1599,18 @@ mod tests {
             serial: good_serial(),
             exited: false,
             active_config: Ok(PIOS.as_bytes().to_vec()),
-            system_log: Ok(
-                "==== boot, build 1700000000 ====\n[  20.000] INFO  wlan0: absent\n\
-                 [  20.100] INFO  kernel: Booting Linux\n"
-                    .to_owned(),
-            ),
+            system_log: Ok(format!(
+                "==== boot, build 1700000000 ====\n\
+                 [   0.001] INFO  qberrypi {} (build 1700000000)\n\
+                 [   0.050] INFO  config.txt: Restored\n\
+                 [  20.000] INFO  wlan0: absent\n\
+                 [  20.100] INFO  kernel: Booting Linux\n\
+                 [  25.000] INFO  returning\n",
+                qberrypi::VERSION
+            )),
             image_before: "aa".to_owned(),
             image_after: "bb".to_owned(),
+            build_epoch: 1_700_000_000,
         }
     }
 
@@ -1497,20 +1627,22 @@ mod tests {
         "init logged no ERROR and no unexpected WARN on the serial console";
     const NO_COMPLAINT_IN_LOG: &str =
         "init logged no ERROR and no unexpected WARN in qberrypi/log.txt on the card";
+    const ONE_BOOT_OF_THIS_BUILD: &str =
+        "qberrypi/log.txt on the card has one boot header, which names this build";
 
     #[test]
     fn a_good_one_shot_boot_fails_no_condition() {
         let conditions = one_shot_conditions(&good_evidence());
 
         assert_eq!(failures(&conditions), [""; 0]);
-        assert_eq!(conditions.len(), 13);
+        assert_eq!(conditions.len(), 16);
     }
 
     #[test]
     fn each_thing_wrong_with_a_one_shot_boot_fails_its_condition() {
         /// What the failed condition is about, and what makes the evidence wrong.
         type Wrong = (&'static str, fn(&mut Evidence));
-        let wrong: [Wrong; 14] = [
+        let wrong: [Wrong; 20] = [
             ("has `qberrypi 0.", |e| {
                 e.serial = e.serial.replace("INFO  qberrypi ", "INFO  qberrypi-")
             }),
@@ -1533,6 +1665,33 @@ mod tests {
             ("has `==== boot`", |e| {
                 e.system_log = Ok("wlan0: absent\nkernel: x\n".into())
             }),
+            // Each save of the boot wrote a header of its own.
+            ("has one boot header", |e| {
+                let log = e.system_log.as_mut().unwrap();
+                *log = log.replace("[  25.", "==== boot, build 1700000000 ====\n[  25.");
+            }),
+            // The log on the card is one that an earlier build left.
+            ("has one boot header", |e| {
+                let log = e.system_log.as_mut().unwrap();
+                *log = log.replace("==== boot, build 1700000000", "==== boot, build 1600000000");
+            }),
+            ("has one boot header", |e| {
+                let log = e.system_log.as_mut().unwrap();
+                *log = log.replace("==== boot, build 1700000000 ====\n", "");
+            }),
+            ("has one boot header", |e| e.build_epoch += 1),
+            // Nothing was saved before the drivers were loaded.
+            ("log.txt on the card has `qberrypi 0.", |e| {
+                let log = e.system_log.as_mut().unwrap();
+                *log = log.replace("INFO  qberrypi ", "INFO  qberrypi-");
+            }),
+            (
+                "log.txt on the card has `INFO  config.txt: Restored`",
+                |e| {
+                    let log = e.system_log.as_mut().unwrap();
+                    *log = log.replace("config.txt: Restored", "config.txt: AlreadyRestored");
+                },
+            ),
             ("has `kernel: `", |e| {
                 e.system_log = Ok("==== boot\nwlan0: absent\n".into())
             }),
@@ -1583,7 +1742,44 @@ mod tests {
         let conditions = one_shot_conditions(&evidence);
 
         // Among them the one that the passphrase is not in it.
-        assert_eq!(failures(&conditions).len(), 4);
+        assert_eq!(failures(&conditions).len(), 7);
+    }
+
+    #[test]
+    fn a_log_of_one_boot_has_one_header_and_it_names_the_build_that_was_booted() {
+        let header = "==== boot, build 1700000000 ====\n";
+        let log_of = |text: String| Evidence {
+            system_log: Ok(text),
+            ..good_evidence()
+        };
+        let verdict = |text: String| log_of(text).log_is_of_one_boot_of_this_build().verdict;
+
+        assert_eq!(verdict(format!("{header}a\nb\n")), Verdict::Holds);
+        // One boot that reads as two, as when every save wrote a header.
+        assert_eq!(
+            verdict(format!("{header}a\n{header}b\n")),
+            Verdict::Fails(
+                "it has 2; the last names build 1700000000, and this is build 1700000000".into()
+            )
+        );
+        assert_eq!(
+            verdict("==== boot, build 1600000000 ====\na\n".into()),
+            Verdict::Fails(
+                "it has 1; the last names build 1600000000, and this is build 1700000000".into()
+            )
+        );
+        assert_eq!(
+            verdict("a\nb\n".into()),
+            Verdict::Fails(
+                "it has 0; the last names no build, and this is build 1700000000".into()
+            )
+        );
+        let mut unread = good_evidence();
+        unread.system_log = Err("cannot read qberrypi/log.txt".into());
+        assert_eq!(
+            unread.log_is_of_one_boot_of_this_build().verdict,
+            Verdict::Fails("cannot read qberrypi/log.txt".into())
+        );
     }
 
     #[test]
@@ -1637,13 +1833,14 @@ mod tests {
         let conditions = broken_config_conditions(&good_broken_evidence());
 
         assert_eq!(failures(&conditions), [""; 0]);
-        assert_eq!(conditions.len(), 7);
+        assert_eq!(conditions.len(), 8);
     }
 
     #[test]
     fn a_broken_config_boot_must_restore_and_name_the_file_in_the_log() {
         let mut evidence = good_broken_evidence();
-        evidence.system_log = Ok("==== boot\n[   0.025] ERROR something else\n".into());
+        evidence.system_log =
+            Ok("==== boot, build 1700000000 ====\n[   0.025] ERROR something else\n".into());
         evidence.active_config = Ok(CONFIG_TXT.as_bytes().to_vec());
 
         let conditions = broken_config_conditions(&evidence);
@@ -1733,7 +1930,6 @@ mod tests {
              [   0.050] INFO  config.txt: Restored\n\
              [   0.051] WARN  watchdog: No such file or directory (os error 2)\n\
              [   0.182] WARN  activity LED: No such file or directory (os error 2)\n\
-             ==== boot, build 1700000000 ====\n\
              [  20.265] INFO  returning\n",
             qberrypi::VERSION
         )
@@ -1757,7 +1953,7 @@ mod tests {
         let conditions = no_console_conditions(&good_no_console_evidence());
 
         assert_eq!(failures(&conditions), [""; 0]);
-        assert_eq!(conditions.len(), 8);
+        assert_eq!(conditions.len(), 9);
     }
 
     #[test]
@@ -1781,6 +1977,7 @@ mod tests {
                     qberrypi::VERSION
                 ),
                 "qberrypi/log.txt on the card has `INFO  returning`",
+                ONE_BOOT_OF_THIS_BUILD,
                 "qberrypi/log.txt on the card does not have `example-passphrase`",
                 NO_COMPLAINT_IN_LOG,
             ]
@@ -1834,7 +2031,14 @@ mod tests {
                 qberrypi::VERSION
             ),
             exited: true,
-            system_log: Err("cannot read qberrypi/log.txt".into()),
+            // Saved with the restore, before the watchdog was armed.
+            system_log: Ok(format!(
+                "==== boot, build 1700000000 ====\n\
+                 [   0.001] INFO  qberrypi {} (build 1700000000)\n\
+                 [   0.008] INFO  clock: set to the build time\n\
+                 [   0.050] INFO  config.txt: Restored\n",
+                qberrypi::VERSION
+            )),
             ..good_evidence()
         }
     }
@@ -1844,7 +2048,7 @@ mod tests {
         let conditions = watchdog_conditions(&good_watchdog_evidence());
 
         assert_eq!(failures(&conditions), [""; 0]);
-        assert_eq!(conditions.len(), 7);
+        assert_eq!(conditions.len(), 11);
         // Here QEMU does end by itself, so nothing is left unchecked.
         assert!(
             conditions
@@ -1861,6 +2065,7 @@ mod tests {
             .serial
             .replace("[   0.050] INFO  config.txt: Restored\n", "");
         evidence.active_config = Ok(CONFIG_TXT.as_bytes().to_vec());
+        evidence.system_log = Err("cannot read qberrypi/log.txt".into());
 
         let conditions = watchdog_conditions(&evidence);
 
@@ -1869,6 +2074,36 @@ mod tests {
             [
                 "the serial console has `INFO  config.txt: Restored`",
                 "config.txt on the card equals config.pios.txt",
+                &format!(
+                    "qberrypi/log.txt on the card has `qberrypi {} (build `",
+                    qberrypi::VERSION
+                ),
+                "qberrypi/log.txt on the card has `INFO  config.txt: Restored`",
+                ONE_BOOT_OF_THIS_BUILD,
+                "qberrypi/log.txt on the card does not have `example-passphrase`",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_reset_on_arming_that_took_the_log_with_it_fails() {
+        // The restore was done, but the log was to be saved only later: the
+        // reset came first, and nothing of the boot can be read back.
+        let mut evidence = good_watchdog_evidence();
+        evidence.system_log = Err("cannot read qberrypi/log.txt".into());
+
+        let conditions = watchdog_conditions(&evidence);
+
+        assert_eq!(
+            failures(&conditions),
+            [
+                &format!(
+                    "qberrypi/log.txt on the card has `qberrypi {} (build `",
+                    qberrypi::VERSION
+                ),
+                "qberrypi/log.txt on the card has `INFO  config.txt: Restored`",
+                ONE_BOOT_OF_THIS_BUILD,
+                "qberrypi/log.txt on the card does not have `example-passphrase`",
             ]
         );
     }
@@ -1948,7 +2183,7 @@ mod tests {
         let conditions = shipped_conditions(&good_shipped_evidence());
 
         assert_eq!(failures(&conditions), [""; 0]);
-        assert_eq!(conditions.len(), 7);
+        assert_eq!(conditions.len(), 8);
         // It is judged from the card: nothing is left unchecked.
         assert!(
             conditions
@@ -2011,7 +2246,7 @@ mod tests {
         let mut lines = report.lines();
         assert_eq!(
             lines.next().unwrap(),
-            "one-shot: ok (42 s; 12 of 13 conditions hold, 1 cannot be checked in QEMU)"
+            "one-shot: ok (42 s; 15 of 16 conditions hold, 1 cannot be checked in QEMU)"
         );
         let unchecked = lines.next().unwrap();
         assert!(
@@ -2037,7 +2272,7 @@ mod tests {
         assert!(!held);
         assert_eq!(
             report,
-            "one-shot: FAILED (7 s; 11 of 13 conditions hold)\n  \
+            "one-shot: FAILED (7 s; 14 of 16 conditions hold)\n  \
              FAILED: config.txt on the card equals config.pios.txt: \
              it is \"os_prefix=qberrypi/\\n\"\n  \
              FAILED: init logged no ERROR and no unexpected WARN on the serial console: \
@@ -2060,7 +2295,7 @@ mod tests {
         let lines: Vec<&str> = report.lines().collect();
         assert_eq!(
             lines[0],
-            "no console: ok (23 s; 7 of 8 conditions hold, 1 cannot be checked in QEMU)"
+            "no console: ok (23 s; 8 of 9 conditions hold, 1 cannot be checked in QEMU)"
         );
         assert_eq!(lines[1], "  note: judged by the card.");
         assert!(lines[2].starts_with("  cannot be checked in QEMU: "));
