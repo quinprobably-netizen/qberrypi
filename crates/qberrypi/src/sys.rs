@@ -193,8 +193,9 @@ pub fn reap_children() {
 pub fn reboot() -> ! {
     sync();
     let _ = rustix::system::reboot(RebootCommand::Restart);
-    // The restart was refused. The watchdog is no longer petted from here,
-    // so it restarts the board instead.
+    // The restart was refused. If the watchdog has been started, it is no
+    // longer petted from here and restarts the board instead. Before that,
+    // in the first steps of the boot, nothing does: init stays here.
     loop {
         thread::sleep(Duration::from_secs(60));
     }
