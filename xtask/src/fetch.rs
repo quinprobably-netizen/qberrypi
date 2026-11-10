@@ -16,7 +16,7 @@ use crate::deb;
 use crate::pins::{Digest, PACKAGES, Package};
 
 /// How the download servers are told who is asking.
-const USER_AGENT: &str = "qberrypi-xtask";
+const USER_AGENT: &str = "xtask-fetch";
 
 /// The longest one download may take before it is given up.
 const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(600);
@@ -172,6 +172,21 @@ mod tests {
 
     fn never_download(url: &str, _dest: &Path) -> Result<()> {
         panic!("downloaded {url}");
+    }
+
+    #[test]
+    fn nothing_sent_to_a_server_names_this_project() {
+        assert!(
+            !USER_AGENT.to_lowercase().contains("qberrypi"),
+            "{USER_AGENT}"
+        );
+        for package in PACKAGES {
+            assert!(
+                !package.url.to_lowercase().contains("qberrypi"),
+                "{}",
+                package.url
+            );
+        }
     }
 
     #[test]
