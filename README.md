@@ -5,8 +5,10 @@ board into a network-wide DNS ad blocker. The Linux kernel is stock;
 everything above it is one static Rust executable: init, Wi-Fi supplicant,
 network setup, DNS server and status page. No shell, no other programs.
 
-**Status: Milestone 0 in progress.** It boots in a virtual machine; the first
-boot on a real board is still to come. The design is in
+**Status: Milestone 0 done.** It boots on real hardware: a one-shot boot
+loads the Wi-Fi driver, writes its log and returns to Raspberry Pi OS by itself
+([notes](docs/bring-up/m0.md)). It does not join a network or answer DNS yet.
+The design is in
 [`docs/superpowers/specs/2026-11-10-qberrypi-design.md`](docs/superpowers/specs/2026-11-10-qberrypi-design.md).
 
 ## Development

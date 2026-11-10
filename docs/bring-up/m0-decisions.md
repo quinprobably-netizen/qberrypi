@@ -1,0 +1,123 @@
+# Milestone 0: decisions made while building
+
+Every decision the session lead made on the owner's behalf while the plan was carried out, in order, each with what it costs if wrong; then every reviewer finding that was deferred. Taken from the execution ledger.
+
+## Decisions
+
+- **Setup:** work on branch m0-boot in place instead of a separate worktree — brand-new repo with no other work in flight — cost if wrong: none, branch is isolated from main.
+- **Setup:** inline execution chosen by me after the owner did not pick a method; independent Fable review planned for Tasks 4 and 10 plus the final review — cost if wrong: owner wanted per-task review; they were told and can redirect.
+- **Pre-flight:** define the table text once in the qberrypi crate (modules::DEFAULT_TABLE) and have xtask reuse it — avoids two copies drifting — cost if wrong: none.
+- **Task 4:** a backup containing any NUL byte is refused with a new fourth reason "config.pios.txt is not text" — an unclean FAT write can leave NUL-filled files and restoring one would blank config.txt — cost if wrong: a legitimate config with a NUL (not valid config.txt anyway) is never restored and the Pi stays in qberrypi until fixed by hand. Sent back to the implementer before review.
+- **Task 4:** the "selects qberrypi" check stays an exact match on os_prefix=qberrypi/ (no BOM, spaced '=', or include handling) — firmware syntax has no spaces around '=', deploy's guard is the primary defence — cost if wrong: a hand-edited backup that selects qberrypi in an unusual spelling would be restored and loop.
+- **Task 5:** the real insert callback (Task 6) returns AlreadyExists without calling finit_module when /sys/module/<name> already exists — a helper request for brcmfmac-cyw re-walks brcmfmac's dependencies, and finit_module on a module that is still initialising can block instead of returning EEXIST, which would deadlock the driver's own request — cost if wrong: a half-loaded module is treated as loaded and its dependant's insert fails with a normal error.
+- **Task 6:** fatal() also appends the log when the parsed config has debug.log_to_sd on (restore still only under restore_on_fatal) — the plan's fatal lost the log on a permanent system, against the spec's purpose for log_to_sd — cost if wrong: one extra card write on a fatal error in a mode that already permits card writes.
+- **Task 6:** helper mode with an unreadable module table writes "qberrypi-modhelper: module table: {io error}" itself and exits 1 — my dispatch wrongly assumed an empty string would fail to parse — cost if wrong: none.
+- **Task 6:** private Card trait in init.rs accepted (not in the plan) — it is what makes the mount/sync/unmount sequences testable off the Pi — cost if wrong: an extra abstraction to remove.
+- **Task 6:** reviewer's minor "fatal does not pet on entry" upgraded to Important and sent with the fix round — a watchdog reset during rescue can interrupt the in-place rewrite of config.txt — cost if wrong: two extra pet calls.
+- **Task 6:** steps 1 and 2 (pseudo mounts, clock) are fatal as the spec says, even though that restores Raspberry Pi OS's config.txt before the configuration is parsed, permanent system included — failing back to the known-good system is the safer direction — cost if wrong: a permanent qberrypi falls back to Pi-hole on an early failure and needs re-selecting by hand.
+- **Task 7:** user agent changed to "xtask-fetch" — my dispatch suggested the project-named string, against the rule that outside requests must not carry the project's name — cost if wrong: none. The one real fetch run already sent the old string to archive.raspberrypi.com and deb.debian.org; reported to the owner.
+- **Task 7:** workspace Cargo.toml [profile.dev.package.sha2] opt-level = 3 accepted (outside the brief's file list) — makes the repeat run quick — cost if wrong: one manifest stanza to remove.
+- **Task 7:** no coded http:// fallback — TLS worked for both hosts and the client is https-only — cost if wrong: fetch fails if the archive ever drops TLS, and the fix is a deliberate edit.
+- **Task 8:** build's cargo command carries --target-dir <root>/target (not in the brief) — otherwise a CARGO_TARGET_DIR setting would pack a stale executable — cost if wrong: none.
+- **Task 9:** `exited` is not checkable in QEMU — raspi3b resets the machine when the watchdog is armed, so the test boots with initcall_blacklist=bcm2835_wdt_driver_init, which also removes the restart handler; scenarios require "reboot: Restarting system" on serial instead — cost if wrong: watchdog, real restart and LED are proven only on the Pi (Task 11).
+- **Task 9:** add dev/null (char 1,3) to the initramfs, 26 entries instead of the plan's 25 — without it init dies before main when the kernel has no console, the kernel panics and restarts, and config.txt is never restored — cost if wrong: one unused device node.
+- **Task 9:** QEMU console is ttyAMA1 for this device tree (plan said ttyAMA0) — QEMU -append only — cost if wrong: none.
+- **Task 9:** `permanent` also requires "INFO  returning" on serial — as written it passed for a guest whose init never ran — cost if wrong: none.
+- **Task 9:** the watchdog is armed AFTER the one-shot restore (new order: mounts, clock, read config, restore, watchdog, modules, ...), changing the spec's boot sequence — a board that reset on arming would otherwise reset before config.txt is restored, on every start — cost if wrong: steps 3–4 run without a watchdog, so a hang there hangs instead of reset-looping; either way the Pi needs a hand, and a hang writes nothing. Spec and plan text to be updated by the controller.
+- **Task 9:** a fatal error in the new steps 3–4 has no watchdog behind its restart; accepted for this milestone — restart as PID 1 does not realistically fail and the restore-before-arm order is worth more — cost if wrong: a refused restart there hangs until power is cycled.
+- **Task 9:** the broken-config card becomes the example file with the passphrase line's closing quote removed, with serial and log both required to lack the passphrase — my dispatch specified a condition that asserted nothing — cost if wrong: none.
+- **Task 9:** reviewer's minor 1 (scenarios stay green for a boot that ended in fatal or logged unexpected ERROR/WARN) upgraded to Important — this is the last gate before real hardware — cost if wrong: a stricter test that may need an allow-list entry later.
+- **Task 9:** reviewer's minor 6 (no scenario boots with the shipped cmdline.txt) upgraded to Important; add a scenario that uses build::CMDLINE_TXT — ties the gate to the deployed file — cost if wrong: 22 s more per test run.
+- **Task 10:** when config.txt already selects qberrypi and a valid backup exists, the script restores config.pios.txt first (deselects) before touching the qberrypi/ folder — a failed copy would otherwise leave config.txt pointing at a folder with bad files — cost if wrong: one extra safe-direction write to config.txt per redeploy in that state.
+- **Task 10:** accepted additions beyond the plan — status-5 refusal when config.txt is Raspberry Pi OS's but differs from the saved backup; no wait after a --permanent deploy; a note when return_after_secs is 0; tempfile as a runtime dependency of xtask — cost if wrong: an owner who edits config.txt after the first deploy must follow the refusal's instructions.
+- **Task 10:** also in this fix round — sync before the new backup is renamed into place (reviewer minor 1), tests for the status-9 paths (minor 3), README tells the owner to set log_to_sd and return_after_secs as well as one_shot (minor 7) — each is cheap and touches the first-deploy path — cost if wrong: none.
+- **Task 10:** extras beyond the brief accepted — statuses 6–9, per-file name and listing checks, main wrapper with </dev/null, drop_caches before verification, signal trap, IPv6 brackets for scp, marker-line protocol — each strengthens a guard; drop_caches is system-wide but harmless on a single-purpose Pi — cost if wrong: a brief I/O slowdown on the Pi per deploy.
+- **Task 9:** keep_bootcon beside earlycon in the shipped-command-line scenario accepted — without it the boot console is dropped when tty1 registers and the restart line is never seen — cost if wrong: none, QEMU command line only.
+- **Final:** reviewer disagreed with the premise of "steps 1–2 are fatal and restore" (the restore cannot happen that early) — accepted; F2 makes rescue wait for the card — cost if wrong: none.
+- **Final:** fix pass takes the 7 Important findings plus the per-task minors the reviewer triaged as "fix before merge" (mount_pseudo, wait_for_path, dd error text, MODULES list, run_all root) plus the repeated boot header, as F1–F13 in final-findings.md — cost if wrong: a larger fix diff to re-review.
+- **Final:** reviewer's recommendations NOT taken in this pass and put to the owner instead — tryboot (not documented for the 3B+), init commenting out the os_prefix line when the backup is refused, tying deploy to a qemu-tested build, deploy --dry-run — each is new behaviour beyond the plan — cost if wrong: the first real boot runs without them.
+
+## Deferred findings
+
+- **Task 2:** unknown-key text reaches the log unbounded/unsanitised (config.rs:317)
+- **Task 2:** syntax errors give line/column only, parser message dropped
+- **Task 2:** Section::section does not join parent path (fine at one nesting level)
+- **Task 2:** test uses 192.0.3.1 (outside documentation ranges) at config.rs:709
+- **Task 2:** accept-side boundary values untested (63-char hostname, /1, /30, 8/63-char passphrase)
+- **Task 2:** prefix accepts leading zeros (/024)
+- **Task 2:** network/broadcast address accepted for address/gateway; bare "https://" list entry accepted — needs a spec decision
+- **Task 3:** dropped() also counts evictions of lines already taken (over-reports loss)
+- **Task 3:** taken lines stay in memory until evicted; cap bounds text not allocation overhead
+- **Task 3:** kmsg read_records discards records already read when a later read errors
+- **Task 3:** unparsable kmsg records skipped silently; install() after a foreign logger is silent
+- **Task 3:** libc used at runtime for O_NONBLOCK while rustix is a dev-dependency (two syscall crates)
+- **Task 3:** timing-dependent assertion logbuf.rs:305; PID-only temp file names in kmsg tests
+- **Task 3:** multi-line messages stored as one entry without per-line prefix
+- **Task 4:** BOM-prefixed or include-based os_prefix in the backup not detected
+- **Task 4:** shrink case leaves "backup + old tail" if set_len/sync_all fails (bootpart.rs:97-99)
+- **Task 4:** doc comment on restore_pios_config does not say a write error can leave config.txt partly written
+- **Task 4:** no test for a non-NotFound read error on config.txt
+- **Task 4:** parent directory not fsynced after creating config.txt (relies on the unmount)
+- **Task 4:** backup lines split on \n only; a lone-\r backup could hide os_prefix=qberrypi/
+- **Task 4:** zero-timeout wait test bound is loose
+- **Task 5:** tab-only line treated as blank instead of an error; fields and dep items trimmed (unrequested leniency)
+- **Task 5:** malformed-line and cycle tests assert only the line number, not the reason
+- **Task 5:** empty-string argument without "--" is treated as a module name
+- **Task 6:** bootpart::wait_for_path now has no caller (step 4 uses the watchdog-petting wait helper)
+- **Task 6:** fatal's re-entry guard assumes a single thread; revisit when tokio arrives
+- **Task 6:** init.rs is 1,106 lines (504 code, 602 tests)
+- **Task 6:** Refused restore logged at info, should be error (init.rs:157, 372)
+- **Task 6:** log lines taken before append_log are lost if the append fails
+- **Task 6:** a failed step-4 unmount leaves the partition mounted read-only and the one-shot restore is skipped (on_card could unmount first, as rescue does)
+- **Task 6:** mount_pseudo stops at the first failure, so a /proc or /sys failure leaves /dev unmounted and rescue cannot restore
+- **Task 6:** "log in use" probe covers the buffer mutex only; with LOG unset the fatal message is written nowhere
+- **Task 6:** rescue's early return skips the unmount when nothing is to be saved
+- **Task 6:** two wait tests have wall-clock lower bounds that can fail on a loaded machine
+- **Task 6:** wait helper doc comment slightly overstates the budget left when the last pass was pet-due
+- **Task 6:** main loop pets twice back to back each tick
+- **Task 7:** outputs replaced one by one; a failed fetch after a pin bump can leave a mixed set in extracted/ (stage and move, or mark the set)
+- **Task 7:** package verified by path then re-opened for extraction (hash and extract from one handle)
+- **Task 7:** download has no size cap before the digest check
+- **Task 7:** fixed .partial names via File::create (symlink-following, concurrent runs collide)
+- **Task 7:** a wanted path appearing twice in an archive is written twice, last wins
+- **Task 7:** ureq default features pull in gzip crates; fixture helper panics unhelpfully without zstd; pins `file` field not tied to the URL by a test; repeat run touches directory mtimes
+- **Task 7:** test name nothing_sent_to_a_server_names_this_project promises more than it checks (user agent + pin URLs only)
+- **Task 8:** cargo output hidden on a successful build, which also hides compiler warnings from the qberrypi crate
+- **Task 8:** a symlinked out/ pointing outside the repository is written through on the first build
+- **Task 8:** MODULES file list in build.rs is hand-kept beside DEFAULT_TABLE (derive it or assert set equality)
+- **Task 8:** test constant INITRAMFS shadows super::INITRAMFS
+- **Task 8:** cpio add does not mask type bits out of a file mode; duplicate paths and ./.. components accepted
+- **Task 9:** the fatfs crate writes a subdirectory that fsck.fat faults (test image only; Linux reads and writes it)
+- **Task 9:** qemu.rs is 1,297 lines (703 code, 594 tests)
+- **Task 9:** the comment in sys::reboot saying the watchdog backs a refused restart is untrue before the watchdog is opened
+- **Task 9:** run_all verifies root/out/qberrypi but boot_with boots workspace_root()/out/qberrypi
+- **Task 9:** QEMU survives if xtask is killed by a signal (guard covers returns and panics only)
+- **Task 9:** qemu.rs 1,449 lines with three separable parts
+- **Task 9:** serial substring conditions can false-fail when a kernel line interleaves; six of seven sdimage tests were written with the implementation
+- **Task 10:** deploy.rs is 2,780 lines (about 970 code, 1,810 tests)
+- **Task 10:** the hardware_checks branch (model match, mountpoint, cache drop) is not executed by any test; no dash or shellcheck on the dev machine
+- **Task 10:** both config.txt writes in the script use cp, which briefly empties the file (init's restore is in place)
+- **Task 10:** verification trusts the copied SHA256SUMS (cmp it against the staged one first); dots in $name are regex wildcards in the listing check
+- **Task 10:** ssh has no ServerAliveInterval; a dropped network hangs deploy
+- **Task 10:** a failed stage-directory removal (it holds the passphrase) is silent
+- **Task 10:** mountpoint -q does not check the device is /dev/mmcblk0p1
+- **Task 10:** two tests not written first; the script has never executed under real dash (dash -n on the Pi, bash-as-sh and BusyBox ash only) — owner to install dash before the first deploy
+- **Task 9:** old serial log removed inside run_guest, after the image is built (a build failure leaves a stale log); a failed log write masks the guest's own failure
+- **Task 9:** every guest is stopped 3 s after "reboot: Restarting system"
+- **Task 9:** fatal writes a bare line with no stamp or level when the log lock is held (init.rs:341-344), invisible to the ERROR/WARN helper
+- **Task 9:** in card-judged scenarios, anything init logs after its last save is unseen; LED allow entry cannot tell "no LED in QEMU" from "wrong LED path" (real Pi must confirm)
+- **Task 9:** qemu.rs is about 2,150 lines
+- **Task 10:** a trapped TERM/HUP/INT during the select's dd exits before truncate, leaving a mixed config.txt that selects qberrypi, with no restore and no message (millisecond window; build already verified; one-shot init rewrites the file) — ignore those signals from before dd until after truncate
+- **Task 10:** dd's error text is discarded (2>/dev/null), hiding e.g. a read-only boot partition
+- **Task 10:** two status-9 test rows leave config.txt unpinned; write_config's read-back cmp reads the page cache; status-9 messages still recommend `sudo cp` with unquoted paths; step-4 comment still says "copied back"
+- **Final:** SIGPIPE after the select can leave qberrypi selected and pending without a restart (deploy.rs:581, :674-678)
+- **Final:** plan's Amendments table stops at Task 9 (controller to add Task 10's)
+- **Final:** a Pi slow to go down is reported as "never stopped answering" after 30 s and collect runs early
+- **Final:** the deploy tests' backup corpus is hand-copied; a differential test against bootpart::restore_pios_config would pin the seam
+- **Final:** 60 of the 71 per-task deferred minors can wait (reviewer's triage); 3 were already resolved at head
+- **Final:** with log_to_sd off and an old log on the card, a good one-shot deploy ends in the "older build" error
+- **Final:** log header is tied to the first take, not the first successful write; log.txt can pass 1 MiB by up to three saves before the next boot trims it
+- **Final:** "permanent with log_to_sd on" early save has a host test only, no QEMU scenario
+- **Final:** deploy only prints a note when one_shot is on and return_after_secs is 0 (the Pi then waits for a power cycle)
+- **Final:** pins.rs still lists the fetched module files by hand
+- **Final:** restore torn state on power loss mid-write (old length, new leading bytes) is inferred, not tested
