@@ -128,6 +128,11 @@ impl ModuleTable {
         Ok(table)
     }
 
+    /// The file of every module in the table, in the table's order.
+    pub fn files(&self) -> impl Iterator<Item = &str> {
+        self.entries.iter().map(|entry| entry.file.as_str())
+    }
+
     /// Lists a module and everything it needs, in the order to load them.
     ///
     /// Dependencies come first, in the order a module lists them, and each
@@ -260,6 +265,23 @@ mod tests {
         assert_eq!(names, ["brcmutil", "rfkill", "cfg80211", "brcmfmac"]);
         assert!(t.load_order("brcmfmac_cyw").is_some());
         assert!(t.load_order("net-pf-10").is_none());
+    }
+
+    #[test]
+    fn the_files_of_a_table_are_listed_in_its_order() {
+        let t = ModuleTable::parse(TABLE).unwrap();
+        let files: Vec<&str> = t.files().collect();
+        assert_eq!(
+            files,
+            [
+                "rfkill.ko",
+                "cfg80211.ko",
+                "brcmutil.ko",
+                "brcmfmac.ko",
+                "brcmfmac-cyw.ko"
+            ]
+        );
+        assert_eq!(ModuleTable::parse("").unwrap().files().count(), 0);
     }
 
     #[test]

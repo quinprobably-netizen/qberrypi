@@ -12,8 +12,8 @@ use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use anyhow::{Context, Result, bail};
-use qberrypi::modules::{DEFAULT_TABLE, MODULE_DIR, MODULE_LIST};
+use anyhow::{Context, Result, anyhow, bail};
+use qberrypi::modules::{DEFAULT_TABLE, MODULE_DIR, MODULE_LIST, ModuleTable};
 use sha2::{Digest, Sha256};
 
 use crate::cpio::{CpioWriter, Node};
@@ -45,14 +45,21 @@ const KERNEL: &str = "kernel8.img";
 const DEVICE_TREE: &str = "bcm2710-rpi-3-b-plus.dtb";
 const INITRAMFS: &str = "initramfs8";
 
-/// The kernel module files: under `modules/` when fetched, in `MODULE_DIR` in the initramfs.
-const MODULES: [&str; 5] = [
-    "rfkill.ko",
-    "cfg80211.ko",
-    "brcmutil.ko",
-    "brcmfmac.ko",
-    "brcmfmac-cyw.ko",
-];
+/// The kernel module files a module table names, in the table's order.
+///
+/// Those of `DEFAULT_TABLE` are what the initramfs holds: under `modules/`
+/// when fetched, in `MODULE_DIR` in the initramfs. Taken from the table that
+/// init reads, so the two cannot come apart.
+fn module_files(table: &str) -> Result<Vec<String>> {
+    let table = ModuleTable::parse(table).map_err(|e| anyhow!("the module table: {e}"))?;
+    Ok(table.files().map(str::to_owned).collect())
+}
+
+/// Where the build leaves the time it gave the executable as its build time.
+///
+/// Under the repository root, beside the boot folder and not in it: the
+/// folder holds what goes onto the card, and nothing else.
+const BUILD_EPOCH_FILE: &str = "out/build-epoch";
 
 /// The directory in the initramfs where the kernel looks for firmware.
 const FIRMWARE_DIR: &str = "lib/firmware";
@@ -104,8 +111,8 @@ pub struct ExtractedFiles {
     pub kernel: Vec<u8>,
     /// The device tree of the Pi 3 B+.
     pub dtb: Vec<u8>,
-    /// Each of `MODULES` with its contents.
-    modules: Vec<(&'static str, Vec<u8>)>,
+    /// Each module file of `DEFAULT_TABLE` with its contents.
+    modules: Vec<(String, Vec<u8>)>,
     /// Each of `FIRMWARE` with its contents.
     firmware: Vec<(&'static str, Vec<u8>)>,
 }
@@ -125,17 +132,21 @@ impl ExtractedFiles {
                 anyhow::Error::new(e).context(format!("cannot read {}{hint}", path.display()))
             })
         };
-        let read_all = |folder: &str, names: &[&'static str]| {
-            names
-                .iter()
-                .map(|name| Ok((*name, read(&format!("{folder}/{name}"))?)))
-                .collect::<Result<Vec<_>>>()
-        };
+        let (kernel, dtb) = (read(KERNEL)?, read(DEVICE_TREE)?);
+        let mut modules = Vec::new();
+        for name in module_files(DEFAULT_TABLE)? {
+            let data = read(&format!("modules/{name}"))?;
+            modules.push((name, data));
+        }
+        let mut firmware = Vec::new();
+        for name in FIRMWARE {
+            firmware.push((name, read(&format!("firmware/{name}"))?));
+        }
         Ok(Self {
-            kernel: read(KERNEL)?,
-            dtb: read(DEVICE_TREE)?,
-            modules: read_all("modules", &MODULES)?,
-            firmware: read_all("firmware", &FIRMWARE)?,
+            kernel,
+            dtb,
+            modules,
+            firmware,
         })
     }
 }
@@ -223,7 +234,7 @@ pub fn run(root: &Path, epoch: u64) -> Result<PathBuf> {
     let init =
         fs::read(&executable).with_context(|| format!("cannot read {}", executable.display()))?;
 
-    let out = write_boot_folder(root, &extracted, &init)?;
+    let out = write_boot_folder(root, &extracted, &init, epoch)?;
     println!(
         "build: wrote {} (init is {} bytes)",
         out.display(),
@@ -273,9 +284,17 @@ fn run_to_success(command: &mut Command) -> Result<()> {
 
 /// Writes the boot folder under `root` from scratch and returns it.
 ///
-/// `init` is the cross-built executable. An earlier folder is removed only
-/// once everything that goes into the new one is in memory.
-fn write_boot_folder(root: &Path, extracted: &ExtractedFiles, init: &[u8]) -> Result<PathBuf> {
+/// `init` is the cross-built executable, and `epoch` the build time it was
+/// given, which is recorded beside the folder for `cargo xtask deploy`. An
+/// earlier folder is removed only once everything that goes into the new one
+/// is in memory. The record of its build time goes with it, and the new one
+/// is written last: a record never stands for a folder of another build.
+fn write_boot_folder(
+    root: &Path,
+    extracted: &ExtractedFiles,
+    init: &[u8],
+    epoch: u64,
+) -> Result<PathBuf> {
     let initramfs = pack_initramfs(&initramfs_entries(extracted, init))?;
     let files: [(&str, &[u8]); 5] = [
         (KERNEL, &extracted.kernel),
@@ -287,12 +306,21 @@ fn write_boot_folder(root: &Path, extracted: &ExtractedFiles, init: &[u8]) -> Re
     let sums = sha256sums(&files);
 
     let out = root.join(BOOT_FOLDER);
+    let record = root.join(BUILD_EPOCH_FILE);
     remove_boot_folder(root, &out)?;
+    match fs::remove_file(&record) {
+        Err(e) if e.kind() != ErrorKind::NotFound => {
+            return Err(e).with_context(|| format!("cannot remove {}", record.display()));
+        }
+        _ => {}
+    }
     fs::create_dir_all(&out).with_context(|| format!("cannot create {}", out.display()))?;
     for (name, data) in files.into_iter().chain([("SHA256SUMS", sums.as_bytes())]) {
         let path = out.join(name);
         fs::write(&path, data).with_context(|| format!("cannot write {}", path.display()))?;
     }
+    fs::write(&record, format!("{epoch}\n"))
+        .with_context(|| format!("cannot write {}", record.display()))?;
     Ok(out)
 }
 
@@ -377,6 +405,9 @@ mod tests {
         "l lib/firmware/brcm/brcmfmac43455-sdio.raspberrypi,3-model-b-plus.clm_blob",
         "l lib/firmware/brcm/brcmfmac43455-sdio.raspberrypi,3-model-b-plus.txt",
     ];
+
+    /// The build time the tests give a boot folder.
+    const EPOCH: u64 = 1_700_000_123;
 
     /// A repository root whose `vendor-cache/extracted/` holds a stand-in for
     /// each fetched file. Each stand-in holds its own path, so a mix-up shows.
@@ -597,7 +628,7 @@ mod tests {
         let root = fixture_root();
         let extracted = fixture_extracted();
 
-        let out = write_boot_folder(root.path(), &extracted, b"ELF").unwrap();
+        let out = write_boot_folder(root.path(), &extracted, b"ELF", EPOCH).unwrap();
 
         assert_eq!(out, root.path().join("out/qberrypi"));
         assert_eq!(
@@ -656,21 +687,76 @@ mod tests {
     }
 
     #[test]
+    fn the_build_time_is_recorded_beside_the_boot_folder_and_not_in_it() {
+        let root = fixture_root();
+        let extracted = fixture_extracted();
+
+        let out = write_boot_folder(root.path(), &extracted, b"ELF", EPOCH).unwrap();
+
+        let record = root.path().join("out/build-epoch");
+        assert_eq!(fs::read_to_string(record).unwrap(), "1700000123\n");
+        // What goes onto the card, and what its checksums list, is as it was.
+        assert_eq!(files_under(&out).len(), 6);
+        let sums = fs::read_to_string(out.join("SHA256SUMS")).unwrap();
+        assert_eq!(sums.lines().count(), 5);
+        assert!(!sums.contains("build-epoch"));
+    }
+
+    #[test]
+    fn a_later_build_replaces_the_record_of_the_build_time() {
+        let root = fixture_root();
+        let extracted = fixture_extracted();
+        write_boot_folder(root.path(), &extracted, b"ELF", EPOCH).unwrap();
+
+        write_boot_folder(root.path(), &extracted, b"ELF", EPOCH + 60).unwrap();
+
+        let record = root.path().join("out/build-epoch");
+        assert_eq!(fs::read_to_string(record).unwrap(), "1700000183\n");
+    }
+
+    #[test]
+    fn the_packed_module_files_are_those_the_module_table_names() {
+        // A module dropped from the table is not packed, and one added is.
+        let table = "rfkill\trfkill.ko\t\nextra\textra-mod.ko\trfkill\n";
+        assert_eq!(module_files(table).unwrap(), ["rfkill.ko", "extra-mod.ko"]);
+        assert_eq!(
+            module_files(DEFAULT_TABLE).unwrap(),
+            [
+                "rfkill.ko",
+                "cfg80211.ko",
+                "brcmutil.ko",
+                "brcmfmac.ko",
+                "brcmfmac-cyw.ko"
+            ]
+        );
+        let e = module_files("brcmfmac\tbrcmfmac.ko\tcfg80211\n").unwrap_err();
+        assert!(format!("{e:#}").contains("cfg80211"), "{e:#}");
+    }
+
+    #[test]
+    fn the_fetched_modules_that_are_read_are_those_of_the_default_table() {
+        let extracted = fixture_extracted();
+        let read: Vec<&str> = extracted.modules.iter().map(|(name, _)| &**name).collect();
+        assert_eq!(read, module_files(DEFAULT_TABLE).unwrap());
+    }
+
+    #[test]
     fn an_earlier_boot_folder_is_replaced_and_its_neighbours_are_kept() {
         let root = fixture_root();
         let extracted = fixture_extracted();
-        let out = write_boot_folder(root.path(), &extracted, b"ELF").unwrap();
+        let out = write_boot_folder(root.path(), &extracted, b"ELF", EPOCH).unwrap();
         fs::write(out.join("log.txt"), "stale").unwrap();
         fs::create_dir(out.join("overlays")).unwrap();
         fs::write(out.join("overlays/stale.dtbo"), "stale").unwrap();
         fs::write(out.join("initramfs8"), "stale").unwrap();
         fs::write(root.path().join("out/notes.txt"), "kept").unwrap();
 
-        write_boot_folder(root.path(), &extracted, b"ELF").unwrap();
+        write_boot_folder(root.path(), &extracted, b"ELF", EPOCH).unwrap();
 
         assert_eq!(
             files_under(&root.path().join("out")),
             [
+                "build-epoch",
                 "notes.txt",
                 "qberrypi/SHA256SUMS",
                 "qberrypi/bcm2710-rpi-3-b-plus.dtb",
@@ -784,7 +870,7 @@ mod tests {
 
         let e = remove_boot_folder(&root, &root.join("out/qberrypi")).unwrap_err();
         assert!(e.to_string().contains("refusing"), "{e}");
-        write_boot_folder(&root, &extracted, b"ELF").unwrap_err();
+        write_boot_folder(&root, &extracted, b"ELF", EPOCH).unwrap_err();
 
         assert_eq!(
             files_under(&dir.path().join("outside")),
