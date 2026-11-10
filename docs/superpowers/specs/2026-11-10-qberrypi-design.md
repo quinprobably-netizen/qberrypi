@@ -111,8 +111,9 @@ Pi OS side cannot break the match between qberrypi's kernel and its modules.
 
 ### One-shot boots and the development loop
 
-While `debug.one_shot` is on, the first thing init does after mounting the
-card is copy `config.pios.txt` back over `config.txt`. From that moment any
+While `debug.one_shot` is on, init copies `config.pios.txt` back over
+`config.txt` as soon as it has read its configuration, before loading any
+driver. From that moment any
 restart, for any reason, returns to Raspberry Pi OS. Development then runs
 without touching the card:
 
@@ -165,9 +166,10 @@ with no knowledge of the rest. The others are modules of the main crate.
 1. Mount `/proc`, `/sys`, `/dev`, a tmpfs at `/run`. Open the console.
 2. Set the clock to the image build time, so it is never earlier than that.
 3. Open the hardware watchdog with a 15-second timeout.
-4. Mount the boot partition and read `qberrypi/qberrypi.toml`. In one-shot
-   mode, restore `config.txt` first and sync. Unmount. Outside one-shot and
-   SD-log modes the mount is read-only.
+4. Mount the boot partition read-only, read `qberrypi/qberrypi.toml`,
+   unmount. In one-shot mode, remount it writable, restore `config.txt`,
+   sync and unmount. If the configuration cannot be read or parsed, the
+   restore happens anyway, so a bad file cannot strand the Pi in qberrypi.
 5. Register as the kernel's module helper. Load `rfkill`, `cfg80211`
    (with the configured country), `brcmutil`, `brcmfmac`. The driver then
    requests the fifth module, its vendor sub-module `brcmfmac-cyw`, through
@@ -324,7 +326,7 @@ Raspberry Pi OS card.
 | Upstream times out | Try the next upstream; serve stale if available; otherwise SERVFAIL. |
 | List fetch fails | Keep the current block set; retry in an hour. |
 | A component task fails | Supervisor restarts it; three failures in a minute become a reboot. |
-| Bad or missing configuration | Fatal at boot, with the offending key named on the console. |
+| Bad or missing configuration | Fatal at boot, with the offending key named on the console; `config.txt` is restored first, as in one-shot mode. |
 
 The activity LED shows state without a screen: slow heartbeat when serving,
 fast blink while joining Wi-Fi, solid on a fatal error.
