@@ -1,0 +1,6 @@
+/target/
+/out/
+/vendor-cache/
+
+# Holds the Wi-Fi passphrase. Use qberrypi.example.toml as the template.
+qberrypi.toml
