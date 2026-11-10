@@ -161,6 +161,10 @@ pub fn initramfs_entries<'a>(
         "dev/console".to_owned(),
         Node::CharDev { major: 5, minor: 1 },
     ));
+    // When the kernel has no console to open, init starts with nothing open,
+    // and Rust's runtime opens this in its place before `main`. Without it
+    // the runtime aborts there, where init can neither log nor restore.
+    entries.push(("dev/null".to_owned(), Node::CharDev { major: 1, minor: 3 }));
     let init = Node::File {
         data: init,
         mode: 0o755,
@@ -345,7 +349,7 @@ mod tests {
     ];
 
     /// Every path of the initramfs in order, each after the letter `ls -l` shows for its kind.
-    const INITRAMFS: [&str; 25] = [
+    const INITRAMFS: [&str; 26] = [
         "d dev",
         "d proc",
         "d sys",
@@ -356,6 +360,7 @@ mod tests {
         "d lib/firmware",
         "d lib/firmware/brcm",
         "c dev/console",
+        "c dev/null",
         "- init",
         "- lib/modules/modules.list",
         "- lib/modules/rfkill.ko",
@@ -465,6 +470,18 @@ mod tests {
         assert_eq!(listing, INITRAMFS);
         let console = entries.iter().find(|(path, _)| path == "dev/console");
         assert_eq!(console.unwrap().1, Node::CharDev { major: 5, minor: 1 });
+    }
+
+    #[test]
+    fn dev_null_is_there_for_an_init_that_starts_with_nothing_open() {
+        let extracted = fixture_extracted();
+        let entries = initramfs_entries(&extracted, b"ELF");
+
+        let console = entries.iter().position(|(path, _)| path == "dev/console");
+        let (path, node) = &entries[console.unwrap() + 1];
+
+        assert_eq!(path, "dev/null");
+        assert_eq!(*node, Node::CharDev { major: 1, minor: 3 });
     }
 
     #[test]
