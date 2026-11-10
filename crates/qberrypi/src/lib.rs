@@ -1,5 +1,6 @@
 //! qberrypi: everything above the kernel, in one executable.
 
+pub mod bootpart;
 pub mod config;
 pub mod kmsg;
 pub mod logbuf;
