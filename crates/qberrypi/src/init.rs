@@ -4,7 +4,8 @@
 //! through `fatal`, which restarts the board. In one-shot mode, and whenever
 //! the configuration never got read, it first puts Raspberry Pi OS's
 //! `config.txt` back, so a failure cannot leave the Pi starting qberrypi
-//! over and over.
+//! over and over. It saves the log to the card then too, and also on a
+//! permanent system that keeps its log there.
 
 use std::fs::File;
 use std::io::{self, Write};
@@ -303,10 +304,11 @@ fn next_tick(return_after_secs: u64, elapsed: Duration) -> Option<Duration> {
     (!left.is_zero()).then(|| left.min(PET_EVERY))
 }
 
-/// Stops the system: message, LED, the card put right, a pause to read, restart.
+/// Stops the system: message, LED, the card put right and the log saved, a pause to read, restart.
 fn fatal(message: &str) -> ! {
     // A second call means the first one failed, or a panic came from inside
-    // it. Nothing more is tried.
+    // it. Nothing more is tried. This takes init to have one thread: with
+    // more, a second thread's failure would cut the first one's rescue short.
     if FATAL_BEGUN.swap(true, Ordering::SeqCst) {
         sys::reboot();
     }
@@ -327,25 +329,52 @@ fn fatal(message: &str) -> ! {
     sys::reboot()
 }
 
-/// What `fatal` does to the card: restores `config.txt` and saves the log.
+/// What a fatal error does to the card before the restart.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct Rescue {
+    /// Put Raspberry Pi OS's `config.txt` back.
+    restore_config: bool,
+    /// Append the log to `qberrypi/log.txt`.
+    save_log: bool,
+}
+
+/// Decides what a fatal error does to the card, from the configuration if there is one.
 ///
-/// Nothing is done if `restore_on_fatal` says the system is here to stay.
-/// Errors are ignored: the restart comes whatever happens. `log` is the log
-/// to save, and `None` if it must not be used; this logs only when it has one.
+/// `config.txt` is restored when `restore_on_fatal` says so. The log is
+/// saved then too, and also whenever the configuration keeps the log on the
+/// card: that switch is there so that a boot that failed can be read back.
+fn rescue_plan(cfg: Option<&Config>) -> Rescue {
+    let restore_config = restore_on_fatal(cfg);
+    Rescue {
+        restore_config,
+        save_log: restore_config || cfg.is_some_and(|cfg| cfg.debug.log_to_sd),
+    }
+}
+
+/// What `fatal` does to the card: whatever `rescue_plan` says, and no more.
+///
+/// The card is mounted only if there is something to do on it. Errors are
+/// ignored: the restart comes whatever happens. `log` is the log to save,
+/// and `None` if it must not be used; this logs only when it has one.
 fn rescue(cfg: Option<&Config>, card: &mut dyn Card, log: Option<&Mutex<LogBuf>>) {
-    if !restore_on_fatal(cfg) {
+    let plan = rescue_plan(cfg);
+    let log_to_save = log.filter(|_| plan.save_log);
+    if !plan.restore_config && log_to_save.is_none() {
         return;
     }
     // The failure may have come while the partition was mounted.
     let _ = card.unmount();
     let _ = on_card(card, Access::Writable, |boot| {
-        let restored = bootpart::restore_pios_config(boot);
-        let Some(log) = log else { return };
-        match restored {
-            Ok(outcome) => log::info!("config.txt: {outcome:?}"),
-            Err(error) => log::error!("config.txt: {error}"),
+        if plan.restore_config {
+            let restored = bootpart::restore_pios_config(boot);
+            if log.is_some() {
+                match restored {
+                    Ok(outcome) => log::info!("config.txt: {outcome:?}"),
+                    Err(error) => log::error!("config.txt: {error}"),
+                }
+            }
         }
-        if let Some(mut buf) = lock_if_free(log) {
+        if let Some(mut buf) = log_to_save.and_then(lock_if_free) {
             let unsaved = buf.take_unsaved();
             drop(buf);
             let _ = bootpart::append_log(boot, &log_entry(&unsaved));
@@ -532,6 +561,19 @@ mod tests {
 
     fn cfg_with_log_to_sd(on: bool) -> Config {
         cfg_with("log_to_sd = false", &format!("log_to_sd = {on}"))
+    }
+
+    /// The example configuration with its two card-writing switches set.
+    fn cfg_debug(one_shot: bool, log_to_sd: bool) -> Config {
+        let text = EXAMPLE
+            .replace("one_shot = false", &format!("one_shot = {one_shot}"))
+            .replace("log_to_sd = false", &format!("log_to_sd = {log_to_sd}"));
+        let cfg = config::parse(&text).unwrap();
+        assert_eq!(
+            (cfg.debug.one_shot, cfg.debug.log_to_sd),
+            (one_shot, log_to_sd)
+        );
+        cfg
     }
 
     fn log_holding(lines: &[&str]) -> Mutex<LogBuf> {
@@ -1012,6 +1054,50 @@ mod tests {
 
     // The way out.
 
+    const BOTH: Rescue = Rescue {
+        restore_config: true,
+        save_log: true,
+    };
+    const LOG_ONLY: Rescue = Rescue {
+        restore_config: false,
+        save_log: true,
+    };
+    const NEITHER: Rescue = Rescue {
+        restore_config: false,
+        save_log: false,
+    };
+
+    #[test]
+    fn with_no_config_a_failure_restores_config_txt_and_saves_the_log() {
+        assert_eq!(rescue_plan(None), BOTH);
+    }
+
+    #[test]
+    fn in_one_shot_mode_a_failure_restores_config_txt_and_saves_the_log() {
+        assert_eq!(rescue_plan(Some(&cfg_debug(true, false))), BOTH);
+        assert_eq!(rescue_plan(Some(&cfg_debug(true, true))), BOTH);
+    }
+
+    #[test]
+    fn on_a_permanent_system_a_failure_only_saves_the_log_and_only_if_it_is_on() {
+        assert_eq!(rescue_plan(Some(&cfg_debug(false, true))), LOG_ONLY);
+        assert_eq!(rescue_plan(Some(&cfg_debug(false, false))), NEITHER);
+    }
+
+    #[test]
+    fn the_rescue_restores_exactly_when_restore_on_fatal_says_so() {
+        for cfg in [
+            None,
+            Some(cfg_debug(false, false)),
+            Some(cfg_debug(false, true)),
+            Some(cfg_debug(true, false)),
+            Some(cfg_debug(true, true)),
+        ] {
+            let cfg = cfg.as_ref();
+            assert_eq!(rescue_plan(cfg).restore_config, restore_on_fatal(cfg));
+        }
+    }
+
     #[test]
     fn a_failure_before_the_config_is_known_restores_config_txt_and_saves_the_log() {
         let mut card = FakeCard::new();
@@ -1023,25 +1109,59 @@ mod tests {
             header() + "qberrypi.toml: (syntax): not valid TOML\n"
         );
         assert_eq!(card.ops, RESCUE_OPS);
+        assert!(!card.mounted);
     }
 
     #[test]
     fn a_failure_in_one_shot_mode_restores_config_txt_and_saves_the_log() {
-        let mut card = FakeCard::new();
-        let log = log_holding(&["loading brcmfmac: bad signature"]);
-        rescue(Some(&cfg_with_one_shot(true)), &mut card, Some(&log));
-        assert_eq!(card.read("config.txt"), PIOS);
-        assert!(card.read("qberrypi/log.txt").ends_with("bad signature\n"));
-        assert_eq!(card.ops, RESCUE_OPS);
+        // The log is saved whether or not the configuration asks for it.
+        for log_to_sd in [false, true] {
+            let mut card = FakeCard::new();
+            let log = log_holding(&["loading brcmfmac: bad signature"]);
+            rescue(Some(&cfg_debug(true, log_to_sd)), &mut card, Some(&log));
+            assert_eq!(card.read("config.txt"), PIOS);
+            assert_eq!(
+                card.read("qberrypi/log.txt"),
+                header() + "loading brcmfmac: bad signature\n"
+            );
+            assert_eq!(card.ops, RESCUE_OPS);
+            assert!(!card.mounted);
+        }
     }
 
     #[test]
-    fn a_failure_of_a_permanent_system_leaves_the_card_alone() {
+    fn a_failure_of_a_permanent_system_with_the_log_on_saves_it_and_leaves_config_txt() {
         let mut card = FakeCard::new();
         let log = log_holding(&["loading brcmfmac: bad signature"]);
-        rescue(Some(&cfg_with_one_shot(false)), &mut card, Some(&log));
-        // Not even with the log switched on: only one-shot mode writes on the way out.
-        rescue(Some(&cfg_with_log_to_sd(true)), &mut card, Some(&log));
+        rescue(Some(&cfg_debug(false, true)), &mut card, Some(&log));
+        assert_eq!(card.read("config.txt"), QBERRYPI);
+        assert_eq!(card.read("config.pios.txt"), PIOS);
+        assert_eq!(
+            card.read("qberrypi/log.txt"),
+            header() + "loading brcmfmac: bad signature\n"
+        );
+        assert_eq!(card.ops, RESCUE_OPS);
+        assert!(!card.mounted);
+    }
+
+    #[test]
+    fn a_failure_of_a_permanent_system_that_keeps_no_log_never_mounts_the_card() {
+        let mut card = FakeCard::new();
+        let log = log_holding(&["loading brcmfmac: bad signature"]);
+        rescue(Some(&cfg_debug(false, false)), &mut card, Some(&log));
+        assert!(card.ops.is_empty());
+        assert_eq!(card.read("config.txt"), QBERRYPI);
+        assert!(!card.has("qberrypi/log.txt"));
+        assert_eq!(
+            log.lock().unwrap().take_unsaved(),
+            "loading brcmfmac: bad signature\n"
+        );
+    }
+
+    #[test]
+    fn with_only_the_log_to_save_and_no_log_to_use_the_card_is_never_mounted() {
+        let mut card = FakeCard::new();
+        rescue(Some(&cfg_debug(false, true)), &mut card, None);
         assert!(card.ops.is_empty());
         assert_eq!(card.read("config.txt"), QBERRYPI);
         assert!(!card.has("qberrypi/log.txt"));

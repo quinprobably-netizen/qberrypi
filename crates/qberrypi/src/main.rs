@@ -17,13 +17,11 @@ fn main() {
         init::run();
     }
     let args: Vec<String> = std::env::args().skip(1).collect();
-    // A table that cannot be read counts as an empty one: the helper then
-    // reports every module it is asked for as not in it.
-    let table = fs::read_to_string(MODULE_LIST).unwrap_or_default();
+    let table = fs::read_to_string(MODULE_LIST);
     let mut kmsg: Box<dyn Write> = match File::options().write(true).open(KERNEL_LOG) {
         Ok(kmsg) => Box::new(kmsg),
         Err(_) => Box::new(io::sink()),
     };
-    let status = modhelper::run(&args, &table, &mut sys::insert_module, kmsg.as_mut());
+    let status = modhelper::run_with_table(table, &args, &mut sys::insert_module, kmsg.as_mut());
     std::process::exit(status);
 }

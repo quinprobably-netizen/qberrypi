@@ -3,7 +3,7 @@
 //! The kernel runs its module helper as `<path> -q -- <name>`. qberrypi
 //! registers itself as that helper, so this takes the place of `modprobe`.
 
-use std::io::Write;
+use std::io::{self, Write};
 
 use crate::modules::{self, Insert, ModuleTable};
 
@@ -24,6 +24,26 @@ pub fn parse_args(args: &[String]) -> Vec<String> {
         }
     }
     names
+}
+
+/// Runs the helper on the module table as it was read, or not, from the initramfs.
+///
+/// A table that could not be read gets one line on `kmsg`,
+/// `qberrypi-modhelper: module table: {error}`, and the status is 1 with
+/// nothing loaded. Otherwise this is [`run`].
+pub fn run_with_table(
+    table_text: io::Result<String>,
+    args: &[String],
+    insert: Insert,
+    kmsg: &mut dyn Write,
+) -> i32 {
+    match table_text {
+        Ok(table_text) => run(args, &table_text, insert, kmsg),
+        Err(error) => {
+            report(kmsg, &format!("module table: {error}"));
+            1
+        }
+    }
 }
 
 /// Loads the modules named in `args` and returns the helper's exit status.
@@ -114,6 +134,70 @@ mod tests {
         fn flush(&mut self) -> io::Result<()> {
             Ok(())
         }
+    }
+
+    #[test]
+    fn a_table_that_cannot_be_read_is_reported_in_one_write_and_nothing_is_loaded() {
+        let unreadable = || io::Error::from_raw_os_error(libc::ENOENT);
+        let mut out = Records::default();
+        let mut insert = |_: &Path, _: &str| panic!("nothing to insert");
+        let requested = args(&["-q", "--", "brcmfmac-cyw", "rfkill"]);
+        assert_eq!(
+            run_with_table(Err(unreadable()), &requested, &mut insert, &mut out),
+            1
+        );
+        assert_eq!(
+            out.0,
+            [format!(
+                "qberrypi-modhelper: module table: {}\n",
+                unreadable()
+            )]
+        );
+    }
+
+    #[test]
+    fn a_table_that_cannot_be_read_fails_even_if_the_log_cannot_be_written() {
+        let unreadable = Err(ErrorKind::PermissionDenied.into());
+        let mut insert = |_: &Path, _: &str| panic!("nothing to insert");
+        let requested = args(&["--", "rfkill"]);
+        assert_eq!(
+            run_with_table(unreadable, &requested, &mut insert, &mut Broken),
+            1
+        );
+    }
+
+    #[test]
+    fn a_table_that_was_read_is_used_as_run_uses_it() {
+        let mut calls: Vec<PathBuf> = vec![];
+        let mut insert = |p: &Path, _: &str| {
+            calls.push(p.to_owned());
+            Ok(())
+        };
+        let mut out = Records::default();
+        let requested = args(&["-q", "--", "cfg80211", "net-pf-10"]);
+        let table = Ok(TABLE.to_owned());
+        assert_eq!(run_with_table(table, &requested, &mut insert, &mut out), 1);
+        assert_eq!(
+            out.0,
+            [
+                "qberrypi-modhelper: cfg80211: loaded\n",
+                "qberrypi-modhelper: net-pf-10: not in table\n",
+            ]
+        );
+        assert_eq!(
+            calls,
+            [
+                Path::new("/lib/modules/rfkill.ko"),
+                Path::new("/lib/modules/cfg80211.ko"),
+            ]
+        );
+
+        // An empty table is a table: the module is unknown, not the table unread.
+        let mut out = Records::default();
+        let requested = args(&["--", "rfkill"]);
+        let status = run_with_table(Ok(String::new()), &requested, &mut |_, _| Ok(()), &mut out);
+        assert_eq!(status, 1);
+        assert_eq!(out.0, ["qberrypi-modhelper: rfkill: not in table\n"]);
     }
 
     #[test]
