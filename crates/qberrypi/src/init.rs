@@ -6,6 +6,11 @@
 //! `config.txt` back, so a failure cannot leave the Pi starting qberrypi
 //! over and over. It saves the log to the card then too, and also on a
 //! permanent system that keeps its log there.
+//!
+//! A boot that keeps its log on the card saves it more than once: with the
+//! first write to the card, before the watchdog runs or a driver is loaded,
+//! again once the kernel's log has been copied, and on the way out. Each save
+//! adds only what is new, and only the first writes the boot's header.
 
 use std::fs::File;
 use std::io::{self, Write};
@@ -16,7 +21,9 @@ use std::sync::{Mutex, MutexGuard, OnceLock, PoisonError, TryLockError};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use crate::bootpart::{self, BOOT_DEV, MOUNT_POINT};
+use log::Level;
+
+use crate::bootpart::{self, BOOT_DEV, MOUNT_POINT, Restore};
 use crate::config::{self, Config};
 use crate::kmsg;
 use crate::led::{self, LED_DIR, LedState};
@@ -44,7 +51,15 @@ const PET_EVERY: Duration = Duration::from_secs(5);
 const PET_EVERY_LINES: usize = 50;
 /// How often a wait looks whether what it waits for has happened.
 const POLL_EVERY: Duration = Duration::from_millis(50);
-const BOOT_DEV_WAIT: Duration = Duration::from_secs(10);
+/// How long step 3 waits for the kernel to find the card.
+///
+/// Long, because giving up gains nothing: it is a fatal error whose way out
+/// needs the card as well, and no watchdog runs yet that the wait could trip.
+const BOOT_DEV_WAIT: Duration = Duration::from_secs(120);
+/// How long a fatal error waits for the card before it restarts without it.
+///
+/// Bounded, so that a board with no card at all restarts and does not sit.
+const RESCUE_DEV_WAIT: Duration = Duration::from_secs(30);
 const WLAN_WAIT: Duration = Duration::from_secs(20);
 /// How long a fatal message stays on the console before the restart.
 const FATAL_PAUSE: Duration = Duration::from_secs(5);
@@ -78,7 +93,7 @@ pub fn run() -> ! {
     let log = start_logging(); // 1
     keep_clock_after_build(); // 2
     let cfg = read_config(); // 3
-    restore_if_one_shot(cfg, &mut SdCard); // 4
+    restore_and_save_log(cfg, &mut SdCard, log); // 4
     open_watchdog(); // 5
     load_wifi_driver(cfg); // 6
     show_serving(); // 7
@@ -119,7 +134,7 @@ fn keep_clock_after_build() {
 
 /// Step 3: waits for the card and reads the configuration from it.
 fn read_config() -> &'static Config {
-    if !wait_for(BOOT_DEV_WAIT, || Path::new(BOOT_DEV).exists()) {
+    if !wait_for_card(&SdCard, BOOT_DEV_WAIT, &mut pet_watchdog) {
         fatal(&format!("boot partition {BOOT_DEV} did not appear"));
     }
     match load_config(&mut SdCard) {
@@ -137,20 +152,55 @@ fn load_config(card: &mut dyn Card) -> Result<Config, String> {
     config::parse(&text).map_err(|error| error.to_string())
 }
 
-/// Step 4: in one-shot mode, makes the next start one of Raspberry Pi OS.
+/// Step 4: the first write to the card, before the watchdog runs or a driver is loaded.
 ///
-/// From here on, a restart for any reason leaves qberrypi. A restore that
-/// cannot be done is logged and the boot goes on: stopping would not bring
-/// Raspberry Pi OS back either.
-fn restore_if_one_shot(cfg: &Config, card: &mut dyn Card) {
-    if !cfg.debug.one_shot {
+/// In one-shot mode it makes the next start one of Raspberry Pi OS: from
+/// here on, a restart for any reason leaves qberrypi. If the log is kept on
+/// the card, what was logged so far is saved in the same mount, the outcome
+/// of the restore included, so that a boot that dies in a driver has left its
+/// first lines behind. With neither switch on, the card is not touched.
+///
+/// A restore that is refused or fails is logged as an error, and the boot
+/// goes on. Stopping would not bring Raspberry Pi OS back: `fatal` restores
+/// from the same backup, so it would fail the same way and only restart into
+/// qberrypi sooner, over and over. Going on at least leaves a system to look at.
+fn restore_and_save_log(cfg: &Config, card: &mut dyn Card, log: &Mutex<LogBuf>) {
+    let (restore, save) = (cfg.debug.one_shot, cfg.debug.log_to_sd);
+    if !restore && !save {
         return;
     }
     pet_watchdog();
-    match with_card(card, Access::Writable, bootpart::restore_pios_config) {
-        Ok(Ok(outcome)) => log::info!("config.txt: {outcome:?}"),
-        Ok(Err(error)) => log::error!("config.txt: {error}"),
-        Err(error) => log::error!("config.txt: mounting {BOOT_DEV}: {error}"),
+    let written = with_card(card, Access::Writable, |boot| {
+        if restore {
+            log_restore(&bootpart::restore_pios_config(boot));
+        }
+        if save { save_log(boot, log) } else { Ok(()) }
+    });
+    match written {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => log::error!("log.txt: {error}"),
+        Err(error) => {
+            let what = if restore { "config.txt" } else { "log.txt" };
+            log::error!("{what}: mounting {BOOT_DEV}: {error}");
+        }
+    }
+}
+
+/// Logs what came of a restore of `config.txt`.
+fn log_restore(restored: &io::Result<Restore>) {
+    let (level, line) = restore_report(restored);
+    log::log!(level, "{line}");
+}
+
+/// The level and the line that what came of a restore of `config.txt` is logged with.
+///
+/// A restore that was refused, or that failed, is an error: the card still
+/// starts qberrypi, and nothing else will say so.
+fn restore_report(restored: &io::Result<Restore>) -> (Level, String) {
+    match restored {
+        Ok(outcome @ Restore::Refused(_)) => (Level::Error, format!("config.txt: {outcome:?}")),
+        Ok(outcome) => (Level::Info, format!("config.txt: {outcome:?}")),
+        Err(error) => (Level::Error, format!("config.txt: {error}")),
     }
 }
 
@@ -273,28 +323,41 @@ fn log_lines(lines: &[String], log_line: &mut dyn FnMut(&str), pet: &mut dyn FnM
 
 /// Step 9: if the configuration asks for it, appends the log to the card.
 ///
-/// Only the lines not yet saved are written, under a header of their own.
+/// Only the lines not yet saved are written. Step 4 saved the first of them;
+/// this is called again on the way out.
 fn save_log_if_asked(cfg: &Config, card: &mut dyn Card, log: &Mutex<LogBuf>) {
     if !cfg.debug.log_to_sd {
         return;
     }
     pet_watchdog();
-    // The lines are taken only once the card is mounted, so that a card
-    // that does not mount leaves them for the next save.
-    let saved = with_card(card, Access::Writable, |boot| {
-        let unsaved = lock(log).take_unsaved();
-        bootpart::append_log(boot, &log_entry(&unsaved))
-    });
-    match saved {
+    match with_card(card, Access::Writable, |boot| save_log(boot, log)) {
         Ok(Ok(())) => {}
         Ok(Err(error)) => log::error!("log.txt: {error}"),
         Err(error) => log::error!("log.txt: mounting {BOOT_DEV}: {error}"),
     }
 }
 
-/// Lays out log lines for the file on the card, under a header that names the build.
-fn log_entry(unsaved: &str) -> String {
-    format!("==== boot, build {BUILD_EPOCH} ====\n{unsaved}")
+/// Appends the lines not yet saved to the log on the card, which is mounted at `boot`.
+///
+/// The lines are taken only here, with the card mounted, so that a card
+/// that does not mount leaves them for the next save.
+fn save_log(boot: &Path, log: &Mutex<LogBuf>) -> io::Result<()> {
+    let entry = log_entry(&mut lock(log));
+    bootpart::append_log(boot, &entry)
+}
+
+/// Takes the lines not yet saved and lays them out for the file on the card.
+///
+/// What a boot saves first goes under a header that names the build. What
+/// it saves later only continues that, so the file shows one boot as one.
+fn log_entry(buf: &mut LogBuf) -> String {
+    let first_of_this_boot = !buf.taken();
+    let unsaved = buf.take_unsaved();
+    if first_of_this_boot {
+        bootpart::boot_header(BUILD_EPOCH) + &unsaved
+    } else {
+        unsaved
+    }
 }
 
 /// Step 10: keeps the watchdog petted, and restarts when the configured time has passed.
@@ -350,6 +413,7 @@ fn fatal(message: &str) -> ! {
         CONFIG.get(),
         &mut SdCard,
         log.filter(|_| !log_in_use),
+        RESCUE_DEV_WAIT,
         &mut pet_watchdog,
     );
     pause(FATAL_PAUSE);
@@ -380,14 +444,16 @@ fn rescue_plan(cfg: Option<&Config>) -> Rescue {
 
 /// What `fatal` does to the card: whatever `rescue_plan` says, and no more.
 ///
-/// The card is mounted only if there is something to do on it. Errors are
-/// ignored: the restart comes whatever happens. `log` is the log to save,
-/// and `None` if it must not be used; this logs only when it has one. `pet`
-/// is called between the restore and the saving of the log.
+/// The card is waited for and mounted only if there is something to do on
+/// it. Errors are ignored: the restart comes whatever happens. `log` is the
+/// log to save, and `None` if it must not be used; this logs only when it has
+/// one. `wait` is how long the card is waited for. `pet` is called during
+/// that wait, and between the restore and the saving of the log.
 fn rescue(
     cfg: Option<&Config>,
     card: &mut dyn Card,
     log: Option<&Mutex<LogBuf>>,
+    wait: Duration,
     pet: &mut dyn FnMut(),
 ) {
     let plan = rescue_plan(cfg);
@@ -395,24 +461,23 @@ fn rescue(
     if !plan.restore_config && log_to_save.is_none() {
         return;
     }
-    // The failure may have come while the partition was mounted.
-    let _ = card.unmount();
+    // Init starts before the kernel has read the card's partitions, so a
+    // failure in the first steps comes when there is nothing to mount yet.
+    // The mount is tried even when the wait ran out: nothing is lost by it.
+    wait_for_card(card, wait, pet);
     let _ = on_card(card, Access::Writable, |boot| {
         if plan.restore_config {
             let restored = bootpart::restore_pios_config(boot);
             if log.is_some() {
-                match restored {
-                    Ok(outcome) => log::info!("config.txt: {outcome:?}"),
-                    Err(error) => log::error!("config.txt: {error}"),
-                }
+                log_restore(&restored);
             }
         }
         // The restore and the log are each a write that waits for the card.
         pet();
         if let Some(mut buf) = log_to_save.and_then(lock_if_free) {
-            let unsaved = buf.take_unsaved();
+            let entry = log_entry(&mut buf);
             drop(buf);
-            let _ = bootpart::append_log(boot, &log_entry(&unsaved));
+            let _ = bootpart::append_log(boot, &entry);
         }
     });
 }
@@ -430,6 +495,8 @@ fn install_panic_hook() {
 
 /// The boot partition of the SD card, as the boot sequence uses it.
 trait Card {
+    /// Whether the kernel has found the partition yet.
+    fn present(&self) -> bool;
     /// Where the partition's files are while it is mounted.
     fn dir(&self) -> &Path;
     fn mount(&mut self, access: Access) -> io::Result<()>;
@@ -449,6 +516,10 @@ enum Access {
 struct SdCard;
 
 impl Card for SdCard {
+    fn present(&self) -> bool {
+        Path::new(BOOT_DEV).exists()
+    }
+
     fn dir(&self) -> &Path {
         Path::new(MOUNT_POINT)
     }
@@ -471,11 +542,17 @@ impl Card for SdCard {
 /// After a writable mount, everything is first synced to the card. Returns
 /// what `work` returned, with how the unmount went. If the mount fails, that
 /// is the error, and `work` is not run.
+///
+/// The partition is unmounted before it is mounted, too. A failure can come
+/// while it is mounted, and an unmount can fail; a mount on top of that
+/// would be refused as busy, and a restore skipped. Most often nothing is
+/// mounted, and the error that says so is ignored.
 fn on_card<T>(
     card: &mut dyn Card,
     access: Access,
     work: impl FnOnce(&Path) -> T,
 ) -> io::Result<(T, io::Result<()>)> {
+    let _ = card.unmount();
     card.mount(access)?;
     let done = work(card.dir());
     if access == Access::Writable {
@@ -495,6 +572,11 @@ fn with_card<T>(
         log::warn!("unmounting {BOOT_DEV}: {error}");
     }
     Ok(done)
+}
+
+/// Waits until the kernel has found the card or `timeout` has passed, calling `pet` meanwhile; says which.
+fn wait_for_card(card: &dyn Card, timeout: Duration, pet: &mut dyn FnMut()) -> bool {
+    wait_until(timeout, POLL_EVERY, PET_EVERY, pet, &mut || card.present())
 }
 
 /// Waits until `ready` holds or the timeout has passed, petting the watchdog meanwhile.
@@ -574,7 +656,7 @@ fn lock_if_free<T>(mutex: &Mutex<T>) -> Option<MutexGuard<'_, T>> {
 mod tests {
     use super::*;
 
-    use std::cell::RefCell;
+    use std::cell::{Cell, RefCell};
     use std::fs;
     use std::io::ErrorKind;
     use std::sync::{Arc, mpsc};
@@ -635,6 +717,8 @@ mod tests {
         mounted: bool,
         mount_fails: bool,
         unmount_fails: bool,
+        /// How many more times the card is asked for before the kernel has found it.
+        absent_for: Cell<usize>,
     }
 
     impl FakeCard {
@@ -651,7 +735,15 @@ mod tests {
                 mounted: false,
                 mount_fails: false,
                 unmount_fails: false,
+                absent_for: Cell::new(0),
             }
+        }
+
+        /// A card the kernel finds only after it was asked for this many times.
+        fn found_after(asks: usize) -> Self {
+            let card = Self::new();
+            card.absent_for.set(asks);
+            card
         }
 
         fn read(&self, name: &str) -> String {
@@ -672,6 +764,12 @@ mod tests {
     }
 
     impl Card for FakeCard {
+        fn present(&self) -> bool {
+            let left = self.absent_for.get();
+            self.absent_for.set(left.saturating_sub(1));
+            left == 0
+        }
+
         fn dir(&self) -> &Path {
             self.dir.path()
         }
@@ -681,6 +779,9 @@ mod tests {
                 Access::ReadOnly => "mount read-only",
                 Access::Writable => "mount writable",
             });
+            if self.absent_for.get() > 0 {
+                return Err(ErrorKind::NotFound.into());
+            }
             if self.mount_fails || self.mounted {
                 return Err(ErrorKind::ResourceBusy.into());
             }
@@ -702,9 +803,10 @@ mod tests {
         }
     }
 
-    const WRITE_OPS: [&str; 3] = ["mount writable", "sync", "unmount"];
-    /// What `rescue` does: it first unmounts whatever the failure left mounted.
-    const RESCUE_OPS: [&str; 4] = ["unmount", "mount writable", "sync", "unmount"];
+    /// What a read of the card does: it first unmounts whatever was left mounted.
+    const READ_OPS: [&str; 3] = ["unmount", "mount read-only", "unmount"];
+    /// What a write to the card does: the same, with a sync before the last unmount.
+    const WRITE_OPS: [&str; 4] = ["unmount", "mount writable", "sync", "unmount"];
 
     #[test]
     fn banner_names_version_and_build() {
@@ -850,6 +952,58 @@ mod tests {
     }
 
     #[test]
+    fn a_wait_sees_a_path_that_appears_late_and_times_out_on_one_that_never_does() {
+        let tmp = tempfile::tempdir().unwrap();
+        let late = tmp.path().join("late");
+        let start = Instant::now();
+        let creator = thread::spawn({
+            let late = late.clone();
+            move || {
+                thread::sleep(150 * MS);
+                File::create(late).unwrap();
+            }
+        });
+        let found = wait_until(2000 * MS, 5 * MS, LONG, &mut || {}, &mut || late.exists());
+        let waited = start.elapsed();
+        assert!(found);
+        assert!(waited >= 150 * MS && waited < 2000 * MS, "{waited:?}");
+        creator.join().unwrap();
+
+        let never = tmp.path().join("never");
+        let start = Instant::now();
+        let found = wait_until(200 * MS, 5 * MS, LONG, &mut || {}, &mut || never.exists());
+        assert!(!found);
+        assert!(start.elapsed() >= 200 * MS);
+    }
+
+    #[test]
+    fn the_card_is_waited_for_two_minutes_at_boot_and_half_a_minute_on_the_way_out() {
+        // Giving up at boot is a fatal error, and the way out of that needs
+        // the card as well. No watchdog runs yet, so a long wait costs
+        // nothing. The way out gives up sooner: a board with no card at all
+        // still restarts.
+        assert_eq!(BOOT_DEV_WAIT, Duration::from_secs(120));
+        assert_eq!(RESCUE_DEV_WAIT, Duration::from_secs(30));
+    }
+
+    #[test]
+    fn a_card_the_kernel_finds_late_is_waited_for_and_the_watchdog_petted_meanwhile() {
+        let card = FakeCard::found_after(3);
+        let mut pets = 0;
+        assert!(wait_for_card(&card, LONG, &mut || pets += 1));
+        assert_eq!(card.absent_for.get(), 0);
+        assert!(pets >= 1, "{pets} pets");
+    }
+
+    #[test]
+    fn a_card_that_never_appears_is_given_up_on_when_the_time_has_passed() {
+        let card = FakeCard::found_after(usize::MAX);
+        let start = Instant::now();
+        assert!(!wait_for_card(&card, 120 * MS, &mut || {}));
+        assert!(start.elapsed() >= 120 * MS);
+    }
+
+    #[test]
     fn a_lock_that_is_held_is_not_waited_for() {
         let mutex = Mutex::new(7);
         {
@@ -893,7 +1047,7 @@ mod tests {
         let mut card = FakeCard::new();
         let cfg = load_config(&mut card).unwrap();
         assert_eq!(cfg.hostname, "qberrypi");
-        assert_eq!(card.ops, ["mount read-only", "unmount"]);
+        assert_eq!(card.ops, READ_OPS);
     }
 
     #[test]
@@ -905,7 +1059,7 @@ mod tests {
             load_config(&mut card).unwrap_err(),
             format!("qberrypi.toml: {not_found}")
         );
-        assert_eq!(card.ops, ["mount read-only", "unmount"]);
+        assert_eq!(card.ops, READ_OPS);
     }
 
     #[test]
@@ -915,7 +1069,7 @@ mod tests {
         let expected = config::parse("this is not toml").unwrap_err().to_string();
         assert!(expected.starts_with("qberrypi.toml: "));
         assert_eq!(load_config(&mut card).unwrap_err(), expected);
-        assert_eq!(card.ops, ["mount read-only", "unmount"]);
+        assert_eq!(card.ops, READ_OPS);
     }
 
     #[test]
@@ -939,7 +1093,7 @@ mod tests {
             load_config(&mut card).unwrap_err(),
             format!("mounting /dev/mmcblk0p1: {busy}")
         );
-        assert_eq!(card.ops, ["mount read-only"]);
+        assert_eq!(card.ops, ["unmount", "mount read-only"]);
     }
 
     #[test]
@@ -949,30 +1103,67 @@ mod tests {
         assert_eq!(load_config(&mut card).unwrap().hostname, "qberrypi");
     }
 
-    // Step 4: one-shot mode.
+    // Step 4: the first write to the card.
 
     #[test]
     fn one_shot_restores_config_txt_then_syncs_and_unmounts() {
         let mut card = FakeCard::new();
-        restore_if_one_shot(&cfg_with_one_shot(true), &mut card);
+        let log = log_holding(&["banner"]);
+        restore_and_save_log(&cfg_debug(true, false), &mut card, &log);
         assert_eq!(card.read("config.txt"), PIOS);
+        assert_eq!(card.ops, WRITE_OPS);
+        // The log is not asked for on the card, and stays in memory.
+        assert!(!card.has("qberrypi/log.txt"));
+        assert_eq!(log.lock().unwrap().take_unsaved(), "banner\n");
+    }
+
+    #[test]
+    fn without_one_shot_or_the_log_the_card_is_not_touched() {
+        let mut card = FakeCard::new();
+        let log = log_holding(&["banner"]);
+        restore_and_save_log(&cfg_debug(false, false), &mut card, &log);
+        assert!(card.ops.is_empty());
+        assert_eq!(card.read("config.txt"), QBERRYPI);
+        assert!(!card.has("qberrypi/log.txt"));
+        assert_eq!(log.lock().unwrap().take_unsaved(), "banner\n");
+    }
+
+    #[test]
+    fn one_shot_with_the_log_on_saves_it_in_the_same_mount_as_the_restore() {
+        // The watchdog is not running yet and no driver is loaded: a boot
+        // that dies in either has already left these lines on the card.
+        let mut card = FakeCard::new();
+        let log = log_holding(&["banner", "clock: set to the build time"]);
+        restore_and_save_log(&cfg_debug(true, true), &mut card, &log);
+        assert_eq!(card.read("config.txt"), PIOS);
+        assert_eq!(
+            card.read("qberrypi/log.txt"),
+            header() + "banner\nclock: set to the build time\n"
+        );
+        // One mount for both.
+        assert_eq!(card.ops, WRITE_OPS);
+        assert_eq!(log.lock().unwrap().take_unsaved(), "");
+    }
+
+    #[test]
+    fn a_permanent_system_with_the_log_on_saves_it_at_the_same_point_and_leaves_config_txt() {
+        let mut card = FakeCard::new();
+        let log = log_holding(&["banner"]);
+        restore_and_save_log(&cfg_debug(false, true), &mut card, &log);
+        assert_eq!(card.read("config.txt"), QBERRYPI);
+        assert_eq!(card.read("config.pios.txt"), PIOS);
+        assert_eq!(card.read("qberrypi/log.txt"), header() + "banner\n");
         assert_eq!(card.ops, WRITE_OPS);
     }
 
     #[test]
-    fn without_one_shot_the_card_is_not_touched() {
-        let mut card = FakeCard::new();
-        restore_if_one_shot(&cfg_with_one_shot(false), &mut card);
-        assert!(card.ops.is_empty());
-        assert_eq!(card.read("config.txt"), QBERRYPI);
-    }
-
-    #[test]
-    fn a_backup_that_is_refused_still_ends_in_sync_and_unmount() {
+    fn a_backup_that_is_refused_still_ends_in_sync_and_unmount_and_the_log_is_saved() {
         let mut card = FakeCard::new();
         card.remove("config.pios.txt");
-        restore_if_one_shot(&cfg_with_one_shot(true), &mut card);
+        let log = log_holding(&["banner"]);
+        restore_and_save_log(&cfg_debug(true, true), &mut card, &log);
         assert_eq!(card.read("config.txt"), QBERRYPI);
+        assert_eq!(card.read("qberrypi/log.txt"), header() + "banner\n");
         assert_eq!(card.ops, WRITE_OPS);
     }
 
@@ -982,9 +1173,62 @@ mod tests {
         // A directory where the backup should be can be neither read nor restored.
         card.remove("config.pios.txt");
         fs::create_dir(card.dir().join("config.pios.txt")).unwrap();
-        restore_if_one_shot(&cfg_with_one_shot(true), &mut card);
+        restore_and_save_log(&cfg_debug(true, false), &mut card, &log_holding(&[]));
         assert_eq!(card.read("config.txt"), QBERRYPI);
         assert_eq!(card.ops, WRITE_OPS);
+    }
+
+    #[test]
+    fn a_partition_left_mounted_is_unmounted_before_the_restore() {
+        // The unmount after the configuration was read has failed.
+        let mut card = FakeCard::new();
+        card.mount(Access::ReadOnly).unwrap();
+        card.ops.clear();
+        restore_and_save_log(&cfg_debug(true, false), &mut card, &log_holding(&[]));
+        assert_eq!(card.read("config.txt"), PIOS);
+        assert_eq!(card.ops, WRITE_OPS);
+        assert!(!card.mounted);
+    }
+
+    #[test]
+    fn a_card_that_does_not_mount_for_the_first_write_keeps_the_log_for_the_next_save() {
+        let mut card = FakeCard::new();
+        let log = log_holding(&["banner"]);
+        let cfg = cfg_debug(true, true);
+
+        card.mount_fails = true;
+        restore_and_save_log(&cfg, &mut card, &log);
+        assert_eq!(card.read("config.txt"), QBERRYPI);
+        assert!(!card.has("qberrypi/log.txt"));
+
+        card.mount_fails = false;
+        save_log_if_asked(&cfg, &mut card, &log);
+        assert_eq!(card.read("qberrypi/log.txt"), header() + "banner\n");
+    }
+
+    #[test]
+    fn a_restore_that_was_refused_or_that_failed_is_logged_as_an_error() {
+        let line = |text: &str| text.to_owned();
+        assert_eq!(
+            restore_report(&Ok(Restore::Restored)),
+            (Level::Info, line("config.txt: Restored"))
+        );
+        assert_eq!(
+            restore_report(&Ok(Restore::AlreadyRestored)),
+            (Level::Info, line("config.txt: AlreadyRestored"))
+        );
+        // The card still starts qberrypi: nothing less than an error.
+        assert_eq!(
+            restore_report(&Ok(Restore::Refused("config.pios.txt is missing"))),
+            (
+                Level::Error,
+                line("config.txt: Refused(\"config.pios.txt is missing\")")
+            )
+        );
+        assert_eq!(
+            restore_report(&Err(io::Error::other("the card went away"))),
+            (Level::Error, line("config.txt: the card went away"))
+        );
     }
 
     // Step 6: the Wi-Fi driver.
@@ -1124,11 +1368,17 @@ mod tests {
     // Step 9: the log on the card.
 
     #[test]
-    fn a_saved_log_starts_with_the_build_header() {
+    fn only_the_first_entry_of_a_boot_starts_with_the_build_header() {
+        let mut buf = LogBuf::new(4096);
+        buf.push("a");
+        buf.push("b");
         assert_eq!(
-            log_entry("a\nb\n"),
+            log_entry(&mut buf),
             format!("==== boot, build {} ====\na\nb\n", crate::BUILD_EPOCH)
         );
+        buf.push("c");
+        assert_eq!(log_entry(&mut buf), "c\n");
+        assert_eq!(log_entry(&mut buf), "");
     }
 
     #[test]
@@ -1141,13 +1391,48 @@ mod tests {
         assert_eq!(card.read("qberrypi/log.txt"), header() + "first\n");
         assert_eq!(card.ops, WRITE_OPS);
 
+        // What is saved later goes under the header the boot already has.
         log.lock().unwrap().push("second");
         save_log_if_asked(&cfg, &mut card, &log);
+        assert_eq!(card.read("qberrypi/log.txt"), header() + "first\nsecond\n");
+        assert_eq!(card.ops, [WRITE_OPS, WRITE_OPS].concat());
+    }
+
+    #[test]
+    fn a_boot_that_saves_its_log_three_times_reads_as_one_boot() {
+        // A one-shot boot that keeps its log: with the restore, after the
+        // kernel's log was copied, and at the return.
+        let mut card = FakeCard::new();
+        let log = log_holding(&["banner"]);
+        let cfg = cfg_debug(true, true);
+
+        restore_and_save_log(&cfg, &mut card, &log);
+        log.lock().unwrap().push("kernel: one");
+        save_log_if_asked(&cfg, &mut card, &log);
+        log.lock().unwrap().push("returning");
+        save_log_if_asked(&cfg, &mut card, &log);
+
         assert_eq!(
             card.read("qberrypi/log.txt"),
-            header() + "first\n" + &header() + "second\n"
+            header() + "banner\nkernel: one\nreturning\n"
         );
-        assert_eq!(card.ops, [WRITE_OPS, WRITE_OPS].concat());
+        assert_eq!(card.ops, [WRITE_OPS, WRITE_OPS, WRITE_OPS].concat());
+    }
+
+    #[test]
+    fn a_failure_after_the_log_was_first_saved_adds_its_lines_under_the_same_header() {
+        let mut card = FakeCard::new();
+        let log = log_holding(&["banner"]);
+        let cfg = cfg_debug(true, true);
+
+        restore_and_save_log(&cfg, &mut card, &log);
+        log.lock().unwrap().push("loading brcmfmac: bad signature");
+        rescue(Some(&cfg), &mut card, Some(&log), LONG, &mut || {});
+
+        assert_eq!(
+            card.read("qberrypi/log.txt"),
+            header() + "banner\nloading brcmfmac: bad signature\n"
+        );
     }
 
     #[test]
@@ -1225,13 +1510,13 @@ mod tests {
     fn a_failure_before_the_config_is_known_restores_config_txt_and_saves_the_log() {
         let mut card = FakeCard::new();
         let log = log_holding(&["qberrypi.toml: (syntax): not valid TOML"]);
-        rescue(None, &mut card, Some(&log), &mut || {});
+        rescue(None, &mut card, Some(&log), LONG, &mut || {});
         assert_eq!(card.read("config.txt"), PIOS);
         assert_eq!(
             card.read("qberrypi/log.txt"),
             header() + "qberrypi.toml: (syntax): not valid TOML\n"
         );
-        assert_eq!(card.ops, RESCUE_OPS);
+        assert_eq!(card.ops, WRITE_OPS);
         assert!(!card.mounted);
     }
 
@@ -1245,6 +1530,7 @@ mod tests {
                 Some(&cfg_debug(true, log_to_sd)),
                 &mut card,
                 Some(&log),
+                LONG,
                 &mut || {},
             );
             assert_eq!(card.read("config.txt"), PIOS);
@@ -1252,7 +1538,7 @@ mod tests {
                 card.read("qberrypi/log.txt"),
                 header() + "loading brcmfmac: bad signature\n"
             );
-            assert_eq!(card.ops, RESCUE_OPS);
+            assert_eq!(card.ops, WRITE_OPS);
             assert!(!card.mounted);
         }
     }
@@ -1265,6 +1551,7 @@ mod tests {
             Some(&cfg_debug(false, true)),
             &mut card,
             Some(&log),
+            LONG,
             &mut || {},
         );
         assert_eq!(card.read("config.txt"), QBERRYPI);
@@ -1273,7 +1560,7 @@ mod tests {
             card.read("qberrypi/log.txt"),
             header() + "loading brcmfmac: bad signature\n"
         );
-        assert_eq!(card.ops, RESCUE_OPS);
+        assert_eq!(card.ops, WRITE_OPS);
         assert!(!card.mounted);
     }
 
@@ -1285,6 +1572,7 @@ mod tests {
             Some(&cfg_debug(false, false)),
             &mut card,
             Some(&log),
+            LONG,
             &mut || {},
         );
         assert!(card.ops.is_empty());
@@ -1299,7 +1587,13 @@ mod tests {
     #[test]
     fn with_only_the_log_to_save_and_no_log_to_use_the_card_is_never_mounted() {
         let mut card = FakeCard::new();
-        rescue(Some(&cfg_debug(false, true)), &mut card, None, &mut || {});
+        rescue(
+            Some(&cfg_debug(false, true)),
+            &mut card,
+            None,
+            LONG,
+            &mut || {},
+        );
         assert!(card.ops.is_empty());
         assert_eq!(card.read("config.txt"), QBERRYPI);
         assert!(!card.has("qberrypi/log.txt"));
@@ -1312,11 +1606,12 @@ mod tests {
         let log = log_holding(&["first"]);
         // What the card held each time the watchdog was petted.
         let mut seen = Vec::new();
-        rescue(None, &mut card, Some(&log), &mut || {
+        rescue(None, &mut card, Some(&log), LONG, &mut || {
             let restored = fs::read_to_string(dir.join("config.txt")).unwrap() == PIOS;
             seen.push((restored, dir.join("qberrypi/log.txt").exists()));
         });
-        assert_eq!(seen, [(true, false)]);
+        // Once as the wait for the card begins, once between the two writes.
+        assert_eq!(seen, [(false, false), (true, false)]);
         assert_eq!(card.read("qberrypi/log.txt"), header() + "first\n");
     }
 
@@ -1327,11 +1622,62 @@ mod tests {
         let log = log_holding(&["first"]);
         let mut seen = Vec::new();
         let cfg = cfg_debug(false, true);
-        rescue(Some(&cfg), &mut card, Some(&log), &mut || {
+        rescue(Some(&cfg), &mut card, Some(&log), LONG, &mut || {
             seen.push(dir.join("qberrypi/log.txt").exists());
         });
-        assert_eq!(seen, [false]);
+        assert_eq!(seen, [false, false]);
         assert_eq!(card.read("qberrypi/log.txt"), header() + "first\n");
+    }
+
+    #[test]
+    fn a_failure_before_the_kernel_has_found_the_card_waits_for_it_and_then_restores() {
+        // Init runs before the kernel has read the card's partitions, so a
+        // failure in the first steps comes when there is no device to mount.
+        let mut card = FakeCard::found_after(3);
+        let log = log_holding(&["setting the clock: Operation not permitted"]);
+        let mut pets = 0;
+        rescue(None, &mut card, Some(&log), LONG, &mut || pets += 1);
+        assert_eq!(card.read("config.txt"), PIOS);
+        assert_eq!(
+            card.read("qberrypi/log.txt"),
+            header() + "setting the clock: Operation not permitted\n"
+        );
+        assert_eq!(card.ops, WRITE_OPS);
+        // While it waited, and between the restore and the log.
+        assert!(pets >= 2, "{pets} pets");
+    }
+
+    #[test]
+    fn a_card_that_never_appears_does_not_keep_the_rescue_from_ending() {
+        let mut card = FakeCard::found_after(usize::MAX);
+        let log = log_holding(&["first"]);
+        let start = Instant::now();
+        rescue(None, &mut card, Some(&log), 100 * MS, &mut || {});
+        let took = start.elapsed();
+        assert!(
+            took >= 100 * MS && took < Duration::from_secs(5),
+            "{took:?}"
+        );
+        assert_eq!(card.read("config.txt"), QBERRYPI);
+        assert_eq!(log.lock().unwrap().take_unsaved(), "first\n");
+    }
+
+    #[test]
+    fn with_nothing_to_do_on_the_card_the_rescue_does_not_wait_for_it() {
+        let mut card = FakeCard::found_after(usize::MAX);
+        let log = log_holding(&["first"]);
+        let start = Instant::now();
+        rescue(
+            Some(&cfg_debug(false, false)),
+            &mut card,
+            Some(&log),
+            LONG,
+            &mut || panic!("the watchdog was petted for a wait"),
+        );
+        assert!(start.elapsed() < Duration::from_secs(5));
+        assert!(card.ops.is_empty());
+        // The card was not so much as asked for.
+        assert_eq!(card.absent_for.get(), usize::MAX);
     }
 
     #[test]
@@ -1339,9 +1685,9 @@ mod tests {
         let mut card = FakeCard::new();
         card.mount(Access::ReadOnly).unwrap();
         card.ops.clear();
-        rescue(None, &mut card, None, &mut || {});
+        rescue(None, &mut card, None, LONG, &mut || {});
         assert_eq!(card.read("config.txt"), PIOS);
-        assert_eq!(card.ops, RESCUE_OPS);
+        assert_eq!(card.ops, WRITE_OPS);
         assert!(!card.mounted);
     }
 
@@ -1356,7 +1702,7 @@ mod tests {
             let log = Arc::clone(&log);
             move || {
                 let mut card = FakeCard::new();
-                rescue(None, &mut card, Some(&log), &mut || {});
+                rescue(None, &mut card, Some(&log), LONG, &mut || {});
                 done.send(card)
             }
         });
@@ -1366,7 +1712,7 @@ mod tests {
         drop(held);
         assert_eq!(card.read("config.txt"), PIOS);
         assert!(!card.has("qberrypi/log.txt"));
-        assert_eq!(card.ops, RESCUE_OPS);
+        assert_eq!(card.ops, WRITE_OPS);
     }
 
     #[test]
@@ -1374,10 +1720,10 @@ mod tests {
         let mut card = FakeCard::new();
         card.remove("config.pios.txt");
         let log = log_holding(&["first"]);
-        rescue(None, &mut card, Some(&log), &mut || {});
+        rescue(None, &mut card, Some(&log), LONG, &mut || {});
         assert_eq!(card.read("config.txt"), QBERRYPI);
         assert_eq!(card.read("qberrypi/log.txt"), header() + "first\n");
-        assert_eq!(card.ops, RESCUE_OPS);
+        assert_eq!(card.ops, WRITE_OPS);
     }
 
     #[test]
@@ -1385,7 +1731,7 @@ mod tests {
         let mut card = FakeCard::new();
         card.mount_fails = true;
         let log = log_holding(&["first"]);
-        rescue(None, &mut card, Some(&log), &mut || {});
+        rescue(None, &mut card, Some(&log), LONG, &mut || {});
         assert_eq!(card.ops, ["unmount", "mount writable"]);
         assert_eq!(card.read("config.txt"), QBERRYPI);
         assert_eq!(log.lock().unwrap().take_unsaved(), "first\n");

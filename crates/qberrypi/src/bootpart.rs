@@ -28,6 +28,10 @@ const OWN_DIR: &str = "qberrypi";
 const CONFIG_TEXT: &str = "qberrypi.toml";
 const LOG_FILE: &str = "log.txt";
 
+/// What a boot's header in the log has before the build time and after it.
+const BOOT_HEADER_START: &str = "==== boot, build ";
+const BOOT_HEADER_END: &str = " ====";
+
 /// The setting that makes the firmware start qberrypi.
 const SELECTS_QBERRYPI: &[u8] = b"os_prefix=qberrypi/";
 
@@ -115,8 +119,10 @@ pub fn read_config_text(boot: &Path) -> io::Result<String> {
 
 /// Adds text to the end of `qberrypi/log.txt` and waits until it is on the card.
 ///
-/// A log already larger than `LOG_FILE_CAP` is emptied first. The `qberrypi`
-/// folder is made if it is missing; the mount point itself never is.
+/// A log already larger than `LOG_FILE_CAP` is emptied first, but only for
+/// text that starts a boot, with `boot_header`: a boot saves its log in
+/// several pieces, and none of them may be cut off from its header. The
+/// `qberrypi` folder is made if it is missing; the mount point itself never is.
 pub fn append_log(boot: &Path, text: &str) -> io::Result<()> {
     let dir = boot.join(OWN_DIR);
     match fs::create_dir(&dir) {
@@ -127,11 +133,34 @@ pub fn append_log(boot: &Path, text: &str) -> io::Result<()> {
         .append(true)
         .create(true)
         .open(dir.join(LOG_FILE))?;
-    if file.metadata()?.len() > LOG_FILE_CAP {
+    if text.starts_with(BOOT_HEADER_START) && file.metadata()?.len() > LOG_FILE_CAP {
         file.set_len(0)?;
     }
     file.write_all(text.as_bytes())?;
     file.sync_all()
+}
+
+/// The line that starts a boot's entry in `qberrypi/log.txt`: it names the build that booted.
+pub fn boot_header(build_epoch: u64) -> String {
+    format!("{BOOT_HEADER_START}{build_epoch}{BOOT_HEADER_END}\n")
+}
+
+/// Reads from the text of `qberrypi/log.txt` which build its last boot was of.
+///
+/// `None` if the log has no header, or if its last header names no build.
+pub fn last_boot_build(log: &str) -> Option<u64> {
+    let header = log
+        .lines()
+        .rev()
+        .find(|line| line.starts_with(BOOT_HEADER_START))?;
+    let build = header
+        .strip_prefix(BOOT_HEADER_START)?
+        .strip_suffix(BOOT_HEADER_END)?;
+    // `parse` alone would take a sign.
+    if !build.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    build.parse().ok()
 }
 
 /// Waits for a path to exist, such as a device the kernel has yet to find.
@@ -399,8 +428,71 @@ mod tests {
         append_log(d, "two\n").unwrap();
         assert_eq!(read(d, "qberrypi/log.txt"), "one\ntwo\n");
         write(d, LOG, vec![b'x'; LOG_FILE_CAP as usize + 1]);
-        append_log(d, "three\n").unwrap();
-        assert_eq!(read(d, "qberrypi/log.txt"), "three\n");
+        let first_of_a_boot = boot_header(5) + "three\n";
+        append_log(d, &first_of_a_boot).unwrap();
+        assert_eq!(read(d, "qberrypi/log.txt"), first_of_a_boot);
+    }
+
+    #[test]
+    fn a_log_over_the_cap_is_not_started_afresh_in_the_middle_of_a_boot() {
+        // A boot saves its log several times under one header. If a later
+        // save emptied the file, what is left would be the end of a boot with
+        // nothing to say which build it was.
+        let tmp = tempfile::tempdir().unwrap();
+        let d = tmp.path();
+        let first_of_a_boot = boot_header(5) + "banner\n";
+        append_log(d, &first_of_a_boot).unwrap();
+        let grown = first_of_a_boot + &"x".repeat(LOG_FILE_CAP as usize);
+        write(d, LOG, &grown);
+
+        append_log(d, "returning\n").unwrap();
+
+        // Compared by parts: a megabyte in a failure message helps no one.
+        let after = read(d, LOG);
+        assert_eq!(after.len(), grown.len() + "returning\n".len());
+        assert!(after.starts_with(&boot_header(5)));
+        assert!(after.ends_with("xreturning\n"));
+    }
+
+    #[test]
+    fn a_boot_header_names_the_build_and_reads_back() {
+        assert_eq!(
+            boot_header(1_700_000_000),
+            "==== boot, build 1700000000 ====\n"
+        );
+        assert_eq!(
+            last_boot_build(&boot_header(1_700_000_000)),
+            Some(1_700_000_000)
+        );
+        assert_eq!(last_boot_build(&boot_header(u64::MAX)), Some(u64::MAX));
+    }
+
+    #[test]
+    fn the_last_boot_of_a_log_is_the_one_of_its_last_header() {
+        let two_boots = format!("{}a\n{}b\nc\n", boot_header(1), boot_header(2));
+        assert_eq!(last_boot_build(&two_boots), Some(2));
+        // A file that lost its newlines' partners on another system still reads.
+        assert_eq!(last_boot_build(&two_boots.replace('\n', "\r\n")), Some(2));
+        assert_eq!(last_boot_build("a\nb\n"), None);
+        assert_eq!(last_boot_build(""), None);
+    }
+
+    #[test]
+    fn a_header_is_a_whole_line_and_a_damaged_last_one_is_not_passed_over() {
+        // A kernel message that quotes a header is not one.
+        let quoted = "[   1.000] INFO  kernel: ==== boot, build 5 ====\n";
+        assert_eq!(last_boot_build(quoted), None);
+        // Nor is the log then taken for the boot before.
+        for damaged in [
+            "==== boot, build x ====",
+            "==== boot, build  ====",
+            "==== boot, build 3",
+            "==== boot, build 3 ==== and more",
+            "==== boot, build -3 ====",
+        ] {
+            let log = format!("{}a\n{damaged}\nb\n", boot_header(1));
+            assert_eq!(last_boot_build(&log), None, "{damaged}");
+        }
     }
 
     #[test]

@@ -25,6 +25,8 @@ pub struct LogBuf {
     cap_bytes: usize,
     /// How many of the newest lines `take_unsaved` has not yet returned.
     unsaved: usize,
+    /// Whether `take_unsaved` has been called.
+    taken: bool,
     dropped: u64,
 }
 
@@ -36,6 +38,7 @@ impl LogBuf {
             bytes: 0,
             cap_bytes,
             unsaved: 0,
+            taken: false,
             dropped: 0,
         }
     }
@@ -73,7 +76,13 @@ impl LogBuf {
             text.push('\n');
         }
         self.unsaved = 0;
+        self.taken = true;
         text
+    }
+
+    /// Whether `take_unsaved` has been called: what it returns next is not the start of the log.
+    pub fn taken(&self) -> bool {
+        self.taken
     }
 
     /// How many lines have been discarded to stay under the cap.
@@ -212,6 +221,18 @@ mod tests {
                 && !text.contains("line number 00")
         );
         assert!(b.dropped() > 0);
+    }
+
+    #[test]
+    fn the_buffer_knows_whether_its_lines_were_taken_before() {
+        let mut b = LogBuf::new(1024);
+        assert!(!b.taken());
+        b.push("a");
+        assert!(!b.taken());
+        assert_eq!(b.take_unsaved(), "a\n");
+        assert!(b.taken());
+        b.push("b");
+        assert!(b.taken());
     }
 
     #[test]

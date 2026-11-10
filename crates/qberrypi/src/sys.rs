@@ -69,22 +69,39 @@ const PSEUDO_MOUNTS: [PseudoMount; 4] = [
 
 /// Mounts `/proc`, `/sys`, `/dev` and a tmpfs at `/run`, making the directories if needed.
 ///
-/// Stops at the first that fails; the error names it.
+/// All four are tried whatever becomes of the others: `/dev` is where the
+/// console and the card are, and a failure elsewhere must not cost those.
+/// The error is the first failure, and names what could not be mounted.
 pub fn mount_pseudo() -> io::Result<()> {
-    for mount in &PSEUDO_MOUNTS {
-        let named = |error: io::Error| {
-            io::Error::new(error.kind(), format!("mounting {}: {error}", mount.target))
-        };
-        fs::create_dir_all(mount.target).map_err(named)?;
-        rustix::mount::mount(
-            mount.fs_type,
-            mount.target,
-            mount.fs_type,
-            mount.flags,
-            mount.options,
-        )
-        .map_err(|errno| named(errno.into()))?;
+    mount_each(&PSEUDO_MOUNTS, &mut mount_one)
+}
+
+/// Makes every one of the mounts with `mount`, then returns the first error, named by its mount.
+fn mount_each(
+    mounts: &[PseudoMount],
+    mount: &mut dyn FnMut(&PseudoMount) -> io::Result<()>,
+) -> io::Result<()> {
+    let mut first_error = None;
+    for wanted in mounts {
+        if let Err(error) = mount(wanted) {
+            first_error.get_or_insert_with(|| {
+                io::Error::new(error.kind(), format!("mounting {}: {error}", wanted.target))
+            });
+        }
     }
+    first_error.map_or(Ok(()), Err)
+}
+
+/// Mounts one of the kernel's filesystems, making its directory if needed.
+fn mount_one(mount: &PseudoMount) -> io::Result<()> {
+    fs::create_dir_all(mount.target)?;
+    rustix::mount::mount(
+        mount.fs_type,
+        mount.target,
+        mount.fs_type,
+        mount.flags,
+        mount.options,
+    )?;
     Ok(())
 }
 
@@ -334,6 +351,37 @@ mod tests {
         let mut watchdog = Watchdog::absent();
         watchdog.pet();
         watchdog.pet();
+    }
+
+    #[test]
+    fn a_filesystem_that_does_not_mount_does_not_keep_the_others_from_being_mounted() {
+        let mut tried = Vec::new();
+        let result = mount_each(&PSEUDO_MOUNTS, &mut |mount| {
+            tried.push(mount.target);
+            match mount.target {
+                "/proc" => Err(std::io::Error::other("no proc here")),
+                "/run" => Err(std::io::Error::other("no tmpfs here")),
+                _ => Ok(()),
+            }
+        });
+        // Without `/dev` there is no console and no card to restore on.
+        assert_eq!(tried, ["/proc", "/sys", "/dev", "/run"]);
+        // The error is the first one, and names what could not be mounted.
+        assert_eq!(
+            result.unwrap_err().to_string(),
+            "mounting /proc: no proc here"
+        );
+    }
+
+    #[test]
+    fn mounts_that_all_succeed_are_no_error() {
+        let mut tried = 0;
+        mount_each(&PSEUDO_MOUNTS, &mut |_| {
+            tried += 1;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(tried, 4);
     }
 
     #[test]
