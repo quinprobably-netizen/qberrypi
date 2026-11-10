@@ -61,6 +61,33 @@ fn module_files(table: &str) -> Result<Vec<String>> {
 /// folder holds what goes onto the card, and nothing else.
 const BUILD_EPOCH_FILE: &str = "out/build-epoch";
 
+/// Reads the build time of the boot folder under `root`, as `cargo xtask build` recorded it.
+///
+/// It is the time in the header of the log that this build leaves on the card.
+pub fn read_build_epoch(root: &Path) -> Result<u64> {
+    let path = root.join(BUILD_EPOCH_FILE);
+    let text = match fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == ErrorKind::NotFound => {
+            bail!(
+                "{} is missing: run `cargo xtask build` first",
+                path.display()
+            )
+        }
+        Err(e) => return Err(e).with_context(|| format!("cannot read {}", path.display())),
+    };
+    let digits = text.strip_suffix('\n').unwrap_or(&text);
+    if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
+        bail!(
+            "{} is not as the build wrote it: run `cargo xtask build`",
+            path.display()
+        );
+    }
+    digits
+        .parse()
+        .map_err(|e| anyhow!("{}: {e}: run `cargo xtask build`", path.display()))
+}
+
 /// The directory in the initramfs where the kernel looks for firmware.
 const FIRMWARE_DIR: &str = "lib/firmware";
 
@@ -285,7 +312,7 @@ fn run_to_success(command: &mut Command) -> Result<()> {
 /// Writes the boot folder under `root` from scratch and returns it.
 ///
 /// `init` is the cross-built executable, and `epoch` the build time it was
-/// given, which is recorded beside the folder for `cargo xtask deploy`. An
+/// given, which is recorded beside the folder for `read_build_epoch`. An
 /// earlier folder is removed only once everything that goes into the new one
 /// is in memory. The record of its build time goes with it, and the new one
 /// is written last: a record never stands for a folder of another build.
@@ -695,6 +722,7 @@ mod tests {
 
         let record = root.path().join("out/build-epoch");
         assert_eq!(fs::read_to_string(record).unwrap(), "1700000123\n");
+        assert_eq!(read_build_epoch(root.path()).unwrap(), EPOCH);
         // What goes onto the card, and what its checksums list, is as it was.
         assert_eq!(files_under(&out).len(), 6);
         let sums = fs::read_to_string(out.join("SHA256SUMS")).unwrap();
@@ -710,8 +738,32 @@ mod tests {
 
         write_boot_folder(root.path(), &extracted, b"ELF", EPOCH + 60).unwrap();
 
-        let record = root.path().join("out/build-epoch");
-        assert_eq!(fs::read_to_string(record).unwrap(), "1700000183\n");
+        assert_eq!(read_build_epoch(root.path()).unwrap(), EPOCH + 60);
+    }
+
+    #[test]
+    fn a_build_time_that_is_missing_or_not_a_number_says_to_run_build() {
+        let root = tempfile::tempdir().unwrap();
+        let e = read_build_epoch(root.path()).unwrap_err();
+        assert!(format!("{e:#}").contains("cargo xtask build"), "{e:#}");
+        assert!(format!("{e:#}").contains("out/build-epoch"), "{e:#}");
+
+        fs::create_dir(root.path().join("out")).unwrap();
+        for text in [
+            "",
+            "\n",
+            "soon\n",
+            "-5\n",
+            "17 00\n",
+            "99999999999999999999999\n",
+        ] {
+            fs::write(root.path().join("out/build-epoch"), text).unwrap();
+            let e = read_build_epoch(root.path()).unwrap_err();
+            assert!(
+                format!("{e:#}").contains("cargo xtask build"),
+                "{text:?}: {e:#}"
+            );
+        }
     }
 
     #[test]

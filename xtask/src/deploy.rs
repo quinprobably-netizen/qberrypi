@@ -4,7 +4,8 @@
 //! the build into a fresh directory under `/tmp` there and hands a script to
 //! `sudo sh -s`; that script alone writes the boot partition, in this order:
 //!
-//! 1. Checks: the stage directory and what is in it, the board, the mount.
+//! 1. Checks: the stage directory and what is in it, the board, the mount, and
+//!    that the mount is the partition and the filesystem that init mounts.
 //! 2. Backup: `config.txt` is saved as `config.pios.txt`, unless a saved one
 //!    is there already; that one is never written.
 //! 3. Backup validation: the saved file must be one qberrypi's init will
@@ -23,6 +24,13 @@
 //! Like init, it writes `config.txt` in place and then cuts it to length, so
 //! the file is never empty on the way.
 //!
+//! When the Pi answers again, `deploy` makes sure that it really went through
+//! qberrypi and back. `config.txt` must be the saved one again: if the boot
+//! firmware did not take qberrypi's folder, Raspberry Pi OS is running on
+//! qberrypi's `config.txt`. And the last boot in the collected log must be of
+//! the build that was deployed, by the build time that `cargo xtask build`
+//! recorded: otherwise the log is one that an earlier run left.
+//!
 //! Every external command is built as a program with its arguments by a
 //! function of its own and run through a [`Runner`], so tests can read the
 //! commands as data and no test reaches a real machine.
@@ -37,10 +45,11 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Error, Result, anyhow, bail};
+use qberrypi::bootpart::{self, BOOT_DEV};
 use qberrypi::config;
 use tempfile::TempDir;
 
-use crate::build::sha256sums;
+use crate::build::{read_build_epoch, sha256sums};
 
 /// The environment variable that names the Pi when `--host` is not given.
 pub const HOST_VARIABLE: &str = "QBERRYPI_HOST";
@@ -62,6 +71,11 @@ const LOG_FOLDER: &str = "out/logs";
 const REMOTE_BOOT: &str = "/boot/firmware";
 /// The log qberrypi appends to when `debug.log_to_sd` is on.
 const REMOTE_LOG: &str = "/boot/firmware/qberrypi/log.txt";
+/// The configuration the Pi's boot firmware reads, and the saved one of Raspberry Pi OS.
+const REMOTE_ACTIVE: &str = "/boot/firmware/config.txt";
+const REMOTE_SAVED: &str = "/boot/firmware/config.pios.txt";
+/// Where a Raspberry Pi says which board it is.
+const REMOTE_MODEL: &str = "/proc/device-tree/model";
 /// What `mktemp` on the Pi makes the stage directory from.
 const STAGE_TEMPLATE: &str = "/tmp/qberrypi-stage.XXXXXX";
 /// What a stage directory's name starts with; letters and digits follow.
@@ -93,6 +107,8 @@ const WRONG_MACHINE: i32 = 7;
 const BAD_COPY: i32 = 8;
 /// Script status: `config.txt` could not be written, to select qberrypi or to deselect it.
 const CONFIG_NOT_WRITTEN: i32 = 9;
+/// Script status: the boot partition is not the device, or not the filesystem, that init mounts.
+const WRONG_DEVICE: i32 = 10;
 
 /// The line the script prints once `config.txt` selects qberrypi.
 const SELECTED_MARKER: &str = "qberrypi-deploy: qberrypi is selected; restarting";
@@ -292,6 +308,13 @@ fn remove_stage(host: &str, stage: &str) -> Invocation {
     ssh(host, &["rm", "-rf", "--", stage])
 }
 
+/// Asks whether `config.txt` on the Pi is the saved configuration of Raspberry Pi OS.
+///
+/// Status 0 says that it is, status 1 that it is not. Nothing on the Pi is changed.
+fn compare_configs(host: &str) -> Invocation {
+    ssh(host, &["cmp", "-s", "--", REMOTE_ACTIVE, REMOTE_SAVED])
+}
+
 /// Asks whether qberrypi left a log on the card.
 fn log_exists(host: &str) -> Invocation {
     ssh(host, &["test", "-f", REMOTE_LOG])
@@ -423,6 +446,8 @@ pub struct RemoteScript {
     /// Whether to insist on a Raspberry Pi 3 B+ with `boot_dir` a mount point, and to
     /// read the copies back from the card rather than from memory.
     pub hardware_checks: bool,
+    /// The file in which the machine says which board it is; read only for the hardware checks.
+    pub model_file: String,
 }
 
 impl RemoteScript {
@@ -430,6 +455,8 @@ impl RemoteScript {
     pub fn render(&self) -> String {
         let boot = sh_quote(&self.boot_dir);
         let stage = sh_quote(&self.stage_dir);
+        let model_file = sh_quote(&self.model_file);
+        let boot_device = sh_quote(BOOT_DEV);
         let hardware_checks = if self.hardware_checks { "yes" } else { "no" };
         let restart = &self.reboot_cmd;
         format!(
@@ -437,6 +464,8 @@ impl RemoteScript {
              boot={boot}\n\
              stage={stage}\n\
              hardware_checks={hardware_checks}\n\
+             model_file={model_file}\n\
+             boot_device={boot_device}\n\
              \n\
              already_selected={ALREADY_SELECTED}\n\
              backup_refused={BACKUP_REFUSED}\n\
@@ -445,6 +474,7 @@ impl RemoteScript {
              wrong_machine={WRONG_MACHINE}\n\
              bad_copy={BAD_COPY}\n\
              config_not_written={CONFIG_NOT_WRITTEN}\n\
+             wrong_device={WRONG_DEVICE}\n\
              \n\
              restart() {{\n    {restart}\n}}\n\
              {SCRIPT_BODY}"
@@ -464,7 +494,8 @@ const SCRIPT_HEAD: &str = r"#!/bin/sh
 # `cargo xtask deploy`, which runs it as root: ssh <host> sudo sh -s
 #
 # In this order, stopping at the first thing that is not as expected:
-#   1. Checks: the stage directory and its files, the board, the mount.
+#   1. Checks: the stage directory and its files, the board, the mount and
+#      the device that is mounted there.
 #   2. Backup: config.txt is saved as config.pios.txt, unless a saved one is
 #      there already. That one is never written.
 #   3. Backup validation: init must be able to restore from config.pios.txt,
@@ -534,12 +565,13 @@ restorable() {
 # bytes go over the old ones and only then is an old tail cut off. The file is
 # at no moment empty and keeps its place on the card, which a copy that
 # empties it first would not promise. Then the card is synced and the file
-# read back. Fails if any of that does, or if "$1" is empty.
+# read back. Fails if any of that does, or if "$1" is empty. dd is told not to
+# print its count of records; what it says when it fails is let through.
 write_config() {
     # Without the blanks that some versions of wc put before the number.
     new_size=$(wc -c <"$1" | tr -d ' \t')
     [ "$new_size" -gt 0 ] || return 1
-    dd if="$1" of="$active" conv=notrunc 2>/dev/null || return 1
+    dd if="$1" of="$active" conv=notrunc status=none || return 1
     truncate -s "$new_size" "$active" || return 1
     sync || return 1
     cmp -s -- "$1" "$active"
@@ -596,14 +628,23 @@ main() {
 
     [ -d "$boot" ] || die "$wrong_machine" "$boot is not a directory; nothing was changed"
     if [ "$hardware_checks" = yes ]; then
-        [ -r /proc/device-tree/model ] ||
+        [ -r "$model_file" ] ||
             die "$wrong_machine" "this machine does not say which board it is; nothing was changed"
-        model=$(tr -d '\000' </proc/device-tree/model)
+        model=$(tr -d '\000' <"$model_file")
         case "$model" in
             *'Raspberry Pi 3 Model B Plus'*) ;;
             *) die "$wrong_machine" "this is not a Raspberry Pi 3 Model B Plus but a $model; nothing was changed" ;;
         esac
         mountpoint -q "$boot" || die "$wrong_machine" "$boot is not a mount point; nothing was changed"
+        # Init mounts $boot_device as vfat and looks nowhere else. Were $boot any
+        # other partition, init would find neither its configuration nor the
+        # saved config.txt there, and the Pi would start qberrypi for good.
+        command -v findmnt >/dev/null 2>&1 ||
+            die "$wrong_device" "there is no findmnt here to say which device $boot is; nothing was changed"
+        mounted=$(findmnt -no SOURCE,FSTYPE "$boot") ||
+            die "$wrong_device" "findmnt could not say which device $boot is; nothing was changed"
+        [ "$mounted" = "$boot_device vfat" ] ||
+            die "$wrong_device" "$boot is not $boot_device mounted as vfat, which is the one partition qberrypi reads and restores. Nothing was changed. findmnt found there: $mounted"
     fi
 
     # 2. Backup. A saved configuration that is there is never written.
@@ -711,6 +752,51 @@ fn script_outcome(host: &str, ran: &Finished) -> Result<()> {
     }
 }
 
+/// Judges, from the comparison of `config.txt` with the saved one, whether the Pi is back as it should be.
+///
+/// Raspberry Pi OS answering is not enough. The boot firmware starts its
+/// kernel whenever it cannot use qberrypi's folder, and then nothing has put
+/// `config.txt` back.
+fn check_returned(host: &str, compared: &Finished) -> Result<()> {
+    match compared.status {
+        Some(0) => Ok(()),
+        Some(1) => bail!(
+            "{host} is running Raspberry Pi OS on qberrypi's configuration: {REMOTE_ACTIVE} is \
+             not the saved {REMOTE_SAVED}. Either the Pi did not restart, or its boot firmware \
+             started Raspberry Pi OS's kernel in place of qberrypi's, or qberrypi could not put \
+             the file back. No log was collected. To put the configuration of Raspberry Pi OS \
+             back, run: ssh {host} sudo cp {REMOTE_SAVED} {REMOTE_ACTIVE}"
+        ),
+        status => bail!(
+            "comparing {REMOTE_ACTIVE} with {REMOTE_SAVED} on {host} failed ({}), so it is not \
+             known whether the Pi went through qberrypi and back: {}",
+            describe(status),
+            String::from_utf8_lossy(&compared.stderr).trim_end()
+        ),
+    }
+}
+
+/// Checks that the last boot in a collected log was one of the build that was deployed.
+///
+/// The log on the card is added to by every run, so one from an earlier run
+/// is there to be fetched when this run saved none.
+fn check_log_is_of(log: &str, build_epoch: u64) -> Result<()> {
+    /// When qberrypi leaves a log at all.
+    const WHEN: &str = "qberrypi saves its log with debug.log_to_sd on, and in one-shot mode \
+                        also when it stops on an error";
+    match bootpart::last_boot_build(log) {
+        Some(build) if build == build_epoch => Ok(()),
+        Some(build) => bail!(
+            "the last boot in the log is of build {build}, and the build deployed is \
+             {build_epoch}: this run left no log, and the one above is from an earlier run. {WHEN}"
+        ),
+        None => bail!(
+            "the log has no boot header (`==== boot, build N ====`), so it cannot be told \
+             whether it is of this run, of build {build_epoch}. {WHEN}"
+        ),
+    }
+}
+
 /// Tells the time and waits. Tests put a clock in its place that does not wait.
 trait Clock {
     /// The time since some fixed moment.
@@ -789,7 +875,8 @@ fn wait_until(
 }
 
 /// Copies the build to the Pi, selects qberrypi for one boot, restarts the Pi,
-/// waits for it to return to Raspberry Pi OS and collects the log.
+/// waits for it to return to Raspberry Pi OS, checks that it did so through
+/// qberrypi, and collects the log, which must be this build's.
 pub fn deploy(host: &str, permanent: bool, root: &Path) -> Result<()> {
     let mut clock = SystemClock {
         start: Instant::now(),
@@ -851,6 +938,8 @@ fn deploy_with(
         }
     };
     let (names, staged_sums) = staged_checksums(&build_sums, toml.as_bytes())?;
+    // By this the log that comes back is told from one an earlier run left.
+    let build_epoch = read_build_epoch(&root)?;
     let mut files = Vec::new();
     for name in &names {
         let file = build.join(name);
@@ -941,7 +1030,17 @@ fn deploy_with(
         )?,
     }
 
-    collect_with(host, &root, runner, clock, out).map(drop)
+    writeln!(
+        out,
+        "deploy: {host}: checking that config.txt is the saved one of Raspberry Pi OS again"
+    )?;
+    let compared = runner
+        .run(&compare_configs(host), None)
+        .context("cannot run ssh")?;
+    check_returned(host, &compared)?;
+
+    let (_, log) = collect_with(host, &root, runner, clock, out)?;
+    check_log_is_of(&log, build_epoch)
 }
 
 /// Copies the files to the stage and runs the script there as root.
@@ -968,6 +1067,7 @@ fn install(
         stage_dir: stage.to_owned(),
         reboot_cmd: RESTART.to_owned(),
         hardware_checks: true,
+        model_file: REMOTE_MODEL.to_owned(),
     };
     let ran = runner
         .run(&run_script(host), Some(script.render().as_bytes()))
@@ -983,17 +1083,19 @@ pub fn collect(host: &str, root: &Path) -> Result<PathBuf> {
     let clock = SystemClock {
         start: Instant::now(),
     };
-    collect_with(host, root, &mut SystemRunner, &clock, &mut io::stdout())
+    collect_with(host, root, &mut SystemRunner, &clock, &mut io::stdout()).map(|(path, _)| path)
 }
 
 /// `collect`, with the commands, the clock and the output in the caller's hands.
+///
+/// Returns the text of the log as well as where it was saved.
 fn collect_with(
     host: &str,
     root: &Path,
     runner: &mut dyn Runner,
     clock: &dyn Clock,
     out: &mut dyn Write,
-) -> Result<PathBuf> {
+) -> Result<(PathBuf, String)> {
     validate_host(host).map_err(Error::msg)?;
 
     writeln!(out, "collect: {host}: fetching {REMOTE_LOG}")?;
@@ -1026,7 +1128,7 @@ fn collect_with(
         writeln!(out)?;
     }
     writeln!(out, "collect: wrote {}", path.display())?;
-    Ok(path)
+    Ok((path, text.into_owned()))
 }
 
 #[cfg(test)]
@@ -1210,6 +1312,19 @@ mod tests {
             (
                 remove_stage("pi", stage),
                 ssh_args("pi", &["rm", "-rf", "--", stage]),
+            ),
+            (
+                compare_configs("pi"),
+                ssh_args(
+                    "pi",
+                    &[
+                        "cmp",
+                        "-s",
+                        "--",
+                        "/boot/firmware/config.txt",
+                        "/boot/firmware/config.pios.txt",
+                    ],
+                ),
             ),
             (
                 log_exists("pi"),
@@ -1482,6 +1597,19 @@ mod tests {
                 stage_dir: self.stage_path().to_owned(),
                 reboot_cmd: FAKE_RESTART.to_owned(),
                 hardware_checks: false,
+                model_file: "/proc/device-tree/model".to_owned(),
+            }
+        }
+
+        /// The script with its hardware checks on, for a machine that says it is `model`.
+        fn pi_script(&self, model: &str) -> RemoteScript {
+            let model_file = self.tmp.path().join("model");
+            // The device tree ends its texts with a NUL.
+            fs::write(&model_file, format!("{model}\0")).unwrap();
+            RemoteScript {
+                hardware_checks: true,
+                model_file: model_file.to_str().unwrap().to_owned(),
+                ..self.script()
             }
         }
 
@@ -1492,7 +1620,17 @@ mod tests {
 
         /// Runs a script text after the given stand-in commands.
         fn run_text(&self, shell: &str, script: &str, fakes: &str) -> Ran {
-            let mut child = Command::new(shell)
+            self.run_on_path(shell, script, fakes, None)
+        }
+
+        /// The same, with the folder given as the whole `PATH`, if one is given.
+        fn run_on_path(&self, shell: &str, script: &str, fakes: &str, path: Option<&Path>) -> Ran {
+            let mut command = Command::new(shell);
+            if let Some(path) = path {
+                // The shell itself is looked for there too.
+                command.env("PATH", path);
+            }
+            let mut child = command
                 .arg("-s")
                 .env("QBERRYPI_TEST_BOOT", &self.boot)
                 .env("QBERRYPI_TEST_TRACE", self.trace_path())
@@ -1531,6 +1669,9 @@ mod tests {
             );
             assert!(!card.stage.path().exists(), "the stage is still there");
             assert!(ran.stdout.contains(SELECTED_MARKER), "{}", ran.stdout);
+            // A run that went well has nothing to say for itself on standard error:
+            // dd, for one, keeps the count of what it wrote to itself.
+            assert_eq!(ran.stderr, "", "{shell}");
             // Nothing but the backup, the selected configuration and the folder is on the card.
             assert_eq!(card.snapshot().len(), 3 + STAGED.len() + 1);
         }
@@ -2113,6 +2254,193 @@ mod tests {
         }
     }
 
+    const PI_3_B_PLUS: &str = "Raspberry Pi 3 Model B Plus Rev 1.3";
+    /// What `findmnt` says of the boot partition that init mounts.
+    const INITS_PARTITION: &str = "/dev/mmcblk0p1 vfat";
+    /// Stands in for `mountpoint`: the folder is one.
+    const IS_A_MOUNT: &str = "mountpoint() { return 0; }\n";
+    /// Stands in for `mountpoint`: the folder is none.
+    const IS_NO_MOUNT: &str = "mountpoint() { return 1; }\n";
+    /// Stands in for a `findmnt` that cannot say what is mounted there.
+    const FINDMNT_FAILS: &str = "findmnt() { return 1; }\n";
+
+    /// Stands in for `findmnt`: gives `answer` to the one question the script asks,
+    /// and fails for any other.
+    fn findmnt_says(answer: &str) -> String {
+        format!(
+            "findmnt() {{ [ \"$*\" = \"-no SOURCE,FSTYPE $QBERRYPI_TEST_BOOT\" ] || return 64; \
+             printf '%s\\n' {}; }}\n",
+            sh_quote(answer)
+        )
+    }
+
+    /// Whether the tests run as root, for whom the kernel's switches are writable.
+    fn is_root() -> bool {
+        let probe = tempfile::NamedTempFile::new().unwrap();
+        std::os::unix::fs::MetadataExt::uid(&probe.as_file().metadata().unwrap()) == 0
+    }
+
+    /// A folder to use as the whole `PATH`: links to the shells and to the tools the
+    /// script runs, but for `sync`, `mountpoint` and `findmnt`.
+    fn tools_without_findmnt() -> TempDir {
+        const TOOLS: [&str; 12] = [
+            "cat",
+            "cmp",
+            "cp",
+            "dd",
+            "grep",
+            "mkdir",
+            "mv",
+            "rm",
+            "sha256sum",
+            "tr",
+            "truncate",
+            "wc",
+        ];
+        let dir = tempfile::tempdir().unwrap();
+        let path = std::env::var_os("PATH").unwrap();
+        for tool in TOOLS.iter().chain(&shells()) {
+            let real = std::env::split_paths(&path)
+                .map(|folder| folder.join(tool))
+                .find(|candidate| candidate.is_file())
+                .unwrap_or_else(|| panic!("{tool} is not on the PATH"));
+            symlink(real, dir.path().join(tool)).unwrap();
+        }
+        dir
+    }
+
+    #[test]
+    fn with_hardware_checks_the_boot_partition_that_init_mounts_is_accepted() {
+        // The copies are then read back past the page cache, which root alone may empty;
+        // as root this test would empty it on the machine it runs on.
+        if is_root() {
+            return;
+        }
+        for shell in shells() {
+            let card = Card::fresh();
+            let script = card.pi_script(PI_3_B_PLUS).render();
+            let fakes = format!("{FAKE_SYNC}{IS_A_MOUNT}{}", findmnt_says(INITS_PARTITION));
+            let ran = card.run_text(shell, &script, &fakes);
+            assert_eq!(ran.status, Some(0), "{shell}: {}", ran.stderr);
+            assert_eq!(card.read_boot("config.pios.txt"), PIOS.as_bytes());
+            assert_eq!(card.read_boot("config.txt"), OWN_CONFIG.as_bytes());
+            assert!(ran.stdout.contains(SELECTED_MARKER), "{}", ran.stdout);
+            assert!(card.trace().contains("restart"));
+        }
+    }
+
+    #[test]
+    fn with_hardware_checks_a_boot_partition_that_init_does_not_mount_is_refused() {
+        // Init mounts /dev/mmcblk0p1 as vfat, whatever is mounted here: on any other
+        // partition it would find no configuration and no saved config.txt to put back.
+        let found_instead = [
+            "/dev/mmcblk0p2 vfat",
+            "/dev/sda1 vfat",
+            "/dev/mmcblk0p1 ext4",
+            "/dev/mmcblk0p1",
+            "systemd-1 autofs\n/dev/mmcblk0p1 vfat",
+            "/dev/mmcblk0p1 vfat\n/dev/sda1 vfat",
+        ];
+        for shell in shells() {
+            for found in found_instead {
+                let card = Card::fresh();
+                let before = card.snapshot();
+                let script = card.pi_script(PI_3_B_PLUS).render();
+                let fakes = format!("{FAKE_SYNC}{IS_A_MOUNT}{}", findmnt_says(found));
+                let ran = card.run_text(shell, &script, &fakes);
+                assert_eq!(
+                    ran.status,
+                    Some(WRONG_DEVICE),
+                    "{shell}, {found:?}: {}",
+                    ran.stderr
+                );
+                // The message names what init needs and what was found.
+                assert!(ran.stderr.contains("/dev/mmcblk0p1"), "{}", ran.stderr);
+                assert!(ran.stderr.contains(found), "{found:?}: {}", ran.stderr);
+                assert!(ran.stderr.contains("othing was changed"), "{}", ran.stderr);
+                assert_eq!(card.snapshot(), before, "{found:?}");
+                assert_eq!(card.trace(), "", "{found:?}");
+                assert!(!ran.stdout.contains(SELECTED_MARKER));
+            }
+        }
+        assert_eq!(WRONG_DEVICE, 10);
+        assert!(
+            ![
+                ALREADY_SELECTED,
+                BACKUP_REFUSED,
+                CONFIG_CHANGED,
+                BAD_STAGE,
+                WRONG_MACHINE,
+                BAD_COPY,
+                CONFIG_NOT_WRITTEN
+            ]
+            .contains(&WRONG_DEVICE)
+        );
+    }
+
+    #[test]
+    fn with_hardware_checks_a_findmnt_that_fails_or_is_not_there_is_refused() {
+        let tools = tools_without_findmnt();
+        for shell in shells() {
+            // One that cannot answer, and none at all on the PATH.
+            for (fakes, path) in [
+                (format!("{FAKE_SYNC}{IS_A_MOUNT}{FINDMNT_FAILS}"), None),
+                (format!("{FAKE_SYNC}{IS_A_MOUNT}"), Some(tools.path())),
+            ] {
+                let card = Card::fresh();
+                let before = card.snapshot();
+                let script = card.pi_script(PI_3_B_PLUS).render();
+                let ran = card.run_on_path(shell, &script, &fakes, path);
+                assert_eq!(ran.status, Some(WRONG_DEVICE), "{shell}: {}", ran.stderr);
+                assert!(ran.stderr.contains("findmnt"), "{}", ran.stderr);
+                assert!(ran.stderr.contains("othing was changed"), "{}", ran.stderr);
+                assert_eq!(card.snapshot(), before);
+                assert_eq!(card.trace(), "");
+            }
+        }
+    }
+
+    #[test]
+    fn the_folder_of_tools_without_findmnt_lacks_nothing_else_the_script_needs() {
+        // Or the test above would pass for a script that broke on something else.
+        if is_root() {
+            return;
+        }
+        let tools = tools_without_findmnt();
+        for shell in shells() {
+            let card = Card::fresh();
+            let script = card.pi_script(PI_3_B_PLUS).render();
+            let fakes = format!("{FAKE_SYNC}{IS_A_MOUNT}{}", findmnt_says(INITS_PARTITION));
+            let ran = card.run_on_path(shell, &script, &fakes, Some(tools.path()));
+            assert_eq!(ran.status, Some(0), "{shell}: {}", ran.stderr);
+            assert_eq!(card.read_boot("config.txt"), OWN_CONFIG.as_bytes());
+        }
+    }
+
+    #[test]
+    fn with_hardware_checks_another_board_or_a_folder_that_is_no_mount_is_refused() {
+        for shell in shells() {
+            for (model, mount, said) in [
+                (
+                    "Raspberry Pi 4 Model B Rev 1.4",
+                    IS_A_MOUNT,
+                    "Raspberry Pi 4",
+                ),
+                (PI_3_B_PLUS, IS_NO_MOUNT, "is not a mount point"),
+            ] {
+                let card = Card::fresh();
+                let before = card.snapshot();
+                let script = card.pi_script(model).render();
+                let fakes = format!("{FAKE_SYNC}{mount}{}", findmnt_says(INITS_PARTITION));
+                let ran = card.run_text(shell, &script, &fakes);
+                assert_eq!(ran.status, Some(WRONG_MACHINE), "{shell}: {}", ran.stderr);
+                assert!(ran.stderr.contains(said), "{}", ran.stderr);
+                assert_eq!(card.snapshot(), before);
+                assert_eq!(card.trace(), "");
+            }
+        }
+    }
+
     #[test]
     fn the_card_is_synced_after_selecting_and_before_the_restart() {
         // This stand-in for sync also records how far the saving of the backup has come.
@@ -2278,8 +2606,30 @@ mod tests {
                 assert_eq!(card.read_boot("config.txt"), was.as_bytes());
                 assert_eq!(card.read_boot("config.pios.txt"), PIOS.as_bytes());
                 assert!(!card.trace().contains("restart"));
+                // Why the write failed is dd's to say, and it is let through:
+                // on the Pi it is most likely a partition that went read-only.
+                let dd_said = ran
+                    .stderr
+                    .lines()
+                    .find(|line| line.starts_with("dd: "))
+                    .unwrap_or_else(|| panic!("{shell}: dd said nothing in:\n{}", ran.stderr));
+                assert!(dd_said.contains("config.txt"), "{dd_said}");
+                assert!(dd_said.contains("Permission denied"), "{dd_said}");
             }
         }
+    }
+
+    #[test]
+    fn dd_is_told_to_keep_its_count_to_itself_and_its_errors_are_not_thrown_away() {
+        let script = production_script();
+        let dd_lines: Vec<&str> = script
+            .lines()
+            .filter(|line| line.trim_start().starts_with("dd "))
+            .collect();
+        assert_eq!(
+            dd_lines,
+            [r#"    dd if="$1" of="$active" conv=notrunc status=none || return 1"#]
+        );
     }
 
     #[test]
@@ -2403,6 +2753,7 @@ mod tests {
             stage_dir: "/tmp/qberrypi-stage.Ab12Cd".to_owned(),
             reboot_cmd: "systemctl reboot".to_owned(),
             hardware_checks: true,
+            model_file: "/proc/device-tree/model".to_owned(),
         }
         .render()
     }
@@ -2417,6 +2768,12 @@ mod tests {
         assert!(script.contains("\nhardware_checks=yes\n"));
         assert!(script.contains("\n    systemctl reboot\n"));
         assert!(script.contains("Raspberry Pi 3 Model B Plus"));
+        assert!(script.contains("\nmodel_file='/proc/device-tree/model'\n"));
+        // The device is the one init mounts, by init's own constant.
+        assert_eq!(qberrypi::bootpart::BOOT_DEV, "/dev/mmcblk0p1");
+        assert!(script.contains("\nboot_device='/dev/mmcblk0p1'\n"));
+        assert!(script.contains(r#"findmnt -no SOURCE,FSTYPE "$boot""#));
+        assert!(script.contains(r#"[ "$mounted" = "$boot_device vfat" ]"#));
         assert!(script.ends_with("\nmain\n"));
     }
 
@@ -2539,12 +2896,100 @@ mod tests {
         assert!(clock.now() <= 325 * SECOND, "{:?}", clock.now());
     }
 
+    // ---------------------------------------------------------------- back from qberrypi
+
+    #[test]
+    fn a_pi_whose_config_txt_is_the_saved_one_is_back_as_it_should_be() {
+        check_returned("pi", &finished(0, "", "")).unwrap();
+    }
+
+    #[test]
+    fn a_pi_back_on_qberrypis_configuration_is_an_error_with_the_command_that_puts_it_right() {
+        let error = check_returned("user@pi", &finished(1, "", ""))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("is running Raspberry Pi OS on qberrypi's configuration"),
+            "{error}"
+        );
+        assert!(
+            error.contains(
+                "ssh user@pi sudo cp /boot/firmware/config.pios.txt /boot/firmware/config.txt"
+            ),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn a_comparison_that_could_not_be_made_is_an_error_of_its_own() {
+        for (compared, said) in [
+            (
+                finished(2, "", "cmp: /boot/firmware/config.pios.txt: No such file\n"),
+                "status 2",
+            ),
+            (
+                finished(255, "", "ssh: connect to host pi: timed out\n"),
+                "ssh could not reach",
+            ),
+            (
+                Finished {
+                    status: None,
+                    stdout: Vec::new(),
+                    stderr: Vec::new(),
+                },
+                "signal",
+            ),
+        ] {
+            let error = check_returned("pi", &compared).unwrap_err().to_string();
+            assert!(error.contains(said), "{error}");
+            assert!(error.contains("config.pios.txt"), "{error}");
+            // Not known to be on the wrong configuration, so not said to be.
+            assert!(!error.contains("sudo cp"), "{error}");
+        }
+    }
+
+    #[test]
+    fn a_log_whose_last_boot_is_of_this_build_is_this_runs_log() {
+        check_log_is_of(LOG, BUILD_EPOCH).unwrap();
+        // Earlier boots, of earlier builds, are in the same file.
+        let earlier = "==== boot, build 1600000000 ====\nqberrypi 0.1.0\n";
+        check_log_is_of(&format!("{earlier}{LOG}"), BUILD_EPOCH).unwrap();
+    }
+
+    #[test]
+    fn a_log_whose_last_boot_is_of_an_older_build_is_an_error_that_names_both() {
+        let error = check_log_is_of(LOG, BUILD_EPOCH + 60)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("1699999000"), "{error}");
+        assert!(error.contains("1699999060"), "{error}");
+        assert!(error.contains("earlier"), "{error}");
+        // The newest boot counts, not any boot.
+        let later = "==== boot, build 1600000000 ====\nqberrypi 0.1.0\n";
+        assert!(check_log_is_of(&format!("{LOG}{later}"), BUILD_EPOCH).is_err());
+    }
+
+    #[test]
+    fn a_log_without_a_boot_header_is_an_error() {
+        for log in [
+            "",
+            "qberrypi 0.1.0\nrestored config.txt\n",
+            "==== boot, build x ====\n",
+        ] {
+            let error = check_log_is_of(log, BUILD_EPOCH).unwrap_err().to_string();
+            assert!(error.contains("no boot header"), "{log:?}: {error}");
+        }
+    }
+
     // ---------------------------------------------------------------- deploy and collect, end to end
 
     const STAGE: &str = "/tmp/qberrypi-stage.Ab12Cd";
     const CANARY: &str = "canary-passphrase-93871";
     const BOOT_TAR: &[u8] = b"TAR-OF-THE-BOOT-PARTITION-canary-firstboot-secret";
-    const LOG: &str = "qberrypi 0.1.0\nrestored config.txt\n";
+    /// The build time of the build in `checkout`, as the build recorded it.
+    const BUILD_EPOCH: u64 = 1_699_999_000;
+    /// The log of one boot of that build.
+    const LOG: &str = "==== boot, build 1699999000 ====\nqberrypi 0.1.0\nrestored config.txt\n";
 
     fn finished(status: i32, stdout: impl AsRef<[u8]>, stderr: impl AsRef<[u8]>) -> Finished {
         Finished {
@@ -2564,6 +3009,8 @@ mod tests {
         mktemp: Finished,
         scp: Finished,
         script: Finished,
+        /// The answer to the comparison of `config.txt` with the saved one.
+        compared: Finished,
         log: Option<Vec<u8>>,
         /// The staged checksums and the mode of the folder they were in, as scp found them.
         uploaded_sums: Option<(PathBuf, String, u32)>,
@@ -2583,6 +3030,7 @@ mod tests {
                     format!("qberrypi-deploy: copying\n{SELECTED_MARKER}\n"),
                     "",
                 ),
+                compared: finished(0, "", ""),
                 log: Some(LOG.as_bytes().to_vec()),
                 uploaded_sums: None,
             }
@@ -2632,6 +3080,7 @@ mod tests {
                 "mktemp" => self.mktemp.clone(),
                 "sudo" => self.script.clone(),
                 "rm" => finished(0, "", ""),
+                "cmp" => self.compared.clone(),
                 "test" => finished(if self.log.is_some() { 0 } else { 1 }, "", ""),
                 "cat" => finished(0, self.log.clone().unwrap(), ""),
                 other => panic!("unexpected remote command {other}"),
@@ -2660,6 +3109,11 @@ mod tests {
             fs::write(build.join(name), data).unwrap();
         }
         fs::write(build.join("SHA256SUMS"), sha256sums(&BUILT)).unwrap();
+        fs::write(
+            tmp.path().join("out/build-epoch"),
+            format!("{BUILD_EPOCH}\n"),
+        )
+        .unwrap();
         fs::write(tmp.path().join("qberrypi.toml"), one_shot_toml()).unwrap();
         tmp
     }
@@ -2711,7 +3165,8 @@ mod tests {
         assert_eq!(
             pi.summary(),
             [
-                "tar", "mktemp", "scp", "sudo", "true", "true", "true", "true", "test", "cat"
+                "tar", "mktemp", "scp", "sudo", "true", "true", "true", "true", "cmp", "test",
+                "cat"
             ]
         );
         // Nothing goes through a local shell.
@@ -2741,19 +3196,22 @@ mod tests {
             stage_dir: STAGE.to_owned(),
             reboot_cmd: "systemctl reboot".to_owned(),
             hardware_checks: true,
+            model_file: "/proc/device-tree/model".to_owned(),
         };
         assert_eq!(
             String::from_utf8(script_input.clone().unwrap()).unwrap(),
             expected.render()
         );
-        for index in [0, 1, 4, 5, 6, 7, 8, 9] {
+        for index in [0, 1, 4, 5, 6, 7, 8, 9, 10] {
             assert_eq!(call(index).1, None, "call {index} was given input");
         }
         for index in 4..8 {
             assert_eq!(call(index).0, probe("pi"));
         }
-        assert_eq!(call(8).0, log_exists("pi"));
-        assert_eq!(call(9).0, fetch_log("pi"));
+        // Once it answers again: is it back on its own configuration? Then the log.
+        assert_eq!(call(8).0, compare_configs("pi"));
+        assert_eq!(call(9).0, log_exists("pi"));
+        assert_eq!(call(10).0, fetch_log("pi"));
 
         // The staged checksums: the build's and a line for the configuration, built in a
         // private folder outside the checkout that is gone afterwards.
@@ -2789,6 +3247,7 @@ mod tests {
             "qberrypi-deploy: copying",
             "deploy: pi: waiting",
             "deploy: pi: it is back",
+            "deploy: pi: checking that config.txt",
             "collect: pi: fetching",
             "collect: wrote",
         ] {
@@ -2856,7 +3315,7 @@ mod tests {
     #[test]
     fn nothing_runs_when_a_local_check_fails() {
         type Spoil = fn(&Path);
-        let cases: [(&str, &str, bool, Spoil, &str); 7] = [
+        let cases: [(&str, &str, bool, Spoil, &str); 8] = [
             (
                 "a host that is an option",
                 "-oProxyCommand=x",
@@ -2902,6 +3361,13 @@ mod tests {
                 false,
                 |root| fs::remove_file(root.join("out/qberrypi/initramfs8")).unwrap(),
                 "initramfs8",
+            ),
+            (
+                "a build without the record of its build time",
+                "pi",
+                false,
+                |root| fs::remove_file(root.join("out/build-epoch")).unwrap(),
+                "cargo xtask build",
             ),
         ];
         for (case, host, permanent, spoil, expected) in cases {
@@ -3096,10 +3562,81 @@ mod tests {
         assert!(!pi.ran("test") && !pi.ran("cat"));
     }
 
+    #[test]
+    fn a_pi_back_on_qberrypis_configuration_fails_the_deploy_before_any_log_is_collected() {
+        // The firmware did not take the folder and started Raspberry Pi OS's kernel on
+        // qberrypi's config.txt. Whatever log is on the card is not of this run.
+        let checkout = checkout();
+        let mut pi = FakePi::new();
+        pi.compared = finished(1, "", "");
+        let outcome = run_deploy("pi", false, checkout.path(), &mut pi);
+        let error = outcome.error();
+        assert!(
+            error.contains("pi is running Raspberry Pi OS on qberrypi's configuration"),
+            "{error}"
+        );
+        assert!(
+            error.contains(
+                "ssh pi sudo cp /boot/firmware/config.pios.txt /boot/firmware/config.txt"
+            ),
+            "{error}"
+        );
+        assert_eq!(pi.summary().last().unwrap(), "cmp");
+        assert!(!pi.ran("test") && !pi.ran("cat"));
+        assert!(!outcome.said.contains(LOG));
+        assert!(!checkout.path().join("out/logs").exists());
+    }
+
+    #[test]
+    fn a_comparison_that_fails_ends_the_deploy_too() {
+        let checkout = checkout();
+        let mut pi = FakePi::new();
+        pi.compared = finished(2, "", "cmp: /boot/firmware/config.pios.txt: No such file\n");
+        let outcome = run_deploy("pi", false, checkout.path(), &mut pi);
+        assert!(
+            outcome.error().contains("No such file"),
+            "{}",
+            outcome.error()
+        );
+        assert!(!pi.ran("cat"));
+    }
+
+    #[test]
+    fn a_log_of_an_older_build_is_collected_and_then_fails_the_deploy() {
+        let checkout = checkout();
+        let mut pi = FakePi::new();
+        let old = "==== boot, build 1600000000 ====\nan earlier run\n";
+        pi.log = Some(old.as_bytes().to_vec());
+        let outcome = run_deploy("pi", false, checkout.path(), &mut pi);
+        let error = outcome.error();
+        assert!(error.contains("1600000000"), "{error}");
+        assert!(error.contains("1699999000"), "{error}");
+        // It is still shown and kept: it is what there is to read.
+        assert!(outcome.said.contains(old), "{}", outcome.said);
+        let saved = checkout.path().join("out/logs/1700000000.log");
+        assert_eq!(fs::read_to_string(saved).unwrap(), old);
+    }
+
+    #[test]
+    fn a_log_without_a_boot_header_fails_the_deploy() {
+        let checkout = checkout();
+        let mut pi = FakePi::new();
+        pi.log = Some(b"qberrypi 0.1.0\nrestored config.txt\n".to_vec());
+        let outcome = run_deploy("pi", false, checkout.path(), &mut pi);
+        assert!(
+            outcome.error().contains("no boot header"),
+            "{}",
+            outcome.error()
+        );
+    }
+
     fn run_collect(host: &str, root: &Path, pi: &mut FakePi) -> (Result<PathBuf>, String) {
         let mut said = Vec::new();
         let result = collect_with(host, root, pi, &FakeClock::new(), &mut said);
-        (result, String::from_utf8(said).unwrap())
+        (
+            result.map(|(path, _)| path),
+            String::from_utf8(said).unwrap(),
+        )
     }
 
     #[test]
