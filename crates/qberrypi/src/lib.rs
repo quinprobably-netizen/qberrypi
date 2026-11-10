@@ -4,6 +4,8 @@ pub mod bootpart;
 pub mod config;
 pub mod kmsg;
 pub mod logbuf;
+pub mod modhelper;
+pub mod modules;
 
 /// Crate version, shown in the boot banner.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
