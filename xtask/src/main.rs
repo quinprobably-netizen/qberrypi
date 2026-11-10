@@ -1,10 +1,13 @@
 //! Development tasks for qberrypi. Run as `cargo xtask <command>`.
 
 use std::path::Path;
+use std::time::{SystemTime, UNIX_EPOCH};
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 
+mod build;
+mod cpio;
 mod deb;
 mod fetch;
 mod pins;
@@ -37,10 +40,18 @@ fn workspace_root() -> &'static Path {
         .expect("the xtask crate sits one level below the workspace root")
 }
 
+/// The current time in seconds since 1970, which a build takes as its build time.
+fn unix_time() -> Result<u64> {
+    let since_1970 = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .context("the clock of this machine is set before 1970")?;
+    Ok(since_1970.as_secs())
+}
+
 fn main() -> Result<()> {
     match Cli::parse().command {
         Command::Fetch => fetch::run(workspace_root()),
-        Command::Build => bail!("build: not implemented"),
+        Command::Build => build::run(workspace_root(), unix_time()?).map(drop),
         Command::QemuTest => bail!("qemu-test: not implemented"),
         Command::Deploy => bail!("deploy: not implemented"),
         Command::Collect => bail!("collect: not implemented"),
