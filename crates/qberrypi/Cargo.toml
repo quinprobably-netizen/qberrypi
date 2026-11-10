@@ -9,8 +9,8 @@ repository.workspace = true
 [dependencies]
 libc = "0.2.191"
 log = "0.4.35"
+rustix = { version = "1.1.6", features = ["fs", "mount", "system", "time", "process"] }
 toml = { version = "1.2.1", default-features = false, features = ["parse", "serde", "std"] }
 
 [dev-dependencies]
-rustix = { version = "1.1.6", features = ["fs"] }
 tempfile = "3.27.0"
