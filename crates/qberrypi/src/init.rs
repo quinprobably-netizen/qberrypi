@@ -40,6 +40,8 @@ const CYW_IN_SYSFS: &str = "module/brcmfmac_cyw";
 const WATCHDOG_SECS: u32 = 15;
 /// How often the watchdog is petted, at the least, while init waits.
 const PET_EVERY: Duration = Duration::from_secs(5);
+/// How many lines a long dump to the console logs between two pets.
+const PET_EVERY_LINES: usize = 50;
 /// How often a wait looks whether what it waits for has happened.
 const POLL_EVERY: Duration = Duration::from_millis(50);
 const BOOT_DEV_WAIT: Duration = Duration::from_secs(10);
@@ -224,7 +226,7 @@ fn report_wifi() {
         log::info!("{line}");
     }
     match kernel_lines(Path::new(KERNEL_LOG)) {
-        Ok(lines) => lines.iter().for_each(|line| log::info!("{line}")),
+        Ok(lines) => log_lines(&lines, &mut |line| log::info!("{line}"), &mut pet_watchdog),
         // The kernel log is for diagnosis; the boot does not depend on it.
         Err(error) => log::warn!("{KERNEL_LOG}: {error}"),
     }
@@ -250,6 +252,19 @@ fn kernel_lines(kernel_log: &Path) -> io::Result<Vec<String>> {
         .iter()
         .map(|record| format!("kernel: {}", record.text))
         .collect())
+}
+
+/// Logs many lines, petting the watchdog before the first and then every `PET_EVERY_LINES`.
+///
+/// Each line is a write to the console that waits until it is out, and on a
+/// serial console a full kernel log takes longer than the watchdog allows.
+fn log_lines(lines: &[String], log_line: &mut dyn FnMut(&str), pet: &mut dyn FnMut()) {
+    for batch in lines.chunks(PET_EVERY_LINES) {
+        pet();
+        for line in batch {
+            log_line(line);
+        }
+    }
 }
 
 /// Step 9: if the configuration asks for it, appends the log to the card.
@@ -312,6 +327,9 @@ fn fatal(message: &str) -> ! {
     if FATAL_BEGUN.swap(true, Ordering::SeqCst) {
         sys::reboot();
     }
+    // What follows writes to the card. It must not start on whatever time
+    // the failed step left, or the watchdog could cut the writes short.
+    pet_watchdog();
     // A log that is locked was being written when the failure came. Using it
     // again from here would wait for ever, so it is left alone.
     let log = LOG.get().copied();
@@ -324,7 +342,12 @@ fn fatal(message: &str) -> ! {
         log::error!("{message}");
     }
     let _ = led::set(Path::new(LED_DIR), LedState::Fatal);
-    rescue(CONFIG.get(), &mut SdCard, log.filter(|_| !log_in_use));
+    rescue(
+        CONFIG.get(),
+        &mut SdCard,
+        log.filter(|_| !log_in_use),
+        &mut pet_watchdog,
+    );
     pause(FATAL_PAUSE);
     sys::reboot()
 }
@@ -355,8 +378,14 @@ fn rescue_plan(cfg: Option<&Config>) -> Rescue {
 ///
 /// The card is mounted only if there is something to do on it. Errors are
 /// ignored: the restart comes whatever happens. `log` is the log to save,
-/// and `None` if it must not be used; this logs only when it has one.
-fn rescue(cfg: Option<&Config>, card: &mut dyn Card, log: Option<&Mutex<LogBuf>>) {
+/// and `None` if it must not be used; this logs only when it has one. `pet`
+/// is called between the restore and the saving of the log.
+fn rescue(
+    cfg: Option<&Config>,
+    card: &mut dyn Card,
+    log: Option<&Mutex<LogBuf>>,
+    pet: &mut dyn FnMut(),
+) {
     let plan = rescue_plan(cfg);
     let log_to_save = log.filter(|_| plan.save_log);
     if !plan.restore_config && log_to_save.is_none() {
@@ -374,6 +403,8 @@ fn rescue(cfg: Option<&Config>, card: &mut dyn Card, log: Option<&Mutex<LogBuf>>
                 }
             }
         }
+        // The restore and the log are each a write that waits for the card.
+        pet();
         if let Some(mut buf) = log_to_save.and_then(lock_if_free) {
             let unsaved = buf.take_unsaved();
             drop(buf);
@@ -482,7 +513,9 @@ fn pause(length: Duration) {
 ///
 /// `ready` is asked at once, then every `poll_every`, and a last time when
 /// the timeout has passed. `pet` is called at once and then every
-/// `pet_every`, however rarely `ready` is asked.
+/// `pet_every`, however rarely `ready` is asked, and once more on the way
+/// out unless it was called just then: what comes after a wait starts with
+/// the watchdog's whole time ahead of it.
 fn wait_until(
     timeout: Duration,
     poll_every: Duration,
@@ -494,16 +527,18 @@ fn wait_until(
     let mut next_pet = start;
     loop {
         let now = Instant::now();
-        if now >= next_pet {
+        let pet_due = now >= next_pet;
+        if pet_due {
             pet();
             next_pet = now + pet_every;
         }
-        if ready() {
-            return true;
-        }
+        let held = ready();
         let left = timeout.saturating_sub(start.elapsed());
-        if left.is_zero() {
-            return false;
+        if held || left.is_zero() {
+            if !pet_due {
+                pet();
+            }
+            return held;
         }
         let until_pet = next_pet.saturating_duration_since(Instant::now());
         thread::sleep(left.min(poll_every).min(until_pet));
@@ -535,6 +570,7 @@ fn lock_if_free<T>(mutex: &Mutex<T>) -> Option<MutexGuard<'_, T>> {
 mod tests {
     use super::*;
 
+    use std::cell::RefCell;
     use std::fs;
     use std::io::ErrorKind;
     use std::sync::{Arc, mpsc};
@@ -759,6 +795,54 @@ mod tests {
         });
         assert!(held);
         assert!(start.elapsed() >= 50 * MS);
+    }
+
+    /// Runs a wait and returns its pets and asks in the order they came.
+    fn wait_events(
+        timeout: Duration,
+        poll_every: Duration,
+        mut ready: impl FnMut(usize) -> bool,
+    ) -> (bool, Vec<&'static str>) {
+        let events = RefCell::new(Vec::new());
+        let mut asks = 0;
+        let held = wait_until(
+            timeout,
+            poll_every,
+            LONG,
+            &mut || events.borrow_mut().push("pet"),
+            &mut || {
+                events.borrow_mut().push("ask");
+                asks += 1;
+                ready(asks)
+            },
+        );
+        (held, events.into_inner())
+    }
+
+    #[test]
+    fn a_wait_that_times_out_ends_with_a_pet() {
+        // Long after the first pet and long before the next is due: whatever
+        // comes after the wait must not start on a budget that is half spent.
+        let (held, events) = wait_events(50 * MS, LONG, |_| false);
+        assert!(!held);
+        assert_eq!(events, ["pet", "ask", "ask", "pet"]);
+    }
+
+    #[test]
+    fn a_wait_that_the_condition_ends_later_ends_with_a_pet() {
+        let (held, events) = wait_events(LONG, 10 * MS, |asks| asks == 3);
+        assert!(held);
+        assert_eq!(events, ["pet", "ask", "ask", "ask", "pet"]);
+    }
+
+    #[test]
+    fn a_wait_that_ends_at_once_pets_only_once() {
+        let (held, events) = wait_events(LONG, LONG, |_| true);
+        assert!(held);
+        assert_eq!(events, ["pet", "ask"]);
+        let (held, events) = wait_events(Duration::ZERO, LONG, |_| false);
+        assert!(!held);
+        assert_eq!(events, ["pet", "ask"]);
     }
 
     #[test]
@@ -992,6 +1076,41 @@ mod tests {
     }
 
     #[test]
+    fn a_long_dump_pets_the_watchdog_before_the_first_line_and_every_fifty_lines() {
+        let lines: Vec<String> = (0..120).map(|n| format!("kernel: line {n}")).collect();
+        let events = RefCell::new(Vec::new());
+        log_lines(
+            &lines,
+            &mut |line| events.borrow_mut().push(line.to_owned()),
+            &mut || events.borrow_mut().push("pet".to_owned()),
+        );
+        let events = events.into_inner();
+
+        assert_eq!(events[0], "pet");
+        let pets = events.iter().filter(|event| *event == "pet").count();
+        assert!(pets >= 3, "{pets} pets");
+        // Between two pets there are never more than fifty lines.
+        for run in events.split(|event| event == "pet") {
+            assert!(run.len() <= 50, "{} lines without a pet", run.len());
+        }
+        // Every line is logged, once and in order.
+        let logged: Vec<_> = events.into_iter().filter(|event| event != "pet").collect();
+        assert_eq!(logged, lines);
+    }
+
+    #[test]
+    fn a_short_dump_is_logged_whole_after_one_pet() {
+        let lines = ["kernel: one".to_owned(), "kernel: two".to_owned()];
+        let events = RefCell::new(Vec::new());
+        log_lines(
+            &lines,
+            &mut |line| events.borrow_mut().push(line.to_owned()),
+            &mut || events.borrow_mut().push("pet".to_owned()),
+        );
+        assert_eq!(events.into_inner(), ["pet", "kernel: one", "kernel: two"]);
+    }
+
+    #[test]
     fn a_kernel_log_that_cannot_be_read_is_an_error_to_report() {
         let tmp = tempfile::tempdir().unwrap();
         let error = kernel_lines(&tmp.path().join("absent")).unwrap_err();
@@ -1102,7 +1221,7 @@ mod tests {
     fn a_failure_before_the_config_is_known_restores_config_txt_and_saves_the_log() {
         let mut card = FakeCard::new();
         let log = log_holding(&["qberrypi.toml: (syntax): not valid TOML"]);
-        rescue(None, &mut card, Some(&log));
+        rescue(None, &mut card, Some(&log), &mut || {});
         assert_eq!(card.read("config.txt"), PIOS);
         assert_eq!(
             card.read("qberrypi/log.txt"),
@@ -1118,7 +1237,12 @@ mod tests {
         for log_to_sd in [false, true] {
             let mut card = FakeCard::new();
             let log = log_holding(&["loading brcmfmac: bad signature"]);
-            rescue(Some(&cfg_debug(true, log_to_sd)), &mut card, Some(&log));
+            rescue(
+                Some(&cfg_debug(true, log_to_sd)),
+                &mut card,
+                Some(&log),
+                &mut || {},
+            );
             assert_eq!(card.read("config.txt"), PIOS);
             assert_eq!(
                 card.read("qberrypi/log.txt"),
@@ -1133,7 +1257,12 @@ mod tests {
     fn a_failure_of_a_permanent_system_with_the_log_on_saves_it_and_leaves_config_txt() {
         let mut card = FakeCard::new();
         let log = log_holding(&["loading brcmfmac: bad signature"]);
-        rescue(Some(&cfg_debug(false, true)), &mut card, Some(&log));
+        rescue(
+            Some(&cfg_debug(false, true)),
+            &mut card,
+            Some(&log),
+            &mut || {},
+        );
         assert_eq!(card.read("config.txt"), QBERRYPI);
         assert_eq!(card.read("config.pios.txt"), PIOS);
         assert_eq!(
@@ -1148,7 +1277,12 @@ mod tests {
     fn a_failure_of_a_permanent_system_that_keeps_no_log_never_mounts_the_card() {
         let mut card = FakeCard::new();
         let log = log_holding(&["loading brcmfmac: bad signature"]);
-        rescue(Some(&cfg_debug(false, false)), &mut card, Some(&log));
+        rescue(
+            Some(&cfg_debug(false, false)),
+            &mut card,
+            Some(&log),
+            &mut || {},
+        );
         assert!(card.ops.is_empty());
         assert_eq!(card.read("config.txt"), QBERRYPI);
         assert!(!card.has("qberrypi/log.txt"));
@@ -1161,10 +1295,39 @@ mod tests {
     #[test]
     fn with_only_the_log_to_save_and_no_log_to_use_the_card_is_never_mounted() {
         let mut card = FakeCard::new();
-        rescue(Some(&cfg_debug(false, true)), &mut card, None);
+        rescue(Some(&cfg_debug(false, true)), &mut card, None, &mut || {});
         assert!(card.ops.is_empty());
         assert_eq!(card.read("config.txt"), QBERRYPI);
         assert!(!card.has("qberrypi/log.txt"));
+    }
+
+    #[test]
+    fn the_rescue_pets_the_watchdog_between_the_restore_and_the_log() {
+        let mut card = FakeCard::new();
+        let dir = card.dir().to_owned();
+        let log = log_holding(&["first"]);
+        // What the card held each time the watchdog was petted.
+        let mut seen = Vec::new();
+        rescue(None, &mut card, Some(&log), &mut || {
+            let restored = fs::read_to_string(dir.join("config.txt")).unwrap() == PIOS;
+            seen.push((restored, dir.join("qberrypi/log.txt").exists()));
+        });
+        assert_eq!(seen, [(true, false)]);
+        assert_eq!(card.read("qberrypi/log.txt"), header() + "first\n");
+    }
+
+    #[test]
+    fn the_rescue_pets_the_watchdog_before_it_saves_the_log_of_a_permanent_system() {
+        let mut card = FakeCard::new();
+        let dir = card.dir().to_owned();
+        let log = log_holding(&["first"]);
+        let mut seen = Vec::new();
+        let cfg = cfg_debug(false, true);
+        rescue(Some(&cfg), &mut card, Some(&log), &mut || {
+            seen.push(dir.join("qberrypi/log.txt").exists());
+        });
+        assert_eq!(seen, [false]);
+        assert_eq!(card.read("qberrypi/log.txt"), header() + "first\n");
     }
 
     #[test]
@@ -1172,7 +1335,7 @@ mod tests {
         let mut card = FakeCard::new();
         card.mount(Access::ReadOnly).unwrap();
         card.ops.clear();
-        rescue(None, &mut card, None);
+        rescue(None, &mut card, None, &mut || {});
         assert_eq!(card.read("config.txt"), PIOS);
         assert_eq!(card.ops, RESCUE_OPS);
         assert!(!card.mounted);
@@ -1189,7 +1352,7 @@ mod tests {
             let log = Arc::clone(&log);
             move || {
                 let mut card = FakeCard::new();
-                rescue(None, &mut card, Some(&log));
+                rescue(None, &mut card, Some(&log), &mut || {});
                 done.send(card)
             }
         });
@@ -1207,7 +1370,7 @@ mod tests {
         let mut card = FakeCard::new();
         card.remove("config.pios.txt");
         let log = log_holding(&["first"]);
-        rescue(None, &mut card, Some(&log));
+        rescue(None, &mut card, Some(&log), &mut || {});
         assert_eq!(card.read("config.txt"), QBERRYPI);
         assert_eq!(card.read("qberrypi/log.txt"), header() + "first\n");
         assert_eq!(card.ops, RESCUE_OPS);
@@ -1218,7 +1381,7 @@ mod tests {
         let mut card = FakeCard::new();
         card.mount_fails = true;
         let log = log_holding(&["first"]);
-        rescue(None, &mut card, Some(&log));
+        rescue(None, &mut card, Some(&log), &mut || {});
         assert_eq!(card.ops, ["unmount", "mount writable"]);
         assert_eq!(card.read("config.txt"), QBERRYPI);
         assert_eq!(log.lock().unwrap().take_unsaved(), "first\n");
