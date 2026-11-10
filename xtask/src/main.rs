@@ -11,6 +11,8 @@ mod cpio;
 mod deb;
 mod fetch;
 mod pins;
+mod qemu;
+mod sdimage;
 
 #[derive(Parser)]
 #[command(name = "xtask", about = "Development tasks for qberrypi")]
@@ -52,7 +54,7 @@ fn main() -> Result<()> {
     match Cli::parse().command {
         Command::Fetch => fetch::run(workspace_root()),
         Command::Build => build::run(workspace_root(), unix_time()?).map(drop),
-        Command::QemuTest => bail!("qemu-test: not implemented"),
+        Command::QemuTest => qemu::run_all(workspace_root()),
         Command::Deploy => bail!("deploy: not implemented"),
         Command::Collect => bail!("collect: not implemented"),
     }
