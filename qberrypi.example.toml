@@ -1,0 +1,24 @@
+hostname = "qberrypi"
+
+[wifi]
+ssid = "example-network"
+passphrase = "example-passphrase"   # or: pmk = "<64 hex digits>"
+country = "US"
+
+[net]
+address = "192.0.2.53/24"
+gateway = "192.0.2.1"
+
+[dns]
+upstreams = ["9.9.9.9", "149.112.112.112"]
+lists = [
+  "https://raw.githubusercontent.com/StevenBlack/hosts/master/hosts",
+  "https://raw.githubusercontent.com/hagezi/dns-blocklists/main/adblock/pro.txt",
+]
+deny = []
+allow = []
+
+[debug]
+one_shot = false          # restore Raspberry Pi OS's config.txt at every boot
+log_to_sd = false         # append the log to qberrypi/log.txt
+return_after_secs = 0     # restart after this long; 0 means never

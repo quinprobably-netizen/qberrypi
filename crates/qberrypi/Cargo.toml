@@ -7,3 +7,4 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+toml = { version = "1.2.1", default-features = false, features = ["parse", "serde", "std"] }
