@@ -48,8 +48,15 @@ pub enum Restore {
 /// Copies `config.pios.txt` over `config.txt`, so the next start is Raspberry Pi OS.
 ///
 /// The backup is read and judged in full before `config.txt` is touched, and
-/// is itself never written. An error from reading either file is returned
-/// with nothing changed.
+/// is itself never written. It is refused, with nothing changed, when it:
+///
+/// - does not exist: `"config.pios.txt is missing"`;
+/// - holds nothing but whitespace: `"config.pios.txt is empty"`;
+/// - contains a NUL byte: `"config.pios.txt is not text"`;
+/// - has an uncommented line starting with `os_prefix=qberrypi/`:
+///   `"config.pios.txt selects qberrypi"`.
+///
+/// An error from reading either file is returned with nothing changed.
 pub fn restore_pios_config(boot: &Path) -> io::Result<Restore> {
     let backup = match fs::read(boot.join(PIOS_CONFIG)) {
         Ok(bytes) => bytes,
@@ -60,6 +67,11 @@ pub fn restore_pios_config(boot: &Path) -> io::Result<Restore> {
     };
     if backup.trim_ascii().is_empty() {
         return Ok(Restore::Refused("config.pios.txt is empty"));
+    }
+    // An interrupted write on FAT can leave a file of the right size whose
+    // data reads back as NUL bytes; restoring that would blank config.txt.
+    if backup.contains(&0) {
+        return Ok(Restore::Refused("config.pios.txt is not text"));
     }
     if selects_qberrypi(&backup) {
         return Ok(Restore::Refused("config.pios.txt selects qberrypi"));
@@ -75,8 +87,8 @@ pub fn restore_pios_config(boot: &Path) -> io::Result<Restore> {
 
     // The file is overwritten where it lies. Renaming a finished copy into
     // place is not atomic on FAT and would leave a moment with no config.txt.
-    // It is also not emptied first, so it is never left blank on the way: the
-    // new bytes go over the old ones, and only then is any old tail cut off.
+    // Opened without truncation, so the file is never zero-length on the way:
+    // the new bytes go over the old ones, and only then is any old tail cut off.
     let mut file = File::options()
         .write(true)
         .create(true)
@@ -304,6 +316,30 @@ mod tests {
             Restore::Refused("config.pios.txt selects qberrypi")
         );
         assert_eq!(read(d, "config.txt"), "ORIGINAL\n");
+    }
+
+    #[test]
+    fn backup_with_a_nul_byte_is_refused_as_not_text() {
+        for (case, backup) in [
+            // What an interrupted write can leave: the right size, no data.
+            ("all NULs", &[0u8; 512][..]),
+            ("one NUL in text", b"arm_64bit=1\ndtparam=au\0dio=on\n"),
+            // Checked before the setting is looked for.
+            ("NUL and the setting", b"os_prefix=qberrypi/\n\0"),
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            let d = tmp.path();
+            write(d, ACTIVE, "ORIGINAL\n");
+            write(d, BACKUP, backup);
+            let long_ago = backdate(&d.join(ACTIVE));
+            assert_eq!(
+                restore(d),
+                Restore::Refused("config.pios.txt is not text"),
+                "{case}"
+            );
+            assert_eq!(fs::read(d.join(ACTIVE)).unwrap(), b"ORIGINAL\n");
+            assert_eq!(modified(&d.join(ACTIVE)), long_ago);
+        }
     }
 
     #[test]
