@@ -1,0 +1,11 @@
+[package]
+name = "xtask"
+description = "Development tasks for qberrypi: fetch, build, test in QEMU, deploy"
+publish = false
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow = "1.0.104"
+clap = { version = "4.6.7", features = ["derive"] }

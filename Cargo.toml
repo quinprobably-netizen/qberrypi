@@ -1,0 +1,15 @@
+[workspace]
+resolver = "3"
+members = ["crates/qberrypi", "xtask"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+repository = "https://github.com/quinprobably-netizen/qberrypi"
+
+[profile.release]
+opt-level = "s"
+lto = true
+panic = "abort"
+strip = true

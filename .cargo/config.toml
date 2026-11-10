@@ -1,0 +1,6 @@
+[alias]
+xtask = "run --quiet -p xtask --"
+
+[target.aarch64-unknown-linux-musl]
+linker = "rust-lld"
+rustflags = ["-C", "linker-flavor=ld.lld", "-C", "link-self-contained=yes", "-C", "target-feature=+crt-static"]
