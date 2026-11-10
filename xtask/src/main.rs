@@ -1,14 +1,16 @@
 //! Development tasks for qberrypi. Run as `cargo xtask <command>`.
 
+use std::env;
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 
 mod build;
 mod cpio;
 mod deb;
+mod deploy;
 mod fetch;
 mod pins;
 mod qemu;
@@ -30,9 +32,25 @@ enum Command {
     /// Boot the built image under QEMU and check it behaves
     QemuTest,
     /// Copy the build to a Pi running Raspberry Pi OS and boot it once
-    Deploy,
+    Deploy {
+        /// SSH alias of the Pi; without it, the environment variable QBERRYPI_HOST is used
+        #[arg(long)]
+        host: Option<String>,
+        /// Deploy a configuration that has debug.one_shot off and so stays on the Pi
+        #[arg(long)]
+        permanent: bool,
+    },
     /// Fetch the log qberrypi left on the Pi's boot partition
-    Collect,
+    Collect {
+        /// SSH alias of the Pi; without it, the environment variable QBERRYPI_HOST is used
+        #[arg(long)]
+        host: Option<String>,
+    },
+}
+
+/// The Pi a command is for: the `--host` it was given, or else `QBERRYPI_HOST`.
+fn host(flag: Option<String>) -> Result<String> {
+    deploy::resolve_host(flag, env::var(deploy::HOST_VARIABLE).ok())
 }
 
 /// The top of the repository, where `vendor-cache/` and `out/` live.
@@ -55,7 +73,12 @@ fn main() -> Result<()> {
         Command::Fetch => fetch::run(workspace_root()),
         Command::Build => build::run(workspace_root(), unix_time()?).map(drop),
         Command::QemuTest => qemu::run_all(workspace_root()),
-        Command::Deploy => bail!("deploy: not implemented"),
-        Command::Collect => bail!("collect: not implemented"),
+        Command::Deploy {
+            host: flag,
+            permanent,
+        } => deploy::deploy(&host(flag)?, permanent, workspace_root()),
+        Command::Collect { host: flag } => {
+            deploy::collect(&host(flag)?, workspace_root()).map(drop)
+        }
     }
 }
