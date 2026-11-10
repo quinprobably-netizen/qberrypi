@@ -70,6 +70,7 @@ leaves room for them but builds none of them.
 ```
 Pi boot firmware  ->  kernel8.img + device tree  ->  initramfs (cpio, zstd)
                                                         /init        the Rust executable
+                                                        /dev/console, /dev/null  so init starts even with no console
                                                         /lib/modules 5 Wi-Fi modules, uncompressed
                                                         /lib/firmware Wi-Fi firmware, regulatory db
                                                         /blocklist.zst build-time list snapshot
@@ -165,11 +166,14 @@ with no knowledge of the rest. The others are modules of the main crate.
 
 1. Mount `/proc`, `/sys`, `/dev`, a tmpfs at `/run`. Open the console.
 2. Set the clock to the image build time, so it is never earlier than that.
-3. Open the hardware watchdog with a 15-second timeout.
-4. Mount the boot partition read-only, read `qberrypi/qberrypi.toml`,
+3. Mount the boot partition read-only, read `qberrypi/qberrypi.toml`,
    unmount. In one-shot mode, remount it writable, restore `config.txt`,
    sync and unmount. If the configuration cannot be read or parsed, the
    restore happens anyway, so a bad file cannot strand the Pi in qberrypi.
+4. Open the hardware watchdog with a 15-second timeout. This comes after
+   the restore on purpose: a board that misbehaved when the watchdog
+   started would otherwise reset before `config.txt` was put back, on
+   every boot. A missing watchdog is logged, not fatal.
 5. Register as the kernel's module helper. Load `rfkill`, `cfg80211`
    (with the configured country), `brcmutil`, `brcmfmac`. The driver then
    requests the fifth module, its vendor sub-module `brcmfmac-cyw`, through
@@ -180,8 +184,9 @@ with no knowledge of the rest. The others are modules of the main crate.
 8. Set the clock by SNTP.
 9. Start the status server and the list refresher.
 
-A failure in steps 1 to 5 is fatal: the message goes to the console and the
-kernel reboots after five seconds (`panic=5`). From step 6 on, failures are
+A failure in steps 1 to 5 is fatal, the missing watchdog aside: the message
+goes to the console, `config.txt` is restored where the rules below say so,
+and the board restarts after five seconds. From step 6 on, failures are
 handled by the supervisor.
 
 ## Wi-Fi
