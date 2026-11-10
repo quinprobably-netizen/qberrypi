@@ -1,7 +1,13 @@
 //! Development tasks for qberrypi. Run as `cargo xtask <command>`.
 
+use std::path::Path;
+
 use anyhow::{Result, bail};
 use clap::{Parser, Subcommand};
+
+mod deb;
+mod fetch;
+mod pins;
 
 #[derive(Parser)]
 #[command(name = "xtask", about = "Development tasks for qberrypi")]
@@ -24,9 +30,16 @@ enum Command {
     Collect,
 }
 
+/// The top of the repository, where `vendor-cache/` and `out/` live.
+fn workspace_root() -> &'static Path {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("the xtask crate sits one level below the workspace root")
+}
+
 fn main() -> Result<()> {
     match Cli::parse().command {
-        Command::Fetch => bail!("fetch: not implemented"),
+        Command::Fetch => fetch::run(workspace_root()),
         Command::Build => bail!("build: not implemented"),
         Command::QemuTest => bail!("qemu-test: not implemented"),
         Command::Deploy => bail!("deploy: not implemented"),

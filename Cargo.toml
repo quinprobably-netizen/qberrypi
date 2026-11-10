@@ -13,3 +13,7 @@ opt-level = "s"
 lto = true
 panic = "abort"
 strip = true
+
+# `cargo xtask fetch` hashes about 40 MB on every run; unoptimised, that alone takes seconds.
+[profile.dev.package.sha2]
+opt-level = 3
