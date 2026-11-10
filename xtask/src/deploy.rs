@@ -2,9 +2,23 @@
 //!
 //! The Pi is running Raspberry Pi OS and is reached over SSH. `deploy` copies
 //! the build into a fresh directory under `/tmp` there and hands a script to
-//! `sudo sh -s`; that script alone writes the boot partition. It saves
-//! `config.txt` as `config.pios.txt`, which qberrypi's init copies back, and
-//! it stops before it touches `config.txt` whenever something is not as expected.
+//! `sudo sh -s`; that script alone writes the boot partition, in this order:
+//!
+//! 1. Checks: the stage directory and what is in it, the board, the mount.
+//! 2. Backup: `config.txt` is saved as `config.pios.txt`, unless a saved one
+//!    is there already; that one is never written.
+//! 3. Backup validation: the saved file must be one qberrypi's init will
+//!    copy back, and `config.txt` must be either that file or qberrypi's.
+//! 4. Deselect: if `config.txt` selects qberrypi from an earlier deploy, the
+//!    saved file is copied back over it first.
+//! 5. Copy: the staged files go into the `qberrypi` folder.
+//! 6. Verify: the copies are read back against `SHA256SUMS`.
+//! 7. The stage directory is removed.
+//! 8. Select: qberrypi's `config.txt` is copied over `config.txt`.
+//! 9. `sync`, then the restart.
+//!
+//! Up to step 8 the script only ever moves `config.txt` towards Raspberry Pi
+//! OS, so a script that stops early leaves a Pi that starts Raspberry Pi OS.
 //!
 //! Every external command is built as a program with its arguments by a
 //! function of its own and run through a [`Runner`], so tests can read the
@@ -74,8 +88,8 @@ const BAD_STAGE: i32 = 6;
 const WRONG_MACHINE: i32 = 7;
 /// Script status: a file on the card does not match its checksum.
 const BAD_COPY: i32 = 8;
-/// Script status: `config.txt` could not be written.
-const SELECT_FAILED: i32 = 9;
+/// Script status: `config.txt` could not be written, to select qberrypi or to deselect it.
+const CONFIG_NOT_WRITTEN: i32 = 9;
 
 /// The line the script prints once `config.txt` selects qberrypi.
 const SELECTED_MARKER: &str = "qberrypi-deploy: qberrypi is selected; restarting";
@@ -427,7 +441,7 @@ impl RemoteScript {
              bad_stage={BAD_STAGE}\n\
              wrong_machine={WRONG_MACHINE}\n\
              bad_copy={BAD_COPY}\n\
-             select_failed={SELECT_FAILED}\n\
+             config_not_written={CONFIG_NOT_WRITTEN}\n\
              \n\
              restart() {{\n    {restart}\n}}\n\
              {SCRIPT_BODY}"
@@ -445,6 +459,21 @@ const SCRIPT_HEAD: &str = r"#!/bin/sh
 # Installs a staged qberrypi build on the boot partition that is shared with
 # Raspberry Pi OS, and selects it for the next start. Written by
 # `cargo xtask deploy`, which runs it as root: ssh <host> sudo sh -s
+#
+# In this order, stopping at the first thing that is not as expected:
+#   1. Checks: the stage directory and its files, the board, the mount.
+#   2. Backup: config.txt is saved as config.pios.txt, unless a saved one is
+#      there already. That one is never written.
+#   3. Backup validation: init must be able to restore from config.pios.txt,
+#      and config.txt must be either that file or qberrypi's.
+#   4. Deselect: if config.txt selects qberrypi from an earlier deploy,
+#      config.pios.txt is copied back over it.
+#   5. Copy: the staged files go into the qberrypi folder.
+#   6. Verify: the copies are read back against SHA256SUMS.
+#   7. The stage directory is removed.
+#   8. Select: qberrypi's config.txt is copied over config.txt.
+#   9. sync, then the restart.
+# Before step 8, config.txt is only ever moved towards Raspberry Pi OS.
 #
 # The work is done by main, which the last line calls: a script that arrives
 # cut short does nothing.
@@ -557,7 +586,7 @@ main() {
         mountpoint -q "$boot" || die "$wrong_machine" "$boot is not a mount point; nothing was changed"
     fi
 
-    # 2. The saved configuration of Raspberry Pi OS. One that is there is never written.
+    # 2. Backup. A saved configuration that is there is never written.
     if [ ! -s "$backup" ]; then
         if ! restorable "$active"; then
             if [ "$reason" = 'selects qberrypi' ]; then
@@ -573,7 +602,8 @@ main() {
         sync
     fi
 
-    # Whether saved just now or long ago: init must be able to restore from it.
+    # 3. Backup validation. Whether saved just now or long ago: init must be
+    # able to restore from it.
     if ! restorable "$backup"; then
         refused="config.pios.txt $reason, so qberrypi could not hand the Pi back to Raspberry Pi OS"
         if selects_qberrypi "$active"; then
@@ -582,37 +612,44 @@ main() {
         die "$backup_refused" "$refused. If $active is the configuration of Raspberry Pi OS, delete $backup and deploy again; nothing was changed"
     fi
 
-    # A config.txt that does not select qberrypi is the one of Raspberry Pi OS,
-    # and init will put the saved one in its place. Unless the two are the
-    # same, that would lose what was changed since.
     selected=0
     selects_qberrypi "$active" || selected=$?
     if [ "$selected" -ne 0 ]; then
+        # A config.txt that does not select qberrypi is the one of Raspberry Pi
+        # OS, and init will put the saved one in its place. Unless the two are
+        # the same, that would lose what was changed since.
         cmp -s -- "$active" "$backup" ||
-            die "$config_changed" "config.txt is not what config.pios.txt saved, and after its run qberrypi would put the saved one back. To keep the one in config.txt, delete $backup and deploy again; config.txt was not changed"
-    fi
-
-    # 3 and 4. The build goes beside whatever the folder holds already (the log
-    # of earlier runs), and is read back before anything depends on it.
-    say "copying the build to $own"
-    if ! copy_and_check; then
-        if [ "$selected" -eq 0 ]; then
-            die "$bad_copy" "the build in $own is not complete or does not match SHA256SUMS. config.txt was not changed, but it has selected qberrypi since an earlier deploy, so the next restart would start these files. Before the Pi restarts, deploy again, or put the saved configuration back: cp $backup $active"
+            die "$config_changed" "config.txt is not what config.pios.txt saved, and after its run qberrypi would put the saved one back. To keep the one in config.txt, run on the Pi: sudo rm $backup, then deploy again, which saves it afresh. To go back to the saved one, run on the Pi: sudo cp $backup $active, then deploy again. Nothing was changed"
+    else
+        # 4. Deselect. An earlier deploy selected qberrypi and the Pi has not
+        # restarted since. Its folder is about to be replaced, so the saved
+        # configuration goes back first: from here to step 8 a restart, or a
+        # stop of this script, leaves Raspberry Pi OS.
+        say "config.txt selects qberrypi from an earlier deploy; putting config.pios.txt back while the build is replaced"
+        if ! cp -- "$backup" "$active" || ! cmp -s -- "$backup" "$active"; then
+            die "$config_not_written" "config.txt could not be written and may be damaged. Before the Pi restarts, put the saved one back, on the Pi: sudo cp $backup $active"
         fi
-        die "$bad_copy" "the build in $own is not complete or does not match SHA256SUMS; config.txt was not changed, so the next restart is Raspberry Pi OS"
+        sync
     fi
 
-    # 5. The stage is done with; no copy of the passphrase stays in /tmp.
+    # 5 and 6. Copy and verify. The build goes beside whatever the folder holds
+    # already (the log of earlier runs), and is read back before anything
+    # depends on it.
+    say "copying the build to $own"
+    copy_and_check ||
+        die "$bad_copy" "the build in $own is not complete or does not match SHA256SUMS. config.txt is the configuration of Raspberry Pi OS, so the next restart is Raspberry Pi OS"
+
+    # 7. The stage is done with; no copy of the passphrase stays in /tmp.
     rm -rf -- "$stage"
 
-    # 6. From here on the next start is qberrypi.
+    # 8. Select. From here on the next start is qberrypi.
     say "selecting qberrypi"
     if ! cp -- "$own/config.txt" "$active" || ! cmp -s -- "$own/config.txt" "$active"; then
-        die "$select_failed" "config.txt could not be written and may be damaged. Before the Pi restarts, put the saved one back: cp $backup $active"
+        die "$config_not_written" "config.txt could not be written and may be damaged. Before the Pi restarts, put the saved one back, on the Pi: sudo cp $backup $active"
     fi
     say "qberrypi is selected; restarting"
 
-    # 7. The restart.
+    # 9. The restart.
     sync
     restart
 } </dev/null
@@ -1600,29 +1637,127 @@ mod tests {
         }
     }
 
-    #[test]
-    fn a_corrupt_copy_over_a_selected_qberrypi_says_what_to_do_before_a_restart() {
-        // An earlier deploy selected qberrypi and the Pi has not restarted since. The
-        // script still leaves config.txt alone, but the files it names are now bad.
-        for shell in shells() {
-            let card = Card::fresh();
-            assert_eq!(card.run(shell).status, Some(0));
-            card.stage_files(&STAGED);
-            fs::write(card.stage.path().join("initramfs8"), b"DAMAGED").unwrap();
+    /// A card on which an earlier deploy selected qberrypi and the Pi has not restarted since.
+    fn selected_card() -> Card {
+        let card = Card::new();
+        card.write_boot("config.txt", OWN_CONFIG);
+        card.write_boot("config.pios.txt", PIOS);
+        card.write_boot("qberrypi/kernel8.img", "OLD KERNEL");
+        card.write_boot("qberrypi/config.txt", OWN_CONFIG);
+        card
+    }
 
+    #[test]
+    fn a_corrupt_copy_over_a_selected_qberrypi_leaves_raspberry_pi_os_selected() {
+        // The folder config.txt pointed at is about to be replaced, so qberrypi is
+        // deselected first: whatever happens to the copy, the next start is Raspberry Pi OS.
+        for shell in shells() {
+            for (damaged, _) in STAGED {
+                let card = selected_card();
+                fs::write(card.stage.path().join(damaged), b"DAMAGED").unwrap();
+
+                let ran = card.run(shell);
+                assert_eq!(
+                    ran.status,
+                    Some(BAD_COPY),
+                    "{shell}, {damaged}: {}",
+                    ran.stderr
+                );
+                assert_eq!(card.read_boot("config.txt"), PIOS.as_bytes(), "{damaged}");
+                assert_eq!(card.read_boot("config.pios.txt"), PIOS.as_bytes());
+                assert!(
+                    ran.stderr.contains("the next restart is Raspberry Pi OS"),
+                    "{}",
+                    ran.stderr
+                );
+                assert!(!card.trace().contains("restart"));
+            }
+        }
+    }
+
+    #[test]
+    fn a_copy_that_cannot_be_made_over_a_selected_qberrypi_leaves_raspberry_pi_os_selected() {
+        for shell in shells() {
+            let card = Card::new();
+            card.write_boot("config.txt", OWN_CONFIG);
+            card.write_boot("config.pios.txt", PIOS);
+            // A file where the folder should be: nothing can be copied into it.
+            card.write_boot("qberrypi", "not a folder");
             let ran = card.run(shell);
             assert_eq!(ran.status, Some(BAD_COPY), "{shell}: {}", ran.stderr);
+            assert_eq!(card.read_boot("config.txt"), PIOS.as_bytes());
+            assert_eq!(card.read_boot("config.pios.txt"), PIOS.as_bytes());
+        }
+    }
+
+    #[test]
+    fn a_good_deploy_over_a_selected_qberrypi_selects_it_again() {
+        for shell in shells() {
+            let card = selected_card();
+            let ran = card.run(shell);
+            assert_eq!(ran.status, Some(0), "{shell}: {}", ran.stderr);
             assert_eq!(card.read_boot("config.txt"), OWN_CONFIG.as_bytes());
             assert_eq!(card.read_boot("config.pios.txt"), PIOS.as_bytes());
-            let backup = card.boot.join("config.pios.txt");
-            let active = card.boot.join("config.txt");
-            let remedy = format!("cp {} {}", backup.display(), active.display());
-            assert!(
-                ran.stderr.contains("has selected qberrypi"),
-                "{}",
-                ran.stderr
+            assert_eq!(card.read_boot("qberrypi/kernel8.img"), b"KERNEL");
+            assert!(ran.stdout.contains(SELECTED_MARKER), "{}", ran.stdout);
+        }
+    }
+
+    #[test]
+    fn a_selected_qberrypi_is_deselected_before_its_folder_is_touched() {
+        // This stand-in for sync also records which kernel the folder held at the time.
+        let sync = "sync() { printf 'sync: %s / %s\\n' \
+            \"$(cat \"$QBERRYPI_TEST_BOOT/config.txt\")\" \
+            \"$(cat \"$QBERRYPI_TEST_BOOT/qberrypi/kernel8.img\")\" \
+            >>\"$QBERRYPI_TEST_TRACE\"; }\n";
+        for shell in shells() {
+            let card = selected_card();
+            let ran = card.run_text(shell, &card.script().render(), sync);
+            assert_eq!(ran.status, Some(0), "{shell}: {}", ran.stderr);
+            let trace = card.trace();
+            let lines: Vec<&str> = trace.lines().collect();
+            assert_eq!(
+                lines,
+                [
+                    // Raspberry Pi OS is back and on the card while the old build is still whole.
+                    "sync: PIOS / OLD KERNEL",
+                    "sync: PIOS / KERNEL",
+                    "sync: os_prefix=qberrypi/ / KERNEL",
+                    "restart: os_prefix=qberrypi/",
+                ],
+                "{shell}"
             );
-            assert!(ran.stderr.contains(&remedy), "{}", ran.stderr);
+        }
+    }
+
+    #[test]
+    fn a_selected_qberrypi_without_a_backup_to_restore_is_refused_and_nothing_changes() {
+        for shell in shells() {
+            // The backup itself selects qberrypi, or is not one init would restore, or is not there.
+            let backups: [Option<&[u8]>; 4] = [
+                Some(OWN_CONFIG.as_bytes()),
+                Some(b"arm_64bit=1\n  os_prefix=qberrypi/\n"),
+                Some(b" \n"),
+                None,
+            ];
+            for backup in backups {
+                let card = selected_card();
+                match backup {
+                    Some(backup) => card.write_boot("config.pios.txt", backup),
+                    None => fs::remove_file(card.boot.join("config.pios.txt")).unwrap(),
+                }
+                let before = card.snapshot();
+                let ran = card.run(shell);
+                let expected = if backup.is_some() {
+                    BACKUP_REFUSED
+                } else {
+                    ALREADY_SELECTED
+                };
+                assert_eq!(ran.status, Some(expected), "{shell}: {}", ran.stderr);
+                assert_eq!(card.snapshot(), before);
+                assert_eq!(card.read_boot("config.txt"), OWN_CONFIG.as_bytes());
+                assert_eq!(card.trace(), "");
+            }
         }
     }
 
@@ -1841,6 +1976,14 @@ mod tests {
                 let ran = card.run(shell);
                 assert_eq!(ran.status, Some(CONFIG_CHANGED), "{shell}: {}", ran.stderr);
                 assert_eq!(card.snapshot(), before);
+                // The message gives both ways on, as commands: keep the newer one or the saved one.
+                let backup = card.boot.join("config.pios.txt");
+                let active = card.boot.join("config.txt");
+                let keep_newer = format!("rm {}", backup.display());
+                let keep_saved = format!("cp {} {}", backup.display(), active.display());
+                assert!(ran.stderr.contains(&keep_newer), "{}", ran.stderr);
+                assert!(ran.stderr.contains(&keep_saved), "{}", ran.stderr);
+                assert!(ran.stderr.contains("deploy again"), "{}", ran.stderr);
                 assert!(!card.trace().contains("restart"));
             }
         }
