@@ -7,8 +7,6 @@
 use std::fs::{self, File};
 use std::io::{self, ErrorKind, Write};
 use std::path::Path;
-use std::thread;
-use std::time::{Duration, Instant};
 
 /// The block device that holds the boot partition.
 pub const BOOT_DEV: &str = "/dev/mmcblk0p1";
@@ -34,9 +32,6 @@ const BOOT_HEADER_END: &str = " ====";
 
 /// The setting that makes the firmware start qberrypi.
 const SELECTS_QBERRYPI: &[u8] = b"os_prefix=qberrypi/";
-
-/// How often `wait_for_path` looks for the path.
-const POLL_INTERVAL: Duration = Duration::from_millis(50);
 
 /// What `restore_pios_config` did, or why it changed nothing.
 #[derive(Debug, PartialEq)]
@@ -163,24 +158,6 @@ pub fn last_boot_build(log: &str) -> Option<u64> {
     build.parse().ok()
 }
 
-/// Waits for a path to exist, such as a device the kernel has yet to find.
-///
-/// Returns whether it exists. The path is looked for at once and then every
-/// 50 ms, with a last look when the timeout has passed.
-pub fn wait_for_path(path: &Path, timeout: Duration) -> bool {
-    let start = Instant::now();
-    loop {
-        if path.exists() {
-            return true;
-        }
-        let left = timeout.saturating_sub(start.elapsed());
-        if left.is_zero() {
-            return false;
-        }
-        thread::sleep(left.min(POLL_INTERVAL));
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -188,8 +165,7 @@ mod tests {
     use std::fs::{self, File};
     use std::io::ErrorKind;
     use std::path::Path;
-    use std::thread;
-    use std::time::{Duration, Instant, SystemTime};
+    use std::time::{Duration, SystemTime};
 
     const ACTIVE: &str = "config.txt";
     const BACKUP: &str = "config.pios.txt";
@@ -513,45 +489,5 @@ mod tests {
         let absent = tmp.path().join("absent");
         assert!(append_log(&absent, "one\n").is_err());
         assert!(!absent.exists());
-    }
-
-    #[test]
-    fn wait_for_path_sees_a_late_file_and_times_out_on_a_missing_one() {
-        let tmp = tempfile::tempdir().unwrap();
-        let late = tmp.path().join("late");
-        let start = Instant::now();
-        let creator = thread::spawn({
-            let late = late.clone();
-            move || {
-                thread::sleep(Duration::from_millis(150));
-                File::create(late).unwrap();
-            }
-        });
-        assert!(wait_for_path(&late, Duration::from_secs(2)));
-        let waited = start.elapsed();
-        assert!(waited >= Duration::from_millis(150) && waited < Duration::from_secs(2));
-        creator.join().unwrap();
-
-        let never = tmp.path().join("never");
-        let start = Instant::now();
-        assert!(!wait_for_path(&never, Duration::from_millis(200)));
-        assert!(start.elapsed() >= Duration::from_millis(200));
-    }
-
-    #[test]
-    fn wait_for_path_returns_at_once_for_an_existing_path() {
-        let tmp = tempfile::tempdir().unwrap();
-        let start = Instant::now();
-        assert!(wait_for_path(tmp.path(), Duration::from_secs(60)));
-        assert!(wait_for_path(tmp.path(), Duration::ZERO));
-        assert!(start.elapsed() < Duration::from_secs(1));
-    }
-
-    #[test]
-    fn wait_for_path_with_no_timeout_checks_once() {
-        let tmp = tempfile::tempdir().unwrap();
-        let start = Instant::now();
-        assert!(!wait_for_path(&tmp.path().join("never"), Duration::ZERO));
-        assert!(start.elapsed() < Duration::from_secs(1));
     }
 }
