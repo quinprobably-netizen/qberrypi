@@ -2,8 +2,12 @@
 //! writes `out/qberrypi/`, the folder that goes onto the Pi's boot partition.
 //!
 //! The folder holds the kernel and device tree exactly as fetched, the
-//! initramfs, the two text files the Pi's boot firmware reads, and the
-//! checksums of those five. The same inputs always give the same bytes.
+//! initramfs, the two text files the Pi's boot firmware reads, the three
+//! overlay files that go with them, and the checksums of those eight. The
+//! same inputs always give the same bytes.
+//!
+//! The initramfs also holds the block lists that `cargo xtask fetch-lists` cached, as one
+//! compressed snapshot, so that the Pi can block before it has a network.
 
 use std::env;
 use std::ffi::OsString;
@@ -13,15 +17,24 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use anyhow::{Context, Result, anyhow, bail};
+use qberrypi::lists::snapshot::{Header, SNAPSHOT_PATH};
 use qberrypi::modules::{DEFAULT_TABLE, MODULE_DIR, MODULE_LIST, ModuleTable};
 use sha2::{Digest, Sha256};
 
 use crate::cpio::{CpioWriter, Node};
+use crate::lists::{self, STALE_AFTER_DAYS};
 
 /// The kernel command line, as `cmdline.txt` holds it.
 pub const CMDLINE_TXT: &str = "console=tty1 panic=5 loglevel=4\n";
 
 /// The `config.txt` that makes the Pi's boot firmware start qberrypi from its folder.
+///
+/// The last three lines are the touchscreen's: the SPI bus, the prefix the
+/// firmware puts before an overlay's file name, and the overlay that describes
+/// the screen on the bus, with `rotate=270` for the way up the screen is
+/// mounted. With `os_prefix=qberrypi/` the firmware reads `qberrypi/ov-README`
+/// and `qberrypi/ov-qb-piscreen.dtbo`: qberrypi's own copy of the overlay,
+/// which an upgrade of Raspberry Pi OS cannot take away or change.
 pub const CONFIG_TXT: &str = "\
 # qberrypi. Copy config.pios.txt over this file to return to Raspberry Pi OS.
 arm_64bit=1
@@ -29,6 +42,9 @@ os_prefix=qberrypi/
 kernel=kernel8.img
 initramfs initramfs8 followkernel
 disable_overscan=1
+dtparam=spi=on
+overlay_prefix=ov-
+dtoverlay=qb-piscreen,speed=16000000,rotate=270
 ";
 
 /// The folder under the repository root that `cargo xtask fetch` extracts into.
@@ -44,6 +60,12 @@ const TARGET: &str = "aarch64-unknown-linux-musl";
 const KERNEL: &str = "kernel8.img";
 const DEVICE_TREE: &str = "bcm2710-rpi-3-b-plus.dtb";
 const INITRAMFS: &str = "initramfs8";
+
+/// The overlay files of the boot folder, as `cargo xtask fetch` leaves them under `vendor-cache/extracted/`.
+///
+/// `CONFIG_TXT`'s `overlay_prefix=ov-` is what makes the firmware ask for these names, in this
+/// order: the README that says the overlays are here, the map, and the screen's overlay.
+const OVERLAY_FILES: [&str; 3] = ["ov-README", "ov-overlay_map.dtb", "ov-qb-piscreen.dtbo"];
 
 /// The kernel module files a module table names, in the table's order.
 ///
@@ -116,8 +138,18 @@ const BOARD_FIRMWARE: [(&str, &str); 3] = [
     ),
 ];
 
+/// Where the initramfs holds the licence of the front panel's typefaces.
+const TYPEFACE_LICENCE_PATH: &str = "licenses/JetBrainsMono-OFL.txt";
+
+/// The licence of JetBrains Mono, the typeface that `qb-panel` builds into
+/// the executable that draws with it: the SIL Open Font License 1.1.
+///
+/// The licence is to go wherever the typeface goes, so the image carries it.
+/// These are the bytes of the crate's own copy, taken when xtask is compiled.
+const TYPEFACE_LICENCE: &[u8] = include_bytes!("../../crates/qb-panel/fonts/OFL.txt");
+
 /// The directories of the initramfs, each after the one it lies in.
-const DIRS: [&str; 9] = [
+const DIRS: [&str; 10] = [
     "dev",
     "proc",
     "sys",
@@ -127,6 +159,7 @@ const DIRS: [&str; 9] = [
     "lib/modules",
     "lib/firmware",
     "lib/firmware/brcm",
+    "licenses",
 ];
 
 /// How hard zstd works on the initramfs. The kernel unpacks any level.
@@ -138,6 +171,8 @@ pub struct ExtractedFiles {
     pub kernel: Vec<u8>,
     /// The device tree of the Pi 3 B+.
     pub dtb: Vec<u8>,
+    /// Each of `OVERLAY_FILES` with its contents.
+    overlays: Vec<(&'static str, Vec<u8>)>,
     /// Each module file of `DEFAULT_TABLE` with its contents.
     modules: Vec<(String, Vec<u8>)>,
     /// Each of `FIRMWARE` with its contents.
@@ -160,6 +195,10 @@ impl ExtractedFiles {
             })
         };
         let (kernel, dtb) = (read(KERNEL)?, read(DEVICE_TREE)?);
+        let mut overlays = Vec::new();
+        for name in OVERLAY_FILES {
+            overlays.push((name, read(name)?));
+        }
         let mut modules = Vec::new();
         for name in module_files(DEFAULT_TABLE)? {
             let data = read(&format!("modules/{name}"))?;
@@ -172,6 +211,7 @@ impl ExtractedFiles {
         Ok(Self {
             kernel,
             dtb,
+            overlays,
             modules,
             firmware,
         })
@@ -180,10 +220,12 @@ impl ExtractedFiles {
 
 /// Lists everything the initramfs holds, in the order it is packed.
 ///
-/// `init` is the cross-built executable, and the only member that can be executed.
+/// `init` is the cross-built executable, and the only member that can be executed. `snapshot`
+/// is the block lists, compressed as `crate::lists::snapshot` makes them: the last entry.
 pub fn initramfs_entries<'a>(
     extracted: &'a ExtractedFiles,
     init: &'a [u8],
+    snapshot: &'a [u8],
 ) -> Vec<(String, Node<'a>)> {
     let file = |data| Node::File { data, mode: 0o644 };
     // The paths init uses start at the root; the archive's start below it.
@@ -218,6 +260,11 @@ pub fn initramfs_entries<'a>(
     for (path, target) in BOARD_FIRMWARE {
         entries.push((path.to_owned(), Node::Symlink { target }));
     }
+    entries.push((TYPEFACE_LICENCE_PATH.to_owned(), file(TYPEFACE_LICENCE)));
+    entries.push((
+        SNAPSHOT_PATH.trim_start_matches('/').to_owned(),
+        file(snapshot),
+    ));
     entries
 }
 
@@ -247,13 +294,41 @@ pub fn sha256sums(files: &[(&str, &[u8])]) -> String {
     sums
 }
 
+/// What `build` says of the snapshot it packs: a line for what it holds and how old it is, and a
+/// second when it is more than `STALE_AFTER_DAYS` days old. `epoch` is the Unix time of the build.
+fn snapshot_report(header: &Header, bytes: usize, epoch: u64) -> Vec<String> {
+    if header.lists == 0 {
+        return vec![format!(
+            "build: snapshot: no list is configured, {bytes} bytes"
+        )];
+    }
+    let days = epoch.saturating_sub(header.fetched_unix_secs) / 86_400;
+    let mut report = vec![format!(
+        "build: snapshot: {} names from {} lists, fetched {days} days ago, {bytes} bytes",
+        header.exact + header.suffix,
+        header.lists
+    )];
+    if days > STALE_AFTER_DAYS {
+        report.push(format!(
+            "build: the snapshot is over {STALE_AFTER_DAYS} days old; cargo xtask fetch-lists renews it"
+        ));
+    }
+    report
+}
+
 /// Cross-compiles qberrypi and writes the boot folder under `root`; returns the folder.
 ///
 /// `epoch` is the Unix time the executable takes as the time of its build.
 /// The folder of an earlier build is replaced, and only once the new
-/// contents are complete.
+/// contents are complete. The block lists in the image are the ones
+/// `cargo xtask fetch-lists` left in the cache, so the build fails before it
+/// compiles anything when a list of the configuration was not fetched.
 pub fn run(root: &Path, epoch: u64) -> Result<PathBuf> {
     let extracted = ExtractedFiles::read(&root.join(EXTRACTED_DIR))?;
+    let (snapshot, header) = lists::snapshot(root, &lists::configured_lists(root)?)?;
+    for line in snapshot_report(&header, snapshot.len(), epoch) {
+        println!("{line}");
+    }
 
     println!("build: cross-compiling qberrypi for {TARGET}");
     run_to_success(&mut cross_build_command(root, epoch))?;
@@ -261,9 +336,13 @@ pub fn run(root: &Path, epoch: u64) -> Result<PathBuf> {
     let init =
         fs::read(&executable).with_context(|| format!("cannot read {}", executable.display()))?;
 
-    let out = write_boot_folder(root, &extracted, &init, epoch)?;
+    let out = write_boot_folder(root, &extracted, &init, &snapshot, epoch)?;
+    let initramfs = out.join(INITRAMFS);
+    let initramfs_len = fs::metadata(&initramfs)
+        .with_context(|| format!("cannot look at {}", initramfs.display()))?
+        .len();
     println!(
-        "build: wrote {} (init is {} bytes)",
+        "build: wrote {} (init is {} bytes, {INITRAMFS} is {initramfs_len} bytes)",
         out.display(),
         init.len()
     );
@@ -311,25 +390,32 @@ fn run_to_success(command: &mut Command) -> Result<()> {
 
 /// Writes the boot folder under `root` from scratch and returns it.
 ///
-/// `init` is the cross-built executable, and `epoch` the build time it was
-/// given, which is recorded beside the folder for `read_build_epoch`. An
-/// earlier folder is removed only once everything that goes into the new one
-/// is in memory. The record of its build time goes with it, and the new one
-/// is written last: a record never stands for a folder of another build.
+/// `init` is the cross-built executable, `snapshot` the block lists for the initramfs, and
+/// `epoch` the build time `init` was given, which is recorded beside the folder for
+/// `read_build_epoch`. An earlier folder is removed only once everything that goes into the
+/// new one is in memory. The record of its build time goes with it, and the new one is written
+/// last: a record never stands for a folder of another build.
 fn write_boot_folder(
     root: &Path,
     extracted: &ExtractedFiles,
     init: &[u8],
+    snapshot: &[u8],
     epoch: u64,
 ) -> Result<PathBuf> {
-    let initramfs = pack_initramfs(&initramfs_entries(extracted, init))?;
-    let files: [(&str, &[u8]); 5] = [
+    let initramfs = pack_initramfs(&initramfs_entries(extracted, init, snapshot))?;
+    let mut files: Vec<(&str, &[u8])> = vec![
         (KERNEL, &extracted.kernel),
         (DEVICE_TREE, &extracted.dtb),
         (INITRAMFS, &initramfs),
         ("cmdline.txt", CMDLINE_TXT.as_bytes()),
         ("config.txt", CONFIG_TXT.as_bytes()),
     ];
+    files.extend(
+        extracted
+            .overlays
+            .iter()
+            .map(|(name, data)| (*name, &data[..])),
+    );
     let sums = sha256sums(&files);
 
     let out = root.join(BOOT_FOLDER);
@@ -387,8 +473,8 @@ mod tests {
     use std::os::unix::fs::symlink;
     use tempfile::TempDir;
 
-    /// The twelve files `cargo xtask fetch` leaves under `vendor-cache/extracted/`.
-    const FETCHED: [&str; 12] = [
+    /// The twenty files `cargo xtask fetch` leaves under `vendor-cache/extracted/`.
+    const FETCHED: [&str; 20] = [
         "kernel8.img",
         "bcm2710-rpi-3-b-plus.dtb",
         "modules/rfkill.ko",
@@ -396,15 +482,23 @@ mod tests {
         "modules/brcmutil.ko",
         "modules/brcmfmac.ko",
         "modules/brcmfmac-cyw.ko",
+        "modules/backlight.ko",
+        "modules/fbtft.ko",
+        "modules/fb_ili9486.ko",
+        "modules/spi-bcm2835.ko",
+        "modules/ads7846.ko",
         "firmware/regulatory.db",
         "firmware/regulatory.db.p7s",
         "firmware/brcm/brcmfmac43455-sdio.bin",
         "firmware/brcm/brcmfmac43455-sdio.clm_blob",
         "firmware/brcm/brcmfmac43455-sdio.txt",
+        "ov-README",
+        "ov-overlay_map.dtb",
+        "ov-qb-piscreen.dtbo",
     ];
 
     /// Every path of the initramfs in order, each after the letter `ls -l` shows for its kind.
-    const INITRAMFS: [&str; 26] = [
+    const INITRAMFS: [&str; 34] = [
         "d dev",
         "d proc",
         "d sys",
@@ -414,6 +508,7 @@ mod tests {
         "d lib/modules",
         "d lib/firmware",
         "d lib/firmware/brcm",
+        "d licenses",
         "c dev/console",
         "c dev/null",
         "- init",
@@ -423,6 +518,11 @@ mod tests {
         "- lib/modules/brcmutil.ko",
         "- lib/modules/brcmfmac.ko",
         "- lib/modules/brcmfmac-cyw.ko",
+        "- lib/modules/backlight.ko",
+        "- lib/modules/fbtft.ko",
+        "- lib/modules/fb_ili9486.ko",
+        "- lib/modules/spi-bcm2835.ko",
+        "- lib/modules/ads7846.ko",
         "- lib/firmware/regulatory.db",
         "- lib/firmware/regulatory.db.p7s",
         "- lib/firmware/brcm/brcmfmac43455-sdio.bin",
@@ -431,6 +531,8 @@ mod tests {
         "l lib/firmware/brcm/brcmfmac43455-sdio.raspberrypi,3-model-b-plus.bin",
         "l lib/firmware/brcm/brcmfmac43455-sdio.raspberrypi,3-model-b-plus.clm_blob",
         "l lib/firmware/brcm/brcmfmac43455-sdio.raspberrypi,3-model-b-plus.txt",
+        "- licenses/JetBrainsMono-OFL.txt",
+        "- blocklist.zst",
     ];
 
     /// The build time the tests give a boot folder.
@@ -464,7 +566,7 @@ mod tests {
     #[test]
     fn initramfs_has_exactly_one_executable() {
         let extracted = fixture_extracted();
-        let entries = initramfs_entries(&extracted, b"ELF");
+        let entries = initramfs_entries(&extracted, b"ELF", b"SNAPSHOT");
 
         let execs: Vec<_> = entries
             .iter()
@@ -483,6 +585,38 @@ mod tests {
     }
 
     #[test]
+    fn the_typefaces_licence_is_shipped_as_the_panel_crate_has_it() {
+        let extracted = fixture_extracted();
+        let entries = initramfs_entries(&extracted, b"ELF", b"SNAPSHOT");
+        let in_the_crate =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../crates/qb-panel/fonts/OFL.txt");
+        let licence = fs::read(in_the_crate).unwrap();
+
+        let shipped = entries
+            .iter()
+            .find(|(path, _)| path == "licenses/JetBrainsMono-OFL.txt");
+
+        assert_eq!(
+            shipped.unwrap().1,
+            Node::File {
+                data: &licence,
+                mode: 0o644
+            }
+        );
+        // It is the licence the typefaces come under, and it names them.
+        let text = String::from_utf8(licence).unwrap();
+        assert!(text.contains("SIL OPEN FONT LICENSE Version 1.1"));
+        assert!(text.contains("JetBrains Mono"));
+        // A text to be read: init stays the one thing in the image that can be run.
+        let executables: Vec<&str> = entries
+            .iter()
+            .filter(|(_, node)| matches!(node, Node::File { mode, .. } if mode & 0o111 != 0))
+            .map(|(path, _)| path.as_str())
+            .collect();
+        assert_eq!(executables, ["init"]);
+    }
+
+    #[test]
     fn config_txt_selects_the_prefix_and_loads_the_initramfs() {
         assert!(CONFIG_TXT.lines().any(|l| l == "os_prefix=qberrypi/"));
         assert!(
@@ -490,7 +624,26 @@ mod tests {
                 .lines()
                 .any(|l| l == "initramfs initramfs8 followkernel")
         );
-        assert!(!CONFIG_TXT.contains("dtoverlay"));
+    }
+
+    #[test]
+    fn config_txt_takes_overlays_from_qberrypis_own_folder() {
+        assert_eq!(
+            CONFIG_TXT.lines().rev().take(3).collect::<Vec<_>>(),
+            [
+                "dtoverlay=qb-piscreen,speed=16000000,rotate=270",
+                "overlay_prefix=ov-",
+                "dtparam=spi=on"
+            ]
+        );
+        // Still no graphics overlay.
+        assert_eq!(
+            CONFIG_TXT
+                .lines()
+                .filter(|l| l.starts_with("dtoverlay="))
+                .count(),
+            1
+        );
     }
 
     #[test]
@@ -502,7 +655,10 @@ mod tests {
              os_prefix=qberrypi/\n\
              kernel=kernel8.img\n\
              initramfs initramfs8 followkernel\n\
-             disable_overscan=1\n"
+             disable_overscan=1\n\
+             dtparam=spi=on\n\
+             overlay_prefix=ov-\n\
+             dtoverlay=qb-piscreen,speed=16000000,rotate=270\n"
         );
         assert_eq!(CMDLINE_TXT, "console=tty1 panic=5 loglevel=4\n");
     }
@@ -510,7 +666,7 @@ mod tests {
     #[test]
     fn initramfs_holds_the_agreed_paths_in_the_agreed_order() {
         let extracted = fixture_extracted();
-        let entries = initramfs_entries(&extracted, b"ELF");
+        let entries = initramfs_entries(&extracted, b"ELF", b"SNAPSHOT");
 
         let listing: Vec<String> = entries
             .iter()
@@ -531,9 +687,85 @@ mod tests {
     }
 
     #[test]
+    fn the_snapshot_is_the_last_entry_and_is_not_executable() {
+        let extracted = fixture_extracted();
+        let entries = initramfs_entries(&extracted, b"ELF", b"SNAPSHOT");
+        let (path, node) = entries.last().unwrap();
+        assert_eq!(
+            (path.as_str(), *node),
+            (
+                "blocklist.zst",
+                Node::File {
+                    data: b"SNAPSHOT",
+                    mode: 0o644
+                }
+            )
+        );
+        assert_eq!(format!("/{path}"), qberrypi::lists::snapshot::SNAPSHOT_PATH);
+    }
+
+    #[test]
+    fn the_boot_folder_packs_the_snapshot_it_is_given() {
+        let root = fixture_root();
+        let extracted = fixture_extracted();
+
+        let out = write_boot_folder(root.path(), &extracted, b"ELF", b"ANOTHER", EPOCH).unwrap();
+
+        assert_eq!(
+            fs::read(out.join("initramfs8")).unwrap(),
+            pack_initramfs(&initramfs_entries(&extracted, b"ELF", b"ANOTHER")).unwrap()
+        );
+        let first = pack_initramfs(&initramfs_entries(&extracted, b"ELF", b"SNAPSHOT")).unwrap();
+        assert_ne!(fs::read(out.join("initramfs8")).unwrap(), first);
+    }
+
+    #[test]
+    fn the_report_says_how_old_the_snapshot_is_and_when_to_renew_it() {
+        let header = |fetched_unix_secs| Header {
+            fetched_unix_secs,
+            lists: 2,
+            exact: 78_000,
+            suffix: 224_001,
+        };
+        let epoch = 1_800_000_000 + 7 * 86_400 + 86_399;
+
+        // Seven days and nearly a day more is still seven days.
+        assert_eq!(
+            snapshot_report(&header(1_800_000_000), 2_100_000, epoch),
+            ["build: snapshot: 302001 names from 2 lists, fetched 7 days ago, 2100000 bytes"]
+        );
+        assert_eq!(
+            snapshot_report(&header(1_800_000_000), 2_100_000, epoch + 1),
+            [
+                "build: snapshot: 302001 names from 2 lists, fetched 8 days ago, 2100000 bytes",
+                "build: the snapshot is over 7 days old; cargo xtask fetch-lists renews it"
+            ]
+        );
+        // A clock before the fetch makes no negative age.
+        assert_eq!(
+            snapshot_report(&header(epoch + 10), 1, epoch),
+            ["build: snapshot: 302001 names from 2 lists, fetched 0 days ago, 1 bytes"]
+        );
+    }
+
+    #[test]
+    fn the_report_of_a_snapshot_of_no_list_has_no_age() {
+        let header = Header {
+            fetched_unix_secs: 0,
+            lists: 0,
+            exact: 1,
+            suffix: 0,
+        };
+        assert_eq!(
+            snapshot_report(&header, 30, 1_800_000_000),
+            ["build: snapshot: no list is configured, 30 bytes"]
+        );
+    }
+
+    #[test]
     fn dev_null_is_there_for_an_init_that_starts_with_nothing_open() {
         let extracted = fixture_extracted();
-        let entries = initramfs_entries(&extracted, b"ELF");
+        let entries = initramfs_entries(&extracted, b"ELF", b"SNAPSHOT");
 
         let console = entries.iter().position(|(path, _)| path == "dev/console");
         let (path, node) = &entries[console.unwrap() + 1];
@@ -545,7 +777,7 @@ mod tests {
     #[test]
     fn modules_list_is_the_table_init_reads() {
         let extracted = fixture_extracted();
-        let entries = initramfs_entries(&extracted, b"ELF");
+        let entries = initramfs_entries(&extracted, b"ELF", b"SNAPSHOT");
 
         let path = qberrypi::modules::MODULE_LIST.strip_prefix('/').unwrap();
 
@@ -555,7 +787,7 @@ mod tests {
     #[test]
     fn every_module_file_the_table_names_is_in_the_initramfs() {
         let extracted = fixture_extracted();
-        let entries = initramfs_entries(&extracted, b"ELF");
+        let entries = initramfs_entries(&extracted, b"ELF", b"SNAPSHOT");
         let table = ModuleTable::parse(DEFAULT_TABLE).unwrap();
         let dir = qberrypi::modules::MODULE_DIR.strip_prefix('/').unwrap();
 
@@ -566,7 +798,7 @@ mod tests {
                 files.insert(module.file.clone());
             }
         }
-        assert_eq!(files.len(), 5);
+        assert_eq!(files.len(), 10);
         for file in files {
             let fetched = format!("modules/{file}");
             assert_eq!(
@@ -579,11 +811,16 @@ mod tests {
     #[test]
     fn every_fetched_file_lands_at_its_own_path() {
         let extracted = fixture_extracted();
-        let entries = initramfs_entries(&extracted, b"ELF");
+        let entries = initramfs_entries(&extracted, b"ELF", b"SNAPSHOT");
 
-        for fetched in &FETCHED[2..] {
+        // The modules and the firmware go into the initramfs; the overlay files, last, do not.
+        for fetched in &FETCHED[2..17] {
             let data = file_data(&entries, &format!("lib/{fetched}"));
             assert_eq!(data, fetched.as_bytes());
+        }
+        for overlay in &FETCHED[17..] {
+            assert!(overlay.starts_with("ov-"), "{overlay}");
+            assert!(entries.iter().all(|(path, _)| !path.contains(overlay)));
         }
         assert_eq!(extracted.kernel, b"kernel8.img");
         assert_eq!(extracted.dtb, b"bcm2710-rpi-3-b-plus.dtb");
@@ -592,7 +829,7 @@ mod tests {
     #[test]
     fn board_firmware_names_link_to_the_file_beside_them() {
         let extracted = fixture_extracted();
-        let entries = initramfs_entries(&extracted, b"ELF");
+        let entries = initramfs_entries(&extracted, b"ELF", b"SNAPSHOT");
 
         let mut links = 0;
         for (path, node) in &entries {
@@ -615,7 +852,7 @@ mod tests {
     #[test]
     fn packing_the_same_entries_twice_gives_identical_bytes() {
         let extracted = fixture_extracted();
-        let entries = initramfs_entries(&extracted, b"ELF");
+        let entries = initramfs_entries(&extracted, b"ELF", b"SNAPSHOT");
 
         let first = pack_initramfs(&entries).unwrap();
         let second = pack_initramfs(&entries).unwrap();
@@ -626,7 +863,7 @@ mod tests {
     #[test]
     fn the_initramfs_is_a_zstd_frame_around_the_archive() {
         let extracted = fixture_extracted();
-        let entries = initramfs_entries(&extracted, b"ELF");
+        let entries = initramfs_entries(&extracted, b"ELF", b"SNAPSHOT");
         let dir = tempfile::tempdir().unwrap();
 
         let packed = pack_initramfs(&entries).unwrap();
@@ -651,11 +888,11 @@ mod tests {
     }
 
     #[test]
-    fn boot_folder_holds_the_six_files_and_its_checksums_verify() {
+    fn boot_folder_holds_the_nine_files_and_its_checksums_verify() {
         let root = fixture_root();
         let extracted = fixture_extracted();
 
-        let out = write_boot_folder(root.path(), &extracted, b"ELF", EPOCH).unwrap();
+        let out = write_boot_folder(root.path(), &extracted, b"ELF", b"SNAPSHOT", EPOCH).unwrap();
 
         assert_eq!(out, root.path().join("out/qberrypi"));
         assert_eq!(
@@ -667,6 +904,9 @@ mod tests {
                 "config.txt",
                 "initramfs8",
                 "kernel8.img",
+                "ov-README",
+                "ov-overlay_map.dtb",
+                "ov-qb-piscreen.dtbo",
             ]
         );
         assert_eq!(fs::read(out.join("kernel8.img")).unwrap(), b"kernel8.img");
@@ -676,7 +916,7 @@ mod tests {
         );
         assert_eq!(
             fs::read(out.join("initramfs8")).unwrap(),
-            pack_initramfs(&initramfs_entries(&extracted, b"ELF")).unwrap()
+            pack_initramfs(&initramfs_entries(&extracted, b"ELF", b"SNAPSHOT")).unwrap()
         );
         assert_eq!(
             fs::read_to_string(out.join("cmdline.txt")).unwrap(),
@@ -697,6 +937,9 @@ mod tests {
                 "initramfs8",
                 "cmdline.txt",
                 "config.txt",
+                "ov-README",
+                "ov-overlay_map.dtb",
+                "ov-qb-piscreen.dtbo",
             ]
         );
         let check = Command::new("sha256sum")
@@ -709,8 +952,27 @@ mod tests {
             String::from_utf8_lossy(&check.stdout)
                 .matches(": OK")
                 .count(),
-            5
+            8
         );
+    }
+
+    #[test]
+    fn the_boot_folder_holds_the_three_overlay_files_and_their_checksums() {
+        let root = fixture_root();
+        let extracted = fixture_extracted();
+
+        let out = write_boot_folder(root.path(), &extracted, b"ELF", b"SNAPSHOT", EPOCH).unwrap();
+
+        let sums = fs::read_to_string(out.join("SHA256SUMS")).unwrap();
+        for name in ["ov-README", "ov-overlay_map.dtb", "ov-qb-piscreen.dtbo"] {
+            // Each is in the folder as the package had it, and listed with its own digest.
+            assert_eq!(fs::read(out.join(name)).unwrap(), name.as_bytes(), "{name}");
+            let line = sha256sums(&[(name, name.as_bytes())]);
+            assert!(sums.lines().any(|l| l == line.trim_end()), "{name}: {sums}");
+        }
+        // The firmware finds them by their names beside the kernel; there is no folder of them.
+        assert!(!out.join("overlays").exists());
+        assert!(files_under(&out).iter().all(|path| !path.contains('/')));
     }
 
     #[test]
@@ -718,15 +980,15 @@ mod tests {
         let root = fixture_root();
         let extracted = fixture_extracted();
 
-        let out = write_boot_folder(root.path(), &extracted, b"ELF", EPOCH).unwrap();
+        let out = write_boot_folder(root.path(), &extracted, b"ELF", b"SNAPSHOT", EPOCH).unwrap();
 
         let record = root.path().join("out/build-epoch");
         assert_eq!(fs::read_to_string(record).unwrap(), "1700000123\n");
         assert_eq!(read_build_epoch(root.path()).unwrap(), EPOCH);
         // What goes onto the card, and what its checksums list, is as it was.
-        assert_eq!(files_under(&out).len(), 6);
+        assert_eq!(files_under(&out).len(), 9);
         let sums = fs::read_to_string(out.join("SHA256SUMS")).unwrap();
-        assert_eq!(sums.lines().count(), 5);
+        assert_eq!(sums.lines().count(), 8);
         assert!(!sums.contains("build-epoch"));
     }
 
@@ -734,9 +996,9 @@ mod tests {
     fn a_later_build_replaces_the_record_of_the_build_time() {
         let root = fixture_root();
         let extracted = fixture_extracted();
-        write_boot_folder(root.path(), &extracted, b"ELF", EPOCH).unwrap();
+        write_boot_folder(root.path(), &extracted, b"ELF", b"SNAPSHOT", EPOCH).unwrap();
 
-        write_boot_folder(root.path(), &extracted, b"ELF", EPOCH + 60).unwrap();
+        write_boot_folder(root.path(), &extracted, b"ELF", b"SNAPSHOT", EPOCH + 60).unwrap();
 
         assert_eq!(read_build_epoch(root.path()).unwrap(), EPOCH + 60);
     }
@@ -778,7 +1040,12 @@ mod tests {
                 "cfg80211.ko",
                 "brcmutil.ko",
                 "brcmfmac.ko",
-                "brcmfmac-cyw.ko"
+                "brcmfmac-cyw.ko",
+                "backlight.ko",
+                "fbtft.ko",
+                "fb_ili9486.ko",
+                "spi-bcm2835.ko",
+                "ads7846.ko"
             ]
         );
         let e = module_files("brcmfmac\tbrcmfmac.ko\tcfg80211\n").unwrap_err();
@@ -796,14 +1063,14 @@ mod tests {
     fn an_earlier_boot_folder_is_replaced_and_its_neighbours_are_kept() {
         let root = fixture_root();
         let extracted = fixture_extracted();
-        let out = write_boot_folder(root.path(), &extracted, b"ELF", EPOCH).unwrap();
+        let out = write_boot_folder(root.path(), &extracted, b"ELF", b"SNAPSHOT", EPOCH).unwrap();
         fs::write(out.join("log.txt"), "stale").unwrap();
         fs::create_dir(out.join("overlays")).unwrap();
         fs::write(out.join("overlays/stale.dtbo"), "stale").unwrap();
         fs::write(out.join("initramfs8"), "stale").unwrap();
         fs::write(root.path().join("out/notes.txt"), "kept").unwrap();
 
-        write_boot_folder(root.path(), &extracted, b"ELF", EPOCH).unwrap();
+        write_boot_folder(root.path(), &extracted, b"ELF", b"SNAPSHOT", EPOCH).unwrap();
 
         assert_eq!(
             files_under(&root.path().join("out")),
@@ -816,6 +1083,9 @@ mod tests {
                 "qberrypi/config.txt",
                 "qberrypi/initramfs8",
                 "qberrypi/kernel8.img",
+                "qberrypi/ov-README",
+                "qberrypi/ov-overlay_map.dtb",
+                "qberrypi/ov-qb-piscreen.dtbo",
             ]
         );
         assert!(!out.join("overlays").exists());
@@ -922,7 +1192,7 @@ mod tests {
 
         let e = remove_boot_folder(&root, &root.join("out/qberrypi")).unwrap_err();
         assert!(e.to_string().contains("refusing"), "{e}");
-        write_boot_folder(&root, &extracted, b"ELF", EPOCH).unwrap_err();
+        write_boot_folder(&root, &extracted, b"ELF", b"SNAPSHOT", EPOCH).unwrap_err();
 
         assert_eq!(
             files_under(&dir.path().join("outside")),

@@ -1,6 +1,14 @@
 /target/
 /out/
 /vendor-cache/
+# The parallel worktrees link vendor-cache to the main checkout's; a link is not a directory.
+/vendor-cache
+/.superpowers/
+/.claude/settings.local.json
 
 # Holds the Wi-Fi passphrase. Use qberrypi.example.toml as the template.
 qberrypi.toml
+
+# Holds the API's TLS private key, made once by `cargo xtask make-cert`; the `*` covers the
+# temporary name it is written under.
+/qberrypi-tls.pem*

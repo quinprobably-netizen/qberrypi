@@ -61,6 +61,40 @@ pub const PACKAGES: &[Package] = &[
                 "usr/lib/modules/6.18.60+rpt-rpi-v8/kernel/drivers/net/wireless/broadcom/brcm80211/brcmfmac/cyw/brcmfmac-cyw.ko.xz",
                 "modules/brcmfmac-cyw.ko",
             ),
+            (
+                "usr/lib/modules/6.18.60+rpt-rpi-v8/kernel/drivers/video/backlight/backlight.ko.xz",
+                "modules/backlight.ko",
+            ),
+            (
+                "usr/lib/modules/6.18.60+rpt-rpi-v8/kernel/drivers/staging/fbtft/fbtft.ko.xz",
+                "modules/fbtft.ko",
+            ),
+            (
+                "usr/lib/modules/6.18.60+rpt-rpi-v8/kernel/drivers/staging/fbtft/fb_ili9486.ko.xz",
+                "modules/fb_ili9486.ko",
+            ),
+            (
+                "usr/lib/modules/6.18.60+rpt-rpi-v8/kernel/drivers/spi/spi-bcm2835.ko.xz",
+                "modules/spi-bcm2835.ko",
+            ),
+            (
+                "usr/lib/modules/6.18.60+rpt-rpi-v8/kernel/drivers/input/touchscreen/ads7846.ko.xz",
+                "modules/ads7846.ko",
+            ),
+            // qberrypi's own overlays: the firmware reads `ov-README` and then
+            // `ov-overlay_map.dtb` and `ov-<overlay>.dtbo` from beside the kernel.
+            (
+                "usr/lib/modules/6.18.60+rpt-rpi-v8/dtb/overlays/README",
+                "ov-README",
+            ),
+            (
+                "usr/lib/modules/6.18.60+rpt-rpi-v8/dtb/overlays/overlay_map.dtb",
+                "ov-overlay_map.dtb",
+            ),
+            (
+                "usr/lib/modules/6.18.60+rpt-rpi-v8/dtb/overlays/piscreen.dtbo",
+                "ov-qb-piscreen.dtbo",
+            ),
         ],
     },
     Package {
@@ -106,11 +140,12 @@ pub const PACKAGES: &[Package] = &[
 #[cfg(test)]
 mod tests {
     use super::*;
+    use qberrypi::modules::{DEFAULT_TABLE, ModuleTable};
     use std::collections::HashSet;
     use std::path::{Component, Path};
 
     #[test]
-    fn the_packages_produce_the_twelve_files_the_image_needs() {
+    fn the_packages_produce_the_twenty_files_the_image_needs() {
         let mut outputs: Vec<&str> = PACKAGES
             .iter()
             .flat_map(|package| package.wanted.iter().map(|(_, output)| *output))
@@ -127,13 +162,63 @@ mod tests {
                 "firmware/regulatory.db",
                 "firmware/regulatory.db.p7s",
                 "kernel8.img",
+                "modules/ads7846.ko",
+                "modules/backlight.ko",
                 "modules/brcmfmac-cyw.ko",
                 "modules/brcmfmac.ko",
                 "modules/brcmutil.ko",
                 "modules/cfg80211.ko",
+                "modules/fb_ili9486.ko",
+                "modules/fbtft.ko",
                 "modules/rfkill.ko",
+                "modules/spi-bcm2835.ko",
+                "ov-README",
+                "ov-overlay_map.dtb",
+                "ov-qb-piscreen.dtbo",
             ]
         );
+    }
+
+    #[test]
+    fn the_overlay_files_come_from_the_kernel_release_the_device_tree_does() {
+        let kernel = &PACKAGES[0];
+        let member = |output: &str| {
+            kernel
+                .wanted
+                .iter()
+                .find(|(_, out)| *out == output)
+                .map(|(member, _)| *member)
+                .unwrap_or_else(|| panic!("{output} is not taken from the kernel package"))
+        };
+        let tree = member("bcm2710-rpi-3-b-plus.dtb");
+        let dtb_folder = tree
+            .strip_suffix("broadcom/bcm2710-rpi-3-b-plus.dtb")
+            .unwrap();
+        // The overlays sit beside the device tree's folder, under the same release.
+        let overlays = format!("{dtb_folder}overlays/");
+        assert_eq!(member("ov-README"), format!("{overlays}README"));
+        assert_eq!(
+            member("ov-overlay_map.dtb"),
+            format!("{overlays}overlay_map.dtb")
+        );
+        assert_eq!(
+            member("ov-qb-piscreen.dtbo"),
+            format!("{overlays}piscreen.dtbo")
+        );
+    }
+
+    #[test]
+    fn every_module_the_table_names_is_fetched() {
+        let outputs: Vec<&str> = PACKAGES
+            .iter()
+            .flat_map(|package| package.wanted.iter().map(|(_, output)| *output))
+            .collect();
+        for file in ModuleTable::parse(DEFAULT_TABLE).unwrap().files() {
+            assert!(
+                outputs.contains(&format!("modules/{file}").as_str()),
+                "{file}"
+            );
+        }
     }
 
     #[test]

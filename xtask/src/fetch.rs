@@ -22,7 +22,7 @@ const USER_AGENT: &str = "xtask-fetch";
 const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(600);
 
 /// Something that downloads a URL into the file at the given path.
-type Download<'a> = &'a dyn Fn(&str, &Path) -> Result<()>;
+pub(crate) type Download<'a> = &'a dyn Fn(&str, &Path) -> Result<()>;
 
 /// Downloads, verifies and extracts every pinned package under `root/vendor-cache/`.
 ///
@@ -133,7 +133,7 @@ fn verified_deb(package: &Package, debs: &Path, download: Download) -> Result<Pa
 }
 
 /// Downloads `url` over HTTPS into the file at `dest`.
-fn download(url: &str, dest: &Path) -> Result<()> {
+pub(crate) fn download(url: &str, dest: &Path) -> Result<()> {
     let agent: ureq::Agent = ureq::Agent::config_builder()
         .user_agent(USER_AGENT)
         .https_only(true)

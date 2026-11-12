@@ -5,7 +5,7 @@
 //! changes nothing unless it has a backup worth restoring.
 
 use std::fs::{self, File};
-use std::io::{self, ErrorKind, Write};
+use std::io::{self, ErrorKind, Read, Write};
 use std::path::Path;
 
 /// The block device that holds the boot partition.
@@ -110,6 +110,33 @@ fn selects_qberrypi(config: &[u8]) -> bool {
 /// Reads `qberrypi/qberrypi.toml`, the system's configuration file.
 pub fn read_config_text(boot: &Path) -> io::Result<String> {
     fs::read_to_string(boot.join(OWN_DIR).join(CONFIG_TEXT))
+}
+
+/// The file that holds the API's TLS key and certificate, in qberrypi's folder.
+pub const TLS_FILE: &str = "tls.pem";
+
+/// The most bytes of `tls.pem` that are read: a key and a certificate take a little over 0.7 KiB.
+pub const TLS_FILE_CAP: u64 = 16 * 1024;
+
+/// Reads `qberrypi/tls.pem`, the API's key and certificate; `None` if there is no such file.
+///
+/// A file larger than [`TLS_FILE_CAP`] is an error, and no more than the cap and one byte is read
+/// of it. The bytes are the key's: no error here holds any of them.
+pub fn read_tls(boot: &Path) -> io::Result<Option<Vec<u8>>> {
+    let file = match File::open(boot.join(OWN_DIR).join(TLS_FILE)) {
+        Ok(file) => file,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    let mut bytes = Vec::new();
+    file.take(TLS_FILE_CAP + 1).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > TLS_FILE_CAP {
+        return Err(io::Error::new(
+            ErrorKind::InvalidData,
+            format!("larger than {TLS_FILE_CAP} bytes"),
+        ));
+    }
+    Ok(Some(bytes))
 }
 
 /// Adds text to the end of `qberrypi/log.txt` and waits until it is on the card.
@@ -394,6 +421,55 @@ mod tests {
         write(d, "qberrypi/qberrypi.toml", b"hostname = \"\xff\"\n");
         let error = read_config_text(d).unwrap_err();
         assert_eq!(error.kind(), ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn a_boot_partition_without_a_tls_file_has_none() {
+        let tmp = tempfile::tempdir().unwrap();
+        let d = tmp.path();
+        // Neither the folder nor the file is there, or the folder is and the file is not.
+        assert_eq!(read_tls(d).unwrap(), None);
+        fs::create_dir(d.join("qberrypi")).unwrap();
+        assert_eq!(read_tls(d).unwrap(), None);
+    }
+
+    #[test]
+    fn the_tls_file_is_read_as_it_is() {
+        let tmp = tempfile::tempdir().unwrap();
+        let d = tmp.path();
+        fs::create_dir(d.join("qberrypi")).unwrap();
+        // Bytes, not text: the file is not read for its contents here.
+        write(d, "qberrypi/tls.pem", b"twenty bytes, no pem");
+        assert_eq!(
+            read_tls(d).unwrap().as_deref(),
+            Some(&b"twenty bytes, no pem"[..])
+        );
+        // A file of exactly the cap is read; an empty one is a file, not an absent one.
+        write(d, "qberrypi/tls.pem", vec![b'x'; TLS_FILE_CAP as usize]);
+        assert_eq!(read_tls(d).unwrap().unwrap().len() as u64, TLS_FILE_CAP);
+        write(d, "qberrypi/tls.pem", b"");
+        assert_eq!(read_tls(d).unwrap(), Some(Vec::new()));
+    }
+
+    #[test]
+    fn a_tls_file_over_the_cap_is_an_error_that_says_so_and_holds_none_of_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let d = tmp.path();
+        fs::create_dir(d.join("qberrypi")).unwrap();
+        write(d, "qberrypi/tls.pem", vec![b'k'; TLS_FILE_CAP as usize + 1]);
+        let error = read_tls(d).unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::InvalidData);
+        let text = error.to_string();
+        assert!(text.contains("16384"), "{text}");
+        assert!(!text.contains('k'), "{text}");
+    }
+
+    #[test]
+    fn a_tls_file_that_cannot_be_read_is_an_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let d = tmp.path();
+        fs::create_dir_all(d.join("qberrypi/tls.pem")).unwrap();
+        assert!(read_tls(d).is_err());
     }
 
     #[test]

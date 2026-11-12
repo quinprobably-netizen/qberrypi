@@ -3,7 +3,7 @@
 //! Each `read` on `/dev/kmsg` returns one record: a header, a `;`, the message
 //! line, then any number of ` KEY=value` lines describing the device.
 
-use std::fs::OpenOptions;
+use std::fs::{File, OpenOptions};
 use std::io::{self, ErrorKind, Read};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
@@ -39,13 +39,32 @@ pub fn parse_record(raw: &str) -> Option<KmsgLine> {
     })
 }
 
-/// Returns every record the kernel log holds right now, without waiting for more.
-pub fn read_all(path: &Path) -> io::Result<Vec<KmsgLine>> {
-    let mut file = OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NONBLOCK)
-        .open(path)?;
-    read_records(&mut file)
+/// An open, non-blocking source of kernel log records, which remembers how far it has read.
+pub struct Reader<S = File> {
+    source: S,
+}
+
+impl Reader {
+    /// Opens the log at `path`, to be read from its oldest record on.
+    pub fn open(path: &Path) -> io::Result<Self> {
+        let file = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NONBLOCK)
+            .open(path)?;
+        Ok(Self::over(file))
+    }
+}
+
+impl<S: Read> Reader<S> {
+    /// A reader of the records `source` gives, one per `read`.
+    fn over(source: S) -> Self {
+        Self { source }
+    }
+
+    /// Returns the records logged since the last call, without waiting for more.
+    pub fn read_new(&mut self) -> io::Result<Vec<KmsgLine>> {
+        read_records(&mut self.source)
+    }
 }
 
 /// Reads one record per `read` until the source has no more to give.
@@ -181,6 +200,35 @@ mod tests {
     }
 
     #[test]
+    fn a_reader_returns_each_record_once() {
+        let mut reader = Reader::over(Script(VecDeque::from([
+            Ok("6,1,10,-;a"),
+            os_error(libc::EAGAIN),
+            Ok("6,2,20,-;b"),
+            os_error(libc::EAGAIN),
+            os_error(libc::EAGAIN),
+        ])));
+        assert_eq!(texts(&reader.read_new().unwrap()), ["a"]);
+        assert_eq!(texts(&reader.read_new().unwrap()), ["b"]);
+        assert_eq!(texts(&reader.read_new().unwrap()), [""; 0]);
+    }
+
+    #[test]
+    fn a_reader_opened_on_a_file_sees_what_is_appended_to_it() {
+        let path = temp_path("reader");
+        std::fs::write(&path, "6,1,10,-;first\n").unwrap();
+        let mut reader = Reader::open(&path).unwrap();
+        let first = reader.read_new().unwrap();
+        let mut file = OpenOptions::new().append(true).open(&path).unwrap();
+        file.write_all(b"6,2,20,-;second\n").unwrap();
+        let second = reader.read_new().unwrap();
+        std::fs::remove_file(&path).unwrap();
+
+        assert_eq!(texts(&first), ["first"]);
+        assert_eq!(texts(&second), ["second"]);
+    }
+
+    #[test]
     fn any_other_read_error_is_returned() {
         let mut script = Script(VecDeque::from([
             Ok("6,1,100,-;first\n"),
@@ -191,10 +239,10 @@ mod tests {
     }
 
     #[test]
-    fn read_all_reads_a_record_from_an_ordinary_file() {
+    fn a_reader_reads_a_record_from_an_ordinary_file() {
         let path = temp_path("file");
         std::fs::write(&path, "6,1234,5678901,-;brcmfmac: F1 signature read\n").unwrap();
-        let result = read_all(&path);
+        let result = Reader::open(&path).unwrap().read_new();
         std::fs::remove_file(&path).unwrap();
 
         let lines = result.unwrap();
@@ -206,7 +254,7 @@ mod tests {
     }
 
     #[test]
-    fn read_all_does_not_wait_for_more_records() {
+    fn a_reader_does_not_wait_for_more_records() {
         // A FIFO with a writer attached behaves as `/dev/kmsg` does once it
         // has been read to the end: a blocking read would wait for more.
         let path = temp_path("fifo");
@@ -220,17 +268,20 @@ mod tests {
 
         let (done, outcome) = mpsc::channel();
         let reader_path = path.clone();
-        thread::spawn(move || done.send(read_all(&reader_path)));
+        thread::spawn(move || done.send(Reader::open(&reader_path).and_then(|mut r| r.read_new())));
         let outcome = outcome.recv_timeout(Duration::from_secs(5));
         std::fs::remove_file(&path).unwrap();
 
-        let lines = outcome.expect("read_all waited for more records").unwrap();
+        let lines = outcome
+            .expect("the reader waited for more records")
+            .unwrap();
         assert_eq!(texts(&lines), ["only"]);
     }
 
     #[test]
-    fn read_all_reports_a_path_it_cannot_open() {
+    fn a_reader_reports_a_path_it_cannot_open() {
         let path = Path::new("/nonexistent/qberrypi-kmsg-test");
-        assert_eq!(read_all(path).unwrap_err().kind(), io::ErrorKind::NotFound);
+        let error = Reader::open(path).err().expect("there is no such file");
+        assert_eq!(error.kind(), io::ErrorKind::NotFound);
     }
 }

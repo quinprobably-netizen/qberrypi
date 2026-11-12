@@ -1,0 +1,13 @@
+[package]
+name = "qb-panel"
+description = "The qberrypi front panel, Drain: a lane of name tiles, a gate that melts refused names into a funnel above the refused count, and the key that pauses blocking, drawn for a 480x320 screen, with no I/O"
+version.workspace = true
+edition.workspace = true
+license = "MIT AND OFL-1.1"
+repository.workspace = true
+
+[dependencies]
+ab_glyph = { version = "0.2.32", default-features = false, features = ["std"] }
+
+[dev-dependencies]
+png = "0.18.1"

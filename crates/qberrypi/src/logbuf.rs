@@ -80,6 +80,22 @@ impl LogBuf {
         text
     }
 
+    /// Every line still held, oldest first, each ending in a newline. Nothing is marked as saved:
+    /// `take_unsaved` returns what it would have.
+    pub fn text(&self) -> String {
+        let mut text = String::with_capacity(self.bytes);
+        for line in &self.lines {
+            text.push_str(line);
+            text.push('\n');
+        }
+        text
+    }
+
+    /// Whether a line has been pushed since `take_unsaved` last returned, and not yet discarded.
+    pub fn has_unsaved(&self) -> bool {
+        self.unsaved > 0
+    }
+
     /// Whether `take_unsaved` has been called: what it returns next is not the start of the log.
     pub fn taken(&self) -> bool {
         self.taken
@@ -137,8 +153,10 @@ impl Log for Logger {
         // One write per line, so kernel messages cannot land in the middle of
         // it. A console that has gone away must not stop the system logging.
         line.push('\n');
+        let writing = Instant::now();
         let _ = console.write_all(line.as_bytes());
         let _ = console.flush();
+        crate::stall::CONSOLE_WRITE.note(writing.elapsed());
     }
 
     fn flush(&self) {
@@ -224,6 +242,22 @@ mod tests {
     }
 
     #[test]
+    fn the_whole_text_can_be_read_without_taking_it() {
+        let mut b = LogBuf::new(1024);
+        assert!(!b.has_unsaved());
+        b.push("a");
+        b.push("b");
+        assert!(b.has_unsaved());
+        assert_eq!(
+            (b.text(), b.text()),
+            ("a\nb\n".to_owned(), "a\nb\n".to_owned())
+        );
+        assert_eq!(b.take_unsaved(), "a\nb\n");
+        assert!(!b.has_unsaved());
+        assert_eq!(b.text(), "a\nb\n");
+    }
+
+    #[test]
     fn the_buffer_knows_whether_its_lines_were_taken_before() {
         let mut b = LogBuf::new(1024);
         assert!(!b.taken());
@@ -295,6 +329,16 @@ mod tests {
     }
 
     #[test]
+    fn the_whole_log_is_returned_and_nothing_is_marked_saved() {
+        let mut buf = LogBuf::new(4096);
+        buf.push("a");
+        buf.take_unsaved();
+        buf.push("b");
+        assert_eq!(buf.text(), "a\nb\n");
+        assert_eq!(buf.take_unsaved(), "b\n");
+    }
+
+    #[test]
     fn a_zero_cap_keeps_nothing() {
         let mut b = LogBuf::new(0);
         b.push("x");
@@ -343,9 +387,10 @@ mod tests {
         log::info!("installed {}", 1);
 
         // Other tests may log through the same global logger, so look for the
-        // line rather than expecting it to be the only one.
+        // line rather than expecting it to be the only one. The console is the
+        // first caller's, and any test that reads the log installs one first
+        // (to a sink); the console's own part is tested on a logger of its own.
         let is_ours = |line: &str| line.starts_with('[') && line.ends_with("] INFO  installed 1");
         assert!(buf.lock().unwrap().take_unsaved().lines().any(is_ours));
-        assert!(console.text().lines().any(is_ours));
     }
 }

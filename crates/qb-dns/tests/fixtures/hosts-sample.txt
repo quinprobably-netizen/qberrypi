@@ -1,0 +1,30 @@
+# Synthetic sample for qb-dns tests. Every name is reserved (RFC 2606, RFC 6761).
+
+127.0.0.1 localhost
+127.0.0.1 localhost.localdomain
+127.0.0.1 local
+255.255.255.255 broadcasthost
+::1 localhost
+::1 ip6-localhost
+fe80::1%lo0 localhost
+ff02::1 ip6-allnodes
+0.0.0.0 0.0.0.0
+
+# Start of entries
+0.0.0.0 ads.example.com
+0.0.0.0 Tracker.Example.NET
+0.0.0.0 metrics.example.org # inline comment
+0.0.0.0 pixel.example.com #[TAG_NAME.X]
+0.0.0.0 under_score.example.com
+0.0.0.0 xn--bcher-kva.example
+127.0.0.1 loopback-style.example.net
+:: v6-style.example.net
+0.0.0.0 one.example.org two.example.org
+0.0.0.0 trailing-dot.example.com.
+0.0.0.0 ads.example.com
+	0.0.0.0	tabbed.example.com
+  # indented comment
+0.0.0.0 bad..name.example
+0.0.0.0 bücher.example
+192.0.2.7 intranet.example.com
+justonetoken.example.com

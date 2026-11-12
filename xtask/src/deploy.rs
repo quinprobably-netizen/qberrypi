@@ -5,14 +5,18 @@
 //! `sudo sh -s`; that script alone writes the boot partition, in this order:
 //!
 //! 1. Checks: the stage directory and what is in it, the board, the mount, and
-//!    that the mount is the partition and the filesystem that init mounts.
+//!    that the mount is the partition and the filesystem that init mounts; and
+//!    that Raspberry Pi OS's package manager is not running, whose upgrade would
+//!    race the deploy. Then a note if the stage lacks `ov-README` or
+//!    `ov-qb-piscreen.dtbo`, which the boot firmware reads from qberrypi's folder.
 //! 2. Backup: `config.txt` is saved as `config.pios.txt`, unless a saved one
 //!    is there already; that one is never written.
 //! 3. Backup validation: the saved file must be one qberrypi's init will
 //!    copy back, and `config.txt` must be either that file or qberrypi's.
 //! 4. Deselect: if `config.txt` selects qberrypi from an earlier deploy, the
 //!    saved file is copied back over it first.
-//! 5. Copy: the staged files go into the `qberrypi` folder.
+//! 5. Copy: the staged files go into the `qberrypi` folder, and a `tls.pem` that an
+//!    earlier deploy left there is removed unless this one brings one.
 //! 6. Verify: the copies are read back against `SHA256SUMS`.
 //! 7. The stage directory is removed.
 //! 8. Select: qberrypi's `config.txt` is written over `config.txt`. If that
@@ -24,12 +28,32 @@
 //! Like init, it writes `config.txt` in place and then cuts it to length, so
 //! the file is never empty on the way.
 //!
+//! When `qberrypi.toml` has an `[api]` section, `deploy` also reads the API's key and
+//! certificate from `qberrypi-tls.pem` (made once by `cargo xtask make-cert`), refuses a file that
+//! qberrypi could not serve, prints the certificate's pin, and stages the file as `tls.pem`, with
+//! a line of its own in the staged checksums, so that the script copies it like any other file
+//! and reads it back. It is staged in the private folder beside the checksums, which is removed
+//! however the deploy ends; the key is never printed, and never enters `out/`. Without an `[api]`
+//! section nothing of the kind is staged, and the script takes a `tls.pem` that an earlier deploy
+//! left on the card off it (it tells the two cases apart by the staged checksums, which list a
+//! `tls.pem` exactly when the section is there): the key has no use any more. It is the script
+//! that does it, as root on Raspberry Pi OS, never qberrypi, which does not write the card.
+//!
 //! When the Pi answers again, `deploy` makes sure that it really went through
 //! qberrypi and back. `config.txt` must be the saved one again: if the boot
 //! firmware did not take qberrypi's folder, Raspberry Pi OS is running on
 //! qberrypi's `config.txt`. And the last boot in the collected log must be of
 //! the build that was deployed, by the build time that `cargo xtask build`
-//! recorded: otherwise the log is one that an earlier run left.
+//! recorded: otherwise the log is one that an earlier run left. The log must
+//! also hold neither the Wi-Fi passphrase nor the key derived from it, and one
+//! that does is saved but not shown. While the Pi does not answer SSH, it is
+//! pinged at its `net.address`, and the answers are counted: they say whether
+//! qberrypi's network was up in the meantime.
+//!
+//! A permanent deploy (`--permanent`, with every development switch off) does not give
+//! the Pi back. After the restart `deploy` waits for SSH to stop answering, and then asks
+//! the status page at `net.address` every 2 s until `build` is the one that was deployed,
+//! and says how to get the Pi back to Raspberry Pi OS: [`WAY_BACK`].
 //!
 //! Every external command is built as a program with its arguments by a
 //! function of its own and run through a [`Runner`], so tests can read the
@@ -37,7 +61,8 @@
 
 use std::ffi::OsString;
 use std::fs::{self, OpenOptions, Permissions};
-use std::io::{self, ErrorKind, Write};
+use std::io::{self, ErrorKind, Read, Write};
+use std::net::Ipv4Addr;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -45,23 +70,33 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Error, Result, anyhow, bail};
-use qberrypi::bootpart::{self, BOOT_DEV};
+use qb_wpa2::pmk::Pmk;
+use qberrypi::api::tls;
+use qberrypi::bootpart::{self, BOOT_DEV, TLS_FILE_CAP};
 use qberrypi::config;
+use qberrypi::status;
 use tempfile::TempDir;
+use zeroize::Zeroizing;
 
 use crate::build::{read_build_epoch, sha256sums};
+use crate::cert::CERT_FILE;
+use crate::probe::get_stats;
 
 /// The environment variable that names the Pi when `--host` is not given.
 pub const HOST_VARIABLE: &str = "QBERRYPI_HOST";
 
 /// The configuration file, in the checkout and in the folder on the card.
 const CONFIG_FILE: &str = "qberrypi.toml";
+/// The API's key and certificate as the card holds them; `cargo xtask make-cert` makes them in the
+/// checkout as `qberrypi-tls.pem`.
+const TLS_FILE: &str = bootpart::TLS_FILE;
 /// Where `cargo xtask build` leaves the boot folder.
 const BUILD_FOLDER: &str = "out/qberrypi";
 /// The list of digests that the build writes and the script checks.
 const CHECKSUMS: &str = "SHA256SUMS";
-/// Files of the folder on the card that are not the build's to list.
-const NOT_THE_BUILDS: [&str; 3] = [CONFIG_FILE, CHECKSUMS, "log.txt"];
+/// Files of the folder on the card that are not the build's to list: the configuration and the
+/// certificate are the owner's, the checksums are the stage's, and the log is the Pi's.
+const NOT_THE_BUILDS: [&str; 4] = [CONFIG_FILE, CHECKSUMS, "log.txt", TLS_FILE];
 /// The copy of the Pi's boot partition that the first deploy takes.
 const BOOT_BACKUP: &str = "vendor-cache/bootpart-backup.tar";
 /// Where `collect` keeps the logs.
@@ -88,8 +123,10 @@ const SSH_OPTIONS: [&str; 4] = ["-o", "BatchMode=yes", "-o", "ConnectTimeout=10"
 
 /// How long the Pi is given to stop answering after the script restarted it.
 const GONE_WITHIN: Duration = Duration::from_secs(30);
-/// How long the Pi is given to answer again.
-const BACK_WITHIN: Duration = Duration::from_secs(300);
+/// How long the Pi is given to answer again, at the least.
+const BACK_WITHIN_AT_LEAST: Duration = Duration::from_secs(300);
+/// What the Pi is given on top of a configured run: time to restart, start Raspberry Pi OS and answer.
+const BACK_AFTER_RUN: Duration = Duration::from_secs(180);
 /// The pause between two looks at whether the Pi answers.
 const POLL: Duration = Duration::from_secs(5);
 
@@ -110,24 +147,71 @@ const CONFIG_NOT_WRITTEN: i32 = 9;
 /// Script status: the boot partition is not the device, or not the filesystem, that init mounts.
 const WRONG_DEVICE: i32 = 10;
 
+/// Script status: Raspberry Pi OS's package manager is running.
+const UPGRADING: i32 = 11;
+
+/// How long a permanent build is given to answer after the restart.
+const ANSWER_WITHIN: Duration = Duration::from_secs(180);
+/// The pause between two looks at whether a permanent build answers.
+const ASK_EVERY: Duration = Duration::from_secs(2);
+/// How long one look at the status page of a permanent build may take.
+const STATS_TIMEOUT: Duration = Duration::from_secs(2);
+/// How to get the Pi back to Raspberry Pi OS once qberrypi stays.
+const WAY_BACK: &str = "pull the Pi's power cord (safe for qberrypi), put its card in this computer, \
+    run `cargo xtask return-to-pios --boot <where it is mounted>`, eject the card and put it back";
+
 /// The line the script prints once `config.txt` selects qberrypi.
 const SELECTED_MARKER: &str = "qberrypi-deploy: qberrypi is selected; restarting";
 
-/// What to do about a Pi that stays away after a deploy.
+/// What to do about a Pi that stays away after a one-shot deploy; [`WAY_BACK`] follows it.
 const RECOVERY: &str = "If qberrypi started with debug.one_shot on, it has already put Raspberry Pi \
-    OS's config.txt back: switch the Pi off and on, and wait. If it still stays away, put the card \
-    in another computer and copy config.pios.txt over config.txt.";
+    OS's config.txt back: switch the Pi off and on, and wait.";
 
-/// Checks the local `qberrypi.toml` before anything is sent: it must parse, and
-/// it must be a one-shot configuration unless `permanent` says otherwise.
+/// Checks the local `qberrypi.toml` before anything is sent: it must parse, and it must be a
+/// one-shot configuration unless `permanent` says otherwise.
+///
+/// A configuration that is to stay must have no development switch on: not `debug.one_shot`
+/// (which would return the Pi to Raspberry Pi OS at the first restart), nor the log on the card,
+/// a return time, the touch calibration or a provoked fault. The first of them in that order is
+/// named, and every such error says that nothing was copied.
 pub fn check_local(toml_text: &str, permanent: bool) -> Result<(), String> {
-    if debug_settings(toml_text)?.one_shot || permanent {
+    let debug = debug_settings(toml_text)?;
+    if permanent {
+        return refuse_development_switches(&debug);
+    }
+    if debug.one_shot {
         return Ok(());
     }
     Err(format!(
         "{CONFIG_FILE} has debug.one_shot off: qberrypi would stay on the Pi and never return to \
          Raspberry Pi OS by itself. Turn debug.one_shot on, or pass --permanent if that is wanted"
     ))
+}
+
+/// Refuses a configuration with a development switch on, for a build that is to stay.
+fn refuse_development_switches(debug: &config::DebugCfg) -> Result<(), String> {
+    let refusal = if debug.one_shot {
+        "--permanent with debug.one_shot on would return to Raspberry Pi OS at the first \
+         restart: turn debug.one_shot off"
+            .to_owned()
+    } else if debug.log_to_sd {
+        "a permanent qberrypi must not write its log to the card: turn debug.log_to_sd off"
+            .to_owned()
+    } else if debug.return_after_secs != 0 {
+        "a permanent qberrypi with debug.return_after_secs set would restart for ever: set it \
+         to 0"
+            .to_owned()
+    } else if debug.calibrate_touch {
+        "debug.calibrate_touch is for one boot of calibration: turn it off".to_owned()
+    } else if debug.fault != config::Fault::None {
+        format!(
+            "{CONFIG_FILE} has debug.fault set: a permanent qberrypi with a provoked failure \
+             would restart for ever. Set debug.fault to \"none\""
+        )
+    } else {
+        return Ok(());
+    };
+    Err(format!("{refusal}; nothing was copied"))
 }
 
 /// Reads the bring-up switches, which decide whether and when the Pi comes back.
@@ -138,6 +222,94 @@ fn debug_settings(toml_text: &str) -> Result<config::DebugCfg, String> {
         Ok(parsed) => Ok(parsed.debug),
         Err(error) => Err(error.to_string()),
     }
+}
+
+/// Reads the address the Pi has once qberrypi runs on it.
+///
+/// The error names the key at fault and never quotes the file.
+fn pi_address(toml_text: &str) -> Result<Ipv4Addr, String> {
+    match config::parse(toml_text) {
+        Ok(parsed) => Ok(parsed.net.address.addr),
+        Err(error) => Err(error.to_string()),
+    }
+}
+
+/// Whether the local `qberrypi.toml` has an `[api]` section, and so whether the Pi serves the API
+/// and needs a certificate.
+///
+/// The error names the key at fault and never quotes the file.
+fn has_api(toml_text: &str) -> Result<bool, String> {
+    match config::parse(toml_text) {
+        Ok(parsed) => Ok(parsed.api.is_some()),
+        Err(error) => Err(error.to_string()),
+    }
+}
+
+/// The API's key and certificate as they are staged, and the pin that qnet is to be given.
+struct Certificate {
+    /// The bytes of `qberrypi-tls.pem`, which hold the key.
+    pem: Zeroizing<Vec<u8>>,
+    /// The SHA-256 of the certificate, as `AB:CD:...`.
+    pin: String,
+}
+
+/// Reads `qberrypi-tls.pem` from the top of the checkout and checks that qberrypi could serve it:
+/// that it is no larger than the Pi reads, and that `server_config` takes it.
+///
+/// No error holds a byte of the file.
+fn read_certificate(root: &Path) -> Result<Certificate> {
+    let path = root.join(CERT_FILE);
+    let file = match fs::File::open(&path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == ErrorKind::NotFound => {
+            bail!("{CONFIG_FILE} has [api] but there is no {CERT_FILE}: run cargo xtask make-cert")
+        }
+        Err(error) => return Err(error).with_context(|| format!("cannot read {}", path.display())),
+    };
+    let mut pem = Zeroizing::new(Vec::new());
+    file.take(TLS_FILE_CAP + 1)
+        .read_to_end(&mut pem)
+        .with_context(|| format!("cannot read {}", path.display()))?;
+    if pem.len() as u64 > TLS_FILE_CAP {
+        bail!(
+            "{CERT_FILE} is larger than {TLS_FILE_CAP} bytes, which is as much of it as qberrypi \
+             reads; the API would stay off"
+        );
+    }
+    tls::server_config(&pem).map_err(|reason| anyhow!("{CERT_FILE} cannot be served: {reason}"))?;
+    let digest =
+        tls::leaf_sha256(&pem).ok_or_else(|| anyhow!("{CERT_FILE} holds no certificate"))?;
+    Ok(Certificate {
+        pem,
+        pin: tls::pin_text(&digest),
+    })
+}
+
+/// The secrets of the Wi-Fi network, which no log may hold: the passphrase and
+/// the key made from it and the network's name, or else the configured key.
+///
+/// Keys are in lower-case hex, as a log would show them. The error names the
+/// key at fault and never quotes the file.
+fn secrets_of(toml_text: &str) -> Result<Vec<String>, String> {
+    let parsed = config::parse(toml_text).map_err(|error| error.to_string())?;
+    Ok(match &parsed.wifi.key {
+        config::WifiKey::Passphrase(passphrase) => {
+            let mut secrets = vec![passphrase.expose().to_owned()];
+            // The configuration's rules for a passphrase and a name are the derivation's. A file
+            // that broke them was refused before this, so only the passphrase is left to look for.
+            if let Ok(pmk) = Pmk::from_passphrase(passphrase.expose(), parsed.wifi.ssid.as_bytes())
+            {
+                secrets.push(
+                    pmk.expose()
+                        .iter()
+                        .map(|byte| format!("{byte:02x}"))
+                        .collect(),
+                );
+            }
+            secrets
+        }
+        config::WifiKey::Pmk(key) => vec![key.expose().to_ascii_lowercase()],
+    })
 }
 
 /// Refuses a host that `ssh` or `scp` could take for anything but a host.
@@ -188,28 +360,33 @@ fn parse_stage_dir(answer: &[u8]) -> Result<String> {
 
 /// One external command: a program and its arguments, never a line for a shell.
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct Invocation {
-    program: &'static str,
-    args: Vec<OsString>,
+pub(crate) struct Invocation {
+    pub(crate) program: &'static str,
+    pub(crate) args: Vec<OsString>,
 }
 
 /// How a command ended and what it wrote.
 #[derive(Debug, Clone)]
-struct Finished {
+pub(crate) struct Finished {
     /// The exit status; none when a signal ended the command.
-    status: Option<i32>,
-    stdout: Vec<u8>,
-    stderr: Vec<u8>,
+    pub(crate) status: Option<i32>,
+    pub(crate) stdout: Vec<u8>,
+    pub(crate) stderr: Vec<u8>,
 }
 
 /// Runs external commands. Tests put a recorder in its place.
-trait Runner {
+pub(crate) trait Runner {
     /// Runs the command to its end, feeding it `stdin` if there is any.
     fn run(&mut self, invocation: &Invocation, stdin: Option<&[u8]>) -> io::Result<Finished>;
+
+    /// Asks the status page of the Pi at `address` which build answers there.
+    ///
+    /// `None` when nothing answers, or what answers does not name a build.
+    fn reported_build(&mut self, address: Ipv4Addr) -> Option<u64>;
 }
 
 /// Runs the commands for real.
-struct SystemRunner;
+pub(crate) struct SystemRunner;
 
 impl Runner for SystemRunner {
     fn run(&mut self, invocation: &Invocation, stdin: Option<&[u8]>) -> io::Result<Finished> {
@@ -241,11 +418,18 @@ impl Runner for SystemRunner {
             stderr: output.stderr,
         })
     }
+
+    fn reported_build(&mut self, address: Ipv4Addr) -> Option<u64> {
+        get_stats((address, status::PORT).into(), STATS_TIMEOUT)
+            .ok()?
+            .get("build")?
+            .as_u64()
+    }
 }
 
 /// A command for the Pi. `ssh` joins the words with spaces for the shell there,
 /// so every word must be one that needs no quoting.
-fn ssh(host: &str, remote: &[&str]) -> Invocation {
+pub(crate) fn ssh(host: &str, remote: &[&str]) -> Invocation {
     let args = SSH_OPTIONS
         .iter()
         .chain(&["--", host])
@@ -261,6 +445,25 @@ fn ssh(host: &str, remote: &[&str]) -> Invocation {
 /// Asks whether the Pi answers over SSH.
 fn probe(host: &str) -> Invocation {
     ssh(host, &["true"])
+}
+
+/// Sends one packet to the Pi and gives it one second to answer; no name lookup.
+fn ping(address: Ipv4Addr) -> Invocation {
+    Invocation {
+        program: "ping",
+        args: ["-n", "-c", "1", "-W", "1"]
+            .into_iter()
+            .map(OsString::from)
+            .chain([address.to_string().into()])
+            .collect(),
+    }
+}
+
+/// How often the Pi was pinged while it did not answer SSH, and how often it answered.
+#[derive(Debug, Default, PartialEq)]
+struct PingTally {
+    sent: u32,
+    answered: u32,
 }
 
 /// Writes the Pi's whole boot partition to standard output as an archive.
@@ -340,8 +543,19 @@ fn run_to_success(
     invocation: &Invocation,
     what: &str,
 ) -> Result<Finished> {
+    run_fed_to_success(runner, invocation, None, what)
+}
+
+/// Runs a command that must succeed, feeding it `stdin` if there is any; `what`
+/// names it in the error, beside what it wrote.
+pub(crate) fn run_fed_to_success(
+    runner: &mut dyn Runner,
+    invocation: &Invocation,
+    stdin: Option<&[u8]>,
+    what: &str,
+) -> Result<Finished> {
     let done = runner
-        .run(invocation, None)
+        .run(invocation, stdin)
         .with_context(|| format!("cannot run {}", invocation.program))?;
     if done.status != Some(0) {
         bail!(
@@ -353,12 +567,19 @@ fn run_to_success(
     Ok(done)
 }
 
-/// Reads the build's checksums and adds a line for the configuration.
+/// Reads the build's checksums and adds a line for the configuration, and after it one for the
+/// certificate when there is one.
 ///
 /// Returns the files the build lists, in its order, and the text for the
 /// stage. The list is refused unless every line is a digest and a plain file
 /// name, as `cargo xtask build` writes them, and `config.txt` is among them.
-fn staged_checksums(build_sums: &str, toml: &[u8]) -> Result<(Vec<String>, String)> {
+/// The configuration and the certificate are not the build's, so a build that
+/// lists either is refused.
+fn staged_checksums(
+    build_sums: &str,
+    toml: &[u8],
+    certificate: Option<&[u8]>,
+) -> Result<(Vec<String>, String)> {
     let not_the_builds = || {
         anyhow!("{BUILD_FOLDER}/{CHECKSUMS} is not as the build wrote it: run `cargo xtask build`")
     };
@@ -383,7 +604,9 @@ fn staged_checksums(build_sums: &str, toml: &[u8]) -> Result<(Vec<String>, Strin
     if !names.iter().any(|name| name == "config.txt") {
         return Err(not_the_builds());
     }
-    let staged = format!("{build_sums}{}", sha256sums(&[(CONFIG_FILE, toml)]));
+    let mut added = vec![(CONFIG_FILE, toml)];
+    added.extend(certificate.map(|pem| (TLS_FILE, pem)));
+    let staged = format!("{build_sums}{}", sha256sums(&added));
     Ok((names, staged))
 }
 
@@ -398,7 +621,7 @@ fn private_temp_dir() -> Result<TempDir> {
 
 /// Writes a new file that only this user can read. A file that is already there is
 /// an error and stays as it is.
-fn write_private_new(path: &Path, data: &[u8]) -> Result<()> {
+pub(crate) fn write_private_new(path: &Path, data: &[u8]) -> Result<()> {
     let mut file = OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -475,6 +698,7 @@ impl RemoteScript {
              bad_copy={BAD_COPY}\n\
              config_not_written={CONFIG_NOT_WRITTEN}\n\
              wrong_device={WRONG_DEVICE}\n\
+             upgrading={UPGRADING}\n\
              \n\
              restart() {{\n    {restart}\n}}\n\
              {SCRIPT_BODY}"
@@ -495,14 +719,17 @@ const SCRIPT_HEAD: &str = r"#!/bin/sh
 #
 # In this order, stopping at the first thing that is not as expected:
 #   1. Checks: the stage directory and its files, the board, the mount and
-#      the device that is mounted there.
+#      the device that is mounted there, and that Raspberry Pi OS's package
+#      manager is not running. Then a note if the stage lacks ov-README or
+#      ov-qb-piscreen.dtbo, which the boot firmware reads from qberrypi's folder.
 #   2. Backup: config.txt is saved as config.pios.txt, unless a saved one is
 #      there already. That one is never written.
 #   3. Backup validation: init must be able to restore from config.pios.txt,
 #      and config.txt must be either that file or qberrypi's.
 #   4. Deselect: if config.txt selects qberrypi from an earlier deploy,
 #      config.pios.txt is copied back over it.
-#   5. Copy: the staged files go into the qberrypi folder.
+#   5. Copy: the staged files go into the qberrypi folder, and a tls.pem that
+#      an earlier deploy left there is removed unless this one brings one.
 #   6. Verify: the copies are read back against SHA256SUMS.
 #   7. The stage directory is removed.
 #   8. Select: qberrypi's config.txt is written over config.txt. If that
@@ -577,11 +804,37 @@ write_config() {
     cmp -s -- "$1" "$active"
 }
 
-# Copies the staged files into the folder on the card and reads them back
-# against the checksums. Fails if any step does.
+# Whether the stage brings an API certificate: whether its checksums list a
+# tls.pem, which they do exactly when qberrypi.toml has an [api] section.
+# Status 0: it does. Status 1: it does not. Higher: the list cannot be read.
+brings_certificate() {
+    grep -q "^[0-9a-f]\{64\}  tls\.pem\$" "$stage/SHA256SUMS"
+}
+
+# Takes the API's key and certificate of an earlier deploy off the card. It is
+# done when this deploy brings none: qberrypi would not serve the API without
+# the section, and the file holds a private key that nothing uses any more. Says
+# what it removes, by name, and never what is in it. Fails if the file is still
+# there afterwards.
+drop_stale_certificate() {
+    [ -e "$own/tls.pem" ] || [ -L "$own/tls.pem" ] || return 0
+    say "removing $own/tls.pem: this configuration has no [api] section, so qberrypi will not read it"
+    rm -f -- "$own/tls.pem" || return 1
+    [ ! -e "$own/tls.pem" ] && [ ! -L "$own/tls.pem" ]
+}
+
+# Copies the staged files into the folder on the card, takes off it the
+# certificate of an earlier deploy if this one has none, and reads the copies
+# back against the checksums. Fails if any step does.
 copy_and_check() {
     mkdir -p -- "$own" || return 1
     cp -- "$stage"/* "$own/" || return 1
+    certificate=0
+    brings_certificate || certificate=$?
+    # A list that cannot be read (status above 1) removes nothing; the check below fails on it.
+    if [ "$certificate" -eq 1 ]; then
+        drop_stale_certificate || return 1
+    fi
     sync || return 1
     if [ "$hardware_checks" = yes ]; then
         # Otherwise the check would read what is still in memory, not what reached the card.
@@ -608,7 +861,8 @@ main() {
     [ ! -L "$stage" ] || die "$bad_stage" "$stage is a link; nothing was changed"
     [ -d "$stage" ] || die "$bad_stage" "$stage is not a directory; nothing was changed"
 
-    # The stage holds a copy of the Wi-Fi passphrase: however this ends, it goes.
+    # The stage holds a copy of the Wi-Fi passphrase, and of the API's private key when there is
+    # one: however this ends, it goes.
     trap 'rm -rf -- "$stage"' EXIT
     trap 'exit 129' HUP INT PIPE TERM
 
@@ -645,6 +899,31 @@ main() {
             die "$wrong_device" "findmnt could not say which device $boot is; nothing was changed"
         [ "$mounted" = "$boot_device vfat" ] ||
             die "$wrong_device" "$boot is not $boot_device mounted as vfat, which is the one partition qberrypi reads and restores. Nothing was changed. findmnt found there: $mounted"
+    fi
+
+    # Raspberry Pi OS may be in the middle of replacing the kernel, the overlays
+    # or config.txt: this deploy would race it. Nothing has been written yet.
+    for p in apt apt-get dpkg; do
+        if pgrep -x "$p" >/dev/null 2>&1; then
+            die "$upgrading" "Raspberry Pi OS is installing updates ($p is running); try again when it has finished. Nothing was changed"
+        fi
+    done
+    # The upgrade worker cannot be found by its name: it shares it with the
+    # daemon that unattended-upgrades keeps running when nothing is being
+    # upgraded, so a search by name would refuse every deploy. Its command
+    # line tells them apart. The bracket keeps this line from matching the
+    # command line of any shell that was given the script as text.
+    if pgrep -f '/usr/bin/unattended-upgrad[e]( |$)' >/dev/null 2>&1; then
+        die "$upgrading" "Raspberry Pi OS is installing updates (unattended-upgrade is running); try again when it has finished. Nothing was changed"
+    fi
+
+    # qberrypi's config.txt names the touchscreen's overlay by qberrypi's own
+    # prefix, ov-: the boot firmware reads qberrypi/ov-README and
+    # qberrypi/ov-qb-piscreen.dtbo, which this stage brings. Without them the
+    # screen stays dark and everything else runs, so this stops nothing; the
+    # build always has them, so it only catches a stage made by hand.
+    if [ ! -f "$stage/ov-README" ] || [ ! -f "$stage/ov-qb-piscreen.dtbo" ]; then
+        say "note: the build carries no overlay of its own: the front panel will stay dark"
     fi
 
     # 2. Backup. A saved configuration that is there is never written.
@@ -701,7 +980,7 @@ main() {
     copy_and_check ||
         die "$bad_copy" "the build in $own is not complete or does not match SHA256SUMS. config.txt is the configuration of Raspberry Pi OS, so the next restart is Raspberry Pi OS"
 
-    # 7. The stage is done with; no copy of the passphrase stays in /tmp.
+    # 7. The stage is done with; no copy of the passphrase or the key stays in /tmp.
     rm -rf -- "$stage"
 
     # 8. Select. From here on the next start is qberrypi.
@@ -788,13 +1067,39 @@ fn check_log_is_of(log: &str, build_epoch: u64) -> Result<()> {
         Some(build) if build == build_epoch => Ok(()),
         Some(build) => bail!(
             "the last boot in the log is of build {build}, and the build deployed is \
-             {build_epoch}: this run left no log, and the one above is from an earlier run. {WHEN}"
+             {build_epoch}: this run left no log, and the one on the card is from an earlier \
+             run. {WHEN}"
         ),
         None => bail!(
             "the log has no boot header (`==== boot, build N ====`), so it cannot be told \
              whether it is of this run, of build {build_epoch}. {WHEN}"
         ),
     }
+}
+
+/// Checks that a collected log holds none of the secrets.
+///
+/// A passphrase is looked for as it is. A key, which is hex, is looked for in
+/// either case. The error never repeats a secret.
+fn check_log_has_no_secret(log: &str, secrets: &[String]) -> Result<()> {
+    let lowered = log.to_lowercase();
+    let is_key = |secret: &str| secret.len() == 64 && secret.bytes().all(|b| b.is_ascii_hexdigit());
+    let held = secrets.iter().any(|secret| {
+        log.contains(secret.as_str())
+            || (is_key(secret) && lowered.contains(&secret.to_ascii_lowercase()))
+    });
+    if held {
+        bail!("the log holds the Wi-Fi passphrase or key");
+    }
+    Ok(())
+}
+
+/// Refuses a saved log that holds a secret, as `deploy` and `collect` both do.
+///
+/// The error names the file to delete and never repeats a secret.
+fn refuse_secret(log: &str, secrets: &[String], saved: &Path) -> Result<()> {
+    check_log_has_no_secret(log, secrets)
+        .map_err(|refused| anyhow!("{refused}; delete {} and report this", saved.display()))
 }
 
 /// Tells the time and waits. Tests put a clock in its place that does not wait.
@@ -835,17 +1140,32 @@ enum Returned {
     WithoutGoingDown,
 }
 
+/// How long the Pi is given to answer again, for a run of `return_after_secs`.
+///
+/// The run is when qberrypi restarts the Pi by itself, counted from the start
+/// of its boot, and 0 means it does not. The Pi is given the run and 180 s
+/// after it, and in any case 300 s.
+fn back_within(return_after_secs: u64) -> Duration {
+    Duration::from_secs(return_after_secs)
+        .saturating_add(BACK_AFTER_RUN)
+        .max(BACK_WITHIN_AT_LEAST)
+}
+
 /// Waits for the Pi to stop answering and then to answer again.
 ///
 /// `answering` asks the Pi once. A Pi that is not seen to go down within 30 s
-/// is still waited for; one that does not answer again within 300 s is an
-/// error that says how to recover.
-fn wait_for_return(answering: &mut dyn FnMut() -> bool, clock: &mut dyn Clock) -> Result<Returned> {
+/// is still waited for; one that does not answer again within `back_within`
+/// is an error that says how to recover.
+fn wait_for_return(
+    answering: &mut dyn FnMut() -> bool,
+    back_within: Duration,
+    clock: &mut dyn Clock,
+) -> Result<Returned> {
     let went_down = wait_until(false, GONE_WITHIN, answering, clock);
-    if !wait_until(true, BACK_WITHIN, answering, clock) {
+    if !wait_until(true, back_within, answering, clock) {
         bail!(
-            "it did not answer again within {} s. {RECOVERY}",
-            BACK_WITHIN.as_secs()
+            "it did not answer again within {} s. {RECOVERY} If it still stays away: {WAY_BACK}",
+            back_within.as_secs()
         );
     }
     Ok(if went_down {
@@ -853,6 +1173,40 @@ fn wait_for_return(answering: &mut dyn FnMut() -> bool, clock: &mut dyn Clock) -
     } else {
         Returned::WithoutGoingDown
     })
+}
+
+/// Waits for the permanent build to answer on its status page.
+///
+/// `build_seen` asks once and returns the `build` that the page reports; one that is another
+/// number than `build_epoch` is another build, and the wait goes on. The question is asked
+/// every 2 s, for up to 180 s. Returns how long the wait took. The error says what to do for a
+/// Pi that did not answer.
+fn wait_for_qberrypi(
+    build_seen: &mut dyn FnMut() -> Option<u64>,
+    build_epoch: u64,
+    clock: &mut dyn Clock,
+) -> Result<Duration> {
+    let start = clock.now();
+    let mut other = None;
+    loop {
+        let seen = build_seen();
+        if seen == Some(build_epoch) {
+            return Ok(clock.now().saturating_sub(start));
+        }
+        other = seen.or(other);
+        if clock.now().saturating_sub(start) >= ANSWER_WITHIN {
+            let last = match other {
+                Some(build) => format!(" (the last build it reported was {build})"),
+                None => String::new(),
+            };
+            bail!(
+                "the Pi did not answer as qberrypi build {build_epoch} within {} s of the \
+                 restart{last}. To return to Raspberry Pi OS: {WAY_BACK}",
+                ANSWER_WITHIN.as_secs()
+            );
+        }
+        clock.sleep(ASK_EVERY);
+    }
 }
 
 /// Asks every 5 s until the answer is the wanted one; gives up, with `false`, after `limit`.
@@ -876,7 +1230,8 @@ fn wait_until(
 
 /// Copies the build to the Pi, selects qberrypi for one boot, restarts the Pi,
 /// waits for it to return to Raspberry Pi OS, checks that it did so through
-/// qberrypi, and collects the log, which must be this build's.
+/// qberrypi, and collects the log, which must be this build's and must hold
+/// no Wi-Fi secret.
 pub fn deploy(host: &str, permanent: bool, root: &Path) -> Result<()> {
     let mut clock = SystemClock {
         start: Instant::now(),
@@ -915,13 +1270,21 @@ fn deploy_with(
     })?;
     check_local(&toml, permanent).map_err(Error::msg)?;
     let debug = debug_settings(&toml).map_err(Error::msg)?;
+    let address = pi_address(&toml).map_err(Error::msg)?;
+    let secrets = secrets_of(&toml).map_err(Error::msg)?;
+    // The file holds the API's private key: nothing of it goes into a message.
+    let certificate = if has_api(&toml).map_err(Error::msg)? {
+        Some(read_certificate(&root)?)
+    } else {
+        None
+    };
     if debug.one_shot && debug.return_after_secs == 0 {
         writeln!(
             out,
             "deploy: {host}: note: debug.return_after_secs is 0, so qberrypi will not restart by \
              itself. This command will stop waiting after {} s; the Pi returns to Raspberry Pi \
              OS when it is switched off and on",
-            BACK_WITHIN.as_secs()
+            BACK_WITHIN_AT_LEAST.as_secs()
         )?;
     }
 
@@ -937,7 +1300,11 @@ fn deploy_with(
             return Err(error).with_context(|| format!("cannot read {}", sums_path.display()));
         }
     };
-    let (names, staged_sums) = staged_checksums(&build_sums, toml.as_bytes())?;
+    let (names, staged_sums) = staged_checksums(
+        &build_sums,
+        toml.as_bytes(),
+        certificate.as_ref().map(|found| found.pem.as_slice()),
+    )?;
     // By this the log that comes back is told from one an earlier run left.
     let build_epoch = read_build_epoch(&root)?;
     let mut files = Vec::new();
@@ -961,6 +1328,17 @@ fn deploy_with(
         .with_context(|| format!("cannot write {}", staged_sums_path.display()))?;
     files.push(staged_sums_path);
     files.push(toml_path);
+    if let Some(found) = &certificate {
+        // Beside the checksums, in the folder that only this user enters, and gone with it.
+        let staged_pem = scratch_path.join(TLS_FILE);
+        write_private_new(&staged_pem, &found.pem)?;
+        files.push(staged_pem);
+        writeln!(
+            out,
+            "deploy: {host}: the API's certificate pin (SHA-256): {}",
+            found.pin
+        )?;
+    }
 
     let backup = root.join(BOOT_BACKUP);
     match fs::symlink_metadata(&backup) {
@@ -991,7 +1369,8 @@ fn deploy_with(
 
     let installed = install(host, &stage, &files, runner, out);
     if installed.is_err() {
-        // The stage holds the passphrase. The script removes it, but may not have run.
+        // The stage holds the passphrase and the API's key. The script removes it, but may not
+        // have run.
         let _ = writeln!(out, "deploy: {host}: removing the stage directory");
         let _ = runner.run(&remove_stage(host, &stage), None);
     }
@@ -999,29 +1378,47 @@ fn deploy_with(
     drop(scratch);
 
     if !debug.one_shot {
-        writeln!(
-            out,
-            "deploy: {host}: debug.one_shot is off, so qberrypi stays: the Pi will not return to \
-             Raspberry Pi OS by itself. To return it, put the card in another computer and copy \
-             config.pios.txt over config.txt"
-        )?;
-        return Ok(());
+        return wait_for_permanent(host, address, build_epoch, runner, clock, out);
     }
 
+    let back = back_within(debug.return_after_secs);
     writeln!(
         out,
         "deploy: {host}: waiting up to {} s for it to go down and then up to {} s for it to answer again",
         GONE_WITHIN.as_secs(),
-        BACK_WITHIN.as_secs()
+        back.as_secs()
     )?;
+    let mut pings = PingTally::default();
+    let mut said_ping_failed = false;
     let mut answering = || {
-        runner
+        let up = runner
             .run(&probe(host), None)
-            .is_ok_and(|done| done.status == Some(0))
+            .is_ok_and(|done| done.status == Some(0));
+        if !up {
+            // A ping that cannot be run is no failure of the deploy either, and counts as sent.
+            pings.sent += 1;
+            match runner.run(&ping(address), None) {
+                Ok(done) if done.status == Some(0) => pings.answered += 1,
+                Ok(_) => {}
+                // Once: it would be the same at every poll.
+                Err(error) if !said_ping_failed => {
+                    said_ping_failed = true;
+                    let _ = writeln!(out, "deploy: {host}: ping could not be run: {error}");
+                }
+                Err(_) => {}
+            }
+        }
+        up
     };
-    match wait_for_return(&mut answering, clock)
-        .with_context(|| format!("{host} did not come back"))?
-    {
+    let returned = match wait_for_return(&mut answering, back, clock) {
+        Ok(returned) => returned,
+        Err(error) => {
+            // A Pi that did not come back is where the tally tells most.
+            let _ = say_pings(out, host, address, &pings);
+            return Err(error.context(format!("{host} did not come back")));
+        }
+    };
+    match returned {
         Returned::AfterRestart => writeln!(out, "deploy: {host}: it is back")?,
         Returned::WithoutGoingDown => writeln!(
             out,
@@ -1029,6 +1426,7 @@ fn deploy_with(
              the log may be an older one"
         )?,
     }
+    say_pings(out, host, address, &pings)?;
 
     writeln!(
         out,
@@ -1039,8 +1437,78 @@ fn deploy_with(
         .context("cannot run ssh")?;
     check_returned(host, &compared)?;
 
-    let (_, log) = collect_with(host, &root, runner, clock, out)?;
-    check_log_is_of(&log, build_epoch)
+    let (saved, log) = save_log(host, &root, runner, clock, out)?;
+    let of_this_build = check_log_is_of(&log, build_epoch);
+    // A log with a secret in it is not shown, and that is what the error says first, whatever
+    // else is wrong with it. That it is of an older build, too, says whether this run left a log.
+    if let Err(refused) = refuse_secret(&log, &secrets, &saved) {
+        return Err(match of_this_build {
+            Ok(()) => refused,
+            Err(also) => anyhow!("{refused}. Also, {also}"),
+        });
+    }
+    // Any other log is shown, whatever else is wrong with it: it is what there is to read.
+    show_log(&saved, &log, out)?;
+    of_this_build
+}
+
+/// Waits for a permanent qberrypi to take over: for the Pi to stop answering SSH, and then for
+/// its status page to report the build that was deployed.
+///
+/// A Pi that is never seen to stop answering SSH is still waited for, with a note: it may
+/// already have restarted between two looks.
+fn wait_for_permanent(
+    host: &str,
+    address: Ipv4Addr,
+    build_epoch: u64,
+    runner: &mut dyn Runner,
+    clock: &mut dyn Clock,
+    out: &mut dyn Write,
+) -> Result<()> {
+    writeln!(
+        out,
+        "deploy: {host}: qberrypi stays: waiting up to {} s for it to stop answering SSH and then \
+         up to {} s for build {build_epoch} to answer at {address}",
+        GONE_WITHIN.as_secs(),
+        ANSWER_WITHIN.as_secs()
+    )?;
+    let restarted = clock.now();
+    let mut ssh_answering = || {
+        runner
+            .run(&probe(host), None)
+            .is_ok_and(|done| done.status == Some(0))
+    };
+    if !wait_until(false, GONE_WITHIN, &mut ssh_answering, clock) {
+        writeln!(
+            out,
+            "deploy: {host}: note: it never stopped answering SSH; it may not have restarted. \
+             Waiting for qberrypi all the same"
+        )?;
+    }
+    let gone_for = clock.now().saturating_sub(restarted);
+    let took = wait_for_qberrypi(&mut || runner.reported_build(address), build_epoch, clock)
+        .map_err(|error| error.context(format!("{host} did not answer as qberrypi")))?;
+    writeln!(
+        out,
+        "deploy: {host}: qberrypi build {build_epoch} answers at {address} {} s after the \
+         restart; to return to Raspberry Pi OS later: {WAY_BACK}",
+        (gone_for + took).as_secs()
+    )?;
+    Ok(())
+}
+
+/// Says how many of the pings sent while the Pi was away it answered.
+fn say_pings(
+    out: &mut dyn Write,
+    host: &str,
+    address: Ipv4Addr,
+    pings: &PingTally,
+) -> io::Result<()> {
+    writeln!(
+        out,
+        "deploy: {host}: {address} answered {} of {} pings while the Pi was away",
+        pings.answered, pings.sent
+    )
 }
 
 /// Copies the files to the stage and runs the script there as root.
@@ -1078,7 +1546,8 @@ fn install(
 }
 
 /// Fetches the log qberrypi left on the Pi's boot partition, saves it under
-/// `out/logs/`, prints it and returns where it was saved.
+/// `out/logs/`, prints it and returns where it was saved. A log that holds the
+/// Wi-Fi passphrase or key is saved and not printed, and is an error.
 pub fn collect(host: &str, root: &Path) -> Result<PathBuf> {
     let clock = SystemClock {
         start: Instant::now(),
@@ -1088,8 +1557,34 @@ pub fn collect(host: &str, root: &Path) -> Result<PathBuf> {
 
 /// `collect`, with the commands, the clock and the output in the caller's hands.
 ///
-/// Returns the text of the log as well as where it was saved.
+/// Returns the text of the log as well as where it was saved. It is where a
+/// deploy whose Pi did not come back is picked up, so it is a log nobody has
+/// checked: with a `qberrypi.toml` in the checkout that parses, the log is
+/// shown only if it holds none of the Wi-Fi secrets. Without one there is
+/// nothing to check it against, and it is shown as it is.
 fn collect_with(
+    host: &str,
+    root: &Path,
+    runner: &mut dyn Runner,
+    clock: &dyn Clock,
+    out: &mut dyn Write,
+) -> Result<(PathBuf, String)> {
+    let (path, text) = save_log(host, root, runner, clock, out)?;
+    if let Some(secrets) = fs::read_to_string(root.join(CONFIG_FILE))
+        .ok()
+        .and_then(|toml| secrets_of(&toml).ok())
+    {
+        refuse_secret(&text, &secrets, &path)?;
+    }
+    show_log(&path, &text, out)?;
+    Ok((path, text))
+}
+
+/// Fetches the log and saves it under `out/logs/`, and shows none of it.
+///
+/// Returns where it was saved and its text, for the caller to check before
+/// [`show_log`] prints it: a log may hold the Wi-Fi passphrase.
+fn save_log(
     host: &str,
     root: &Path,
     runner: &mut dyn Runner,
@@ -1122,13 +1617,17 @@ fn collect_with(
     // Private: later milestones log details of the network.
     write_private_new(&path, &fetched.stdout)?;
 
-    let text = String::from_utf8_lossy(&fetched.stdout);
+    Ok((path, String::from_utf8_lossy(&fetched.stdout).into_owned()))
+}
+
+/// Prints a saved log and where it was saved.
+fn show_log(path: &Path, text: &str, out: &mut dyn Write) -> Result<()> {
     out.write_all(text.as_bytes())?;
     if !text.is_empty() && !text.ends_with('\n') {
         writeln!(out)?;
     }
     writeln!(out, "collect: wrote {}", path.display())?;
-    Ok((path, text.into_owned()))
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1141,6 +1640,7 @@ mod tests {
     use std::process::{Command, Stdio};
     use std::rc::Rc;
 
+    use qb_wpa2::pmk::Pmk;
     use tempfile::TempDir;
 
     use crate::build::sha256sums;
@@ -1166,6 +1666,108 @@ mod tests {
             .is_ok()
         );
         assert!(check_local("not toml", true).is_err());
+    }
+
+    #[test]
+    fn a_provoked_failure_is_never_deployed_for_good() {
+        // The example configuration has debug.one_shot off.
+        let faulty = EXAMPLE.replace("fault = \"none\"", "fault = \"crash-loop\"");
+        let error = check_local(&faulty, true).unwrap_err();
+        assert!(error.contains("debug.fault"), "{error}");
+        assert!(error.contains("restart for ever"), "{error}");
+        assert!(
+            check_local(
+                &faulty.replace("one_shot = false", "one_shot = true"),
+                false
+            )
+            .is_ok()
+        );
+        // Whatever the failure is, and whatever else is set: only a one-shot run may carry one.
+        for word in [
+            "stall",
+            "crash-loop",
+            "panic",
+            "no-wifi",
+            "drop-link",
+            "mute-probe",
+        ] {
+            let text = EXAMPLE.replace("fault = \"none\"", &format!("fault = \"{word}\""));
+            assert!(check_local(&text, true).is_err(), "{word}");
+            let text = text.replace("one_shot = false", "one_shot = true");
+            assert!(check_local(&text, true).is_err(), "{word}");
+            assert!(check_local(&text, false).is_ok(), "{word}");
+        }
+        assert!(check_local(EXAMPLE, true).is_ok());
+    }
+
+    #[test]
+    fn a_permanent_deploy_refuses_every_development_switch() {
+        let base = EXAMPLE; // every switch off, fault "none"
+        assert!(check_local(base, true).is_ok());
+        let cases = [
+            ("one_shot = false", "one_shot = true", "debug.one_shot"),
+            ("log_to_sd = false", "log_to_sd = true", "debug.log_to_sd"),
+            (
+                "return_after_secs = 0",
+                "return_after_secs = 40",
+                "debug.return_after_secs",
+            ),
+            (
+                "calibrate_touch = false",
+                "calibrate_touch = true",
+                "debug.calibrate_touch",
+            ),
+            ("fault = \"none\"", "fault = \"stall\"", "debug.fault"),
+        ];
+        for (from, to, key) in cases {
+            let error = check_local(&base.replace(from, to), true).unwrap_err();
+            assert!(
+                error.contains(key) && error.ends_with("; nothing was copied"),
+                "{error}"
+            );
+        }
+        // One-shot deploys, which are not permanent, go through as before.
+        assert!(check_local(&base.replace("one_shot = false", "one_shot = true"), false).is_ok());
+    }
+
+    #[test]
+    fn a_permanent_deploy_names_the_first_switch_that_is_on_in_a_fixed_order() {
+        // With every switch on, each refusal in turn is the one that is shown, in the plan's order.
+        const KEYS: [&str; 5] = [
+            "debug.one_shot",
+            "debug.log_to_sd",
+            "debug.return_after_secs",
+            "debug.calibrate_touch",
+            "debug.fault",
+        ];
+        let mut text = base_with_every_switch_on();
+        for (at, key) in KEYS.iter().enumerate() {
+            let error = check_local(&text, true).unwrap_err();
+            for (other_at, other) in KEYS.iter().enumerate() {
+                assert_eq!(error.contains(other), other_at == at, "{key}: {error}");
+            }
+            text = match *key {
+                "debug.one_shot" => text.replace("one_shot = true", "one_shot = false"),
+                "debug.log_to_sd" => text.replace("log_to_sd = true", "log_to_sd = false"),
+                "debug.return_after_secs" => {
+                    text.replace("return_after_secs = 40", "return_after_secs = 0")
+                }
+                "debug.calibrate_touch" => {
+                    text.replace("calibrate_touch = true", "calibrate_touch = false")
+                }
+                _ => text.replace("fault = \"stall\"", "fault = \"none\""),
+            };
+        }
+        assert!(check_local(&text, true).is_ok());
+    }
+
+    fn base_with_every_switch_on() -> String {
+        EXAMPLE
+            .replace("one_shot = false", "one_shot = true")
+            .replace("log_to_sd = false", "log_to_sd = true")
+            .replace("return_after_secs = 0", "return_after_secs = 40")
+            .replace("calibrate_touch = false", "calibrate_touch = true")
+            .replace("fault = \"none\"", "fault = \"stall\"")
     }
 
     #[test]
@@ -1342,6 +1944,17 @@ mod tests {
     }
 
     #[test]
+    fn a_ping_is_one_packet_with_a_one_second_wait() {
+        let invocation = ping(Ipv4Addr::new(192, 0, 2, 53));
+        assert_eq!(invocation.program, "ping");
+        // No name lookup, one packet, one second to answer.
+        assert_eq!(
+            words(&invocation),
+            ["-n", "-c", "1", "-W", "1", "192.0.2.53"]
+        );
+    }
+
+    #[test]
     fn the_upload_is_one_scp_of_named_files_into_the_stage() {
         let files = [
             PathBuf::from("/work/out/qberrypi/kernel8.img"),
@@ -1423,11 +2036,45 @@ mod tests {
     #[test]
     fn the_staged_checksums_gain_a_line_for_the_configuration() {
         let build = sha256sums(&[("kernel8.img", b"K"), ("config.txt", b"C")]);
-        let (names, staged) = staged_checksums(&build, b"T").unwrap();
+        let (names, staged) = staged_checksums(&build, b"T", None).unwrap();
         assert_eq!(names, ["kernel8.img", "config.txt"]);
         let toml_line = sha256sums(&[("qberrypi.toml", b"T")]);
         assert_eq!(staged, format!("{build}{toml_line}"));
         assert_eq!(staged.lines().count(), 3);
+    }
+
+    #[test]
+    fn the_overlay_files_names_are_plain_names_the_stage_takes() {
+        let build = sha256sums(&[
+            ("kernel8.img", b"K"),
+            ("config.txt", b"C"),
+            ("ov-README", b"R"),
+            ("ov-overlay_map.dtb", b"M"),
+            ("ov-qb-piscreen.dtbo", b"P"),
+        ]);
+        let (names, staged) = staged_checksums(&build, b"T", None).unwrap();
+        assert_eq!(
+            names,
+            [
+                "kernel8.img",
+                "config.txt",
+                "ov-README",
+                "ov-overlay_map.dtb",
+                "ov-qb-piscreen.dtbo"
+            ]
+        );
+        assert_eq!(staged.lines().count(), 6);
+    }
+
+    #[test]
+    fn the_staged_checksums_gain_a_line_for_the_certificate_after_the_configuration() {
+        let build = sha256sums(&[("kernel8.img", b"K"), ("config.txt", b"C")]);
+        let (names, staged) = staged_checksums(&build, b"T", Some(b"P")).unwrap();
+        // The certificate is not one of the build's files.
+        assert_eq!(names, ["kernel8.img", "config.txt"]);
+        let added = sha256sums(&[("qberrypi.toml", b"T"), ("tls.pem", b"P")]);
+        assert_eq!(staged, format!("{build}{added}"));
+        assert_eq!(staged.lines().count(), 4);
     }
 
     #[test]
@@ -1447,6 +2094,7 @@ mod tests {
                 "the configuration",
                 format!("{config}{}", line("qberrypi.toml")),
             ),
+            ("the certificate", format!("{config}{}", line("tls.pem"))),
             ("the checksums", format!("{config}{}", line("SHA256SUMS"))),
             ("the log", format!("{config}{}", line("log.txt"))),
             ("listed twice", format!("{config}{config}")),
@@ -1459,7 +2107,8 @@ mod tests {
             ),
             ("a blank line", format!("{config}\n")),
         ] {
-            assert!(staged_checksums(&sums, b"T").is_err(), "{case}");
+            assert!(staged_checksums(&sums, b"T", None).is_err(), "{case}");
+            assert!(staged_checksums(&sums, b"T", Some(b"P")).is_err(), "{case}");
         }
     }
 
@@ -1467,10 +2116,13 @@ mod tests {
 
     const PIOS: &str = "PIOS\n";
     const OWN_CONFIG: &str = "os_prefix=qberrypi/\n";
-    const STAGED: [(&str, &[u8]); 4] = [
+    const STAGED: [(&str, &[u8]); 7] = [
         ("kernel8.img", b"KERNEL"),
         ("initramfs8", b"INITRAMFS"),
         ("config.txt", OWN_CONFIG.as_bytes()),
+        ("ov-README", b"README"),
+        ("ov-overlay_map.dtb", b"OVERLAY_MAP"),
+        ("ov-qb-piscreen.dtbo", b"PISCREEN"),
         ("qberrypi.toml", b"[debug]\none_shot = true\n"),
     ];
 
@@ -1480,6 +2132,48 @@ mod tests {
     const FAKE_RM: &str = "rm() { printf 'rm %s\\n' \"$*\" >>\"$QBERRYPI_TEST_TRACE\"; }\n";
     /// Stands in for the restart and records what `config.txt` held when it was asked for.
     const FAKE_RESTART: &str = "printf 'restart: %s\\n' \"$(cat \"$QBERRYPI_TEST_BOOT/config.txt\")\" >>\"$QBERRYPI_TEST_TRACE\"";
+
+    /// Stands in for `pgrep` on a Pi where no package manager runs: it finds nothing. Every run
+    /// has it before its own stand-ins, so no test depends on what runs on the machine it is on.
+    const NO_PACKAGE_MANAGER: &str = "pgrep() { return 1; }\n";
+
+    /// Stands in for `pgrep` on a Pi where the process `name` runs: it finds that name and no other.
+    fn package_manager_running(name: &str) -> String {
+        format!("pgrep() {{ [ \"$*\" = \"-x {name}\" ]; }}\n")
+    }
+
+    /// What `unattended-upgrades.service` keeps running all the time on Raspberry Pi OS, however
+    /// idle the machine: its shutdown script, waiting for a signal. The kernel names a script after
+    /// its file, cut to 15 characters, so this process is called `unattended-upgr`.
+    const IDLE_UPGRADES_DAEMON: (&str, &str) = (
+        "unattended-upgr",
+        "/usr/bin/python3 /usr/share/unattended-upgrades/unattended-upgrade-shutdown --wait-for-signal",
+    );
+
+    /// Stands in for `pgrep` on a Pi that runs the given processes, each as its name (what
+    /// `pgrep -x` compares) and its whole command line (what `pgrep -f` searches with a regular
+    /// expression). It answers those two questions and no other: given any other flags it finds
+    /// nothing, so a script that asks differently is not refused by it.
+    fn processes_running(processes: &[(&str, &str)]) -> String {
+        let names: String = processes
+            .iter()
+            .map(|(name, _)| format!(" '{name}'"))
+            .collect();
+        let commands: String = processes
+            .iter()
+            .map(|(_, command)| format!(" '{command}'"))
+            .collect();
+        format!(
+            "pgrep() {{\n\
+             [ $# -eq 2 ] || return 2\n\
+             case $1 in\n\
+             -x) printf '%s\\n'{names} | grep -qxF -- \"$2\" ;;\n\
+             -f) printf '%s\\n'{commands} | grep -qE -- \"$2\" ;;\n\
+             *) return 2 ;;\n\
+             esac\n\
+             }}\n"
+        )
+    }
 
     /// The shells the script is tried under: `sh`, and `dash` (the Pi's `sh`) where there is one.
     fn shells() -> Vec<&'static str> {
@@ -1556,6 +2250,24 @@ mod tests {
                 fs::write(self.stage.path().join(name), data).unwrap();
             }
             fs::write(self.stage.path().join("SHA256SUMS"), sha256sums(files)).unwrap();
+        }
+
+        /// Takes these files out of the usual stage, and lists in `SHA256SUMS` only what is left.
+        fn stage_all_but(&self, without: &[&str]) {
+            for name in without {
+                fs::remove_file(self.stage.path().join(name)).unwrap();
+            }
+            let left: Vec<(&str, &[u8])> = STAGED
+                .iter()
+                .copied()
+                .filter(|(name, _)| !without.contains(name))
+                .collect();
+            self.stage_files(&left);
+        }
+
+        /// Puts one more file in the stage, whose checksums the caller writes.
+        fn write_stage(&self, name: &str, data: &[u8]) {
+            fs::write(self.stage.path().join(name), data).unwrap();
         }
 
         fn write_boot(&self, name: &str, data: impl AsRef<[u8]>) {
@@ -1641,7 +2353,7 @@ mod tests {
                 .unwrap();
             let mut input = child.stdin.take().unwrap();
             // A shell that stops early may not read all of it.
-            let _ = input.write_all(format!("{fakes}{script}").as_bytes());
+            let _ = input.write_all(format!("{NO_PACKAGE_MANAGER}{fakes}{script}").as_bytes());
             drop(input);
             let output = child.wait_with_output().unwrap();
             Ran {
@@ -2442,6 +3154,132 @@ mod tests {
     }
 
     #[test]
+    fn the_script_refuses_while_the_package_manager_runs() {
+        for shell in shells() {
+            for process in ["apt", "apt-get", "dpkg"] {
+                let card = Card::fresh();
+                let before = card.snapshot();
+                let fakes = format!("{FAKE_SYNC}{}", package_manager_running(process));
+                let ran = card.run_text(shell, &card.script().render(), &fakes);
+                assert_eq!(
+                    ran.status,
+                    Some(UPGRADING),
+                    "{shell}, {process}: {}",
+                    ran.stderr
+                );
+                let named = format!("({process} is running)");
+                assert!(ran.stderr.contains(&named), "{process}: {}", ran.stderr);
+                assert!(ran.stderr.contains("try again"), "{}", ran.stderr);
+                assert!(ran.stderr.contains("othing was changed"), "{}", ran.stderr);
+                // Nothing was written, synced or restarted, and nothing was selected.
+                assert_eq!(card.snapshot(), before, "{shell}, {process}");
+                assert_eq!(card.trace(), "", "{shell}, {process}");
+                assert!(!ran.stdout.contains(SELECTED_MARKER));
+            }
+            // With none of them running the deploy goes through, as it always did.
+            let card = Card::fresh();
+            let ran = card.run(shell);
+            assert_eq!(ran.status, Some(0), "{shell}: {}", ran.stderr);
+            assert_eq!(card.read_boot("config.txt"), OWN_CONFIG.as_bytes());
+        }
+        assert_eq!(UPGRADING, 11);
+        assert!(
+            ![
+                ALREADY_SELECTED,
+                BACKUP_REFUSED,
+                CONFIG_CHANGED,
+                BAD_STAGE,
+                WRONG_MACHINE,
+                BAD_COPY,
+                CONFIG_NOT_WRITTEN,
+                WRONG_DEVICE
+            ]
+            .contains(&UPGRADING)
+        );
+    }
+
+    #[test]
+    fn the_idle_unattended_upgrades_daemon_does_not_stop_a_deploy() {
+        // Raspberry Pi OS keeps that daemon running all the time, so a name search that finds
+        // it would refuse every deploy for ever.
+        let table = [
+            IDLE_UPGRADES_DAEMON,
+            (
+                "tail",
+                "tail -f /var/log/unattended-upgrades/unattended-upgrades.log",
+            ),
+        ];
+        for shell in shells() {
+            let fakes = format!("{FAKE_SYNC}{}", processes_running(&table));
+            // The stand-in would refuse a script that looks for the daemon by its name.
+            let by_name = Command::new(shell)
+                .args(["-c", &format!("{fakes}pgrep -x unattended-upgr")])
+                .status()
+                .unwrap();
+            assert!(by_name.success(), "{shell}: the stand-in finds no daemon");
+
+            let card = Card::fresh();
+            let ran = card.run_text(shell, &card.script().render(), &fakes);
+            assert_eq!(ran.status, Some(0), "{shell}: {}", ran.stderr);
+            assert_eq!(card.read_boot("config.txt"), OWN_CONFIG.as_bytes());
+            assert!(ran.stdout.contains(SELECTED_MARKER), "{}", ran.stdout);
+            assert_eq!(ran.stderr, "", "{shell}");
+        }
+    }
+
+    #[test]
+    fn the_script_refuses_while_the_unattended_upgrade_worker_runs() {
+        // The worker has the same process name as the idle daemon, so only its command line
+        // tells them apart; with arguments or without, python3 runs it by its path.
+        for shell in shells() {
+            for command in [
+                "/usr/bin/python3 /usr/bin/unattended-upgrade",
+                "/usr/bin/python3 /usr/bin/unattended-upgrade -d",
+                "/usr/bin/python3 /usr/bin/unattended-upgrade --download-only",
+            ] {
+                for beside_daemon in [false, true] {
+                    let worker = ("unattended-upgr", command);
+                    let table = if beside_daemon {
+                        vec![IDLE_UPGRADES_DAEMON, worker]
+                    } else {
+                        vec![worker]
+                    };
+                    let card = Card::fresh();
+                    let before = card.snapshot();
+                    let fakes = format!("{FAKE_SYNC}{}", processes_running(&table));
+                    let ran = card.run_text(shell, &card.script().render(), &fakes);
+                    let what = format!("{shell}, {command}, with the daemon: {beside_daemon}");
+                    assert_eq!(ran.status, Some(UPGRADING), "{what}: {}", ran.stderr);
+                    assert!(
+                        ran.stderr.contains("(unattended-upgrade is running)"),
+                        "{what}: {}",
+                        ran.stderr
+                    );
+                    assert!(ran.stderr.contains("try again"), "{}", ran.stderr);
+                    assert!(ran.stderr.contains("othing was changed"), "{}", ran.stderr);
+                    // Nothing was written, synced or restarted, and nothing was selected.
+                    assert_eq!(card.snapshot(), before, "{what}");
+                    assert_eq!(card.trace(), "", "{what}");
+                    assert!(!ran.stdout.contains(SELECTED_MARKER), "{what}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_package_manager_guard_comes_after_the_checks_of_the_stage() {
+        // The guard sits after the checks of the stage and the board, so what is wrong with
+        // those is still what is said first.
+        for shell in shells() {
+            let card = Card::fresh();
+            fs::remove_file(card.stage.path().join("SHA256SUMS")).unwrap();
+            let fakes = format!("{FAKE_SYNC}{}", package_manager_running("dpkg"));
+            let ran = card.run_text(shell, &card.script().render(), &fakes);
+            assert_eq!(ran.status, Some(BAD_STAGE), "{shell}: {}", ran.stderr);
+        }
+    }
+
+    #[test]
     fn the_card_is_synced_after_selecting_and_before_the_restart() {
         // This stand-in for sync also records how far the saving of the backup has come.
         let sync = "sync() { printf 'sync: %s new=%s saved=%s\\n' \
@@ -2747,6 +3585,277 @@ mod tests {
         }
     }
 
+    #[test]
+    fn the_overlay_files_land_flat_in_qberrypis_folder_for_the_firmware_to_find() {
+        // The firmware reads `qberrypi/ov-README` and `qberrypi/ov-<overlay>.dtbo`; it never looks
+        // in a folder of overlays, and the script makes none.
+        for shell in shells() {
+            let card = Card::fresh();
+            let ran = card.run(shell);
+            assert_eq!(ran.status, Some(0), "{shell}: {}", ran.stderr);
+            for (name, data) in [
+                ("ov-README", &b"README"[..]),
+                ("ov-overlay_map.dtb", b"OVERLAY_MAP"),
+                ("ov-qb-piscreen.dtbo", b"PISCREEN"),
+            ] {
+                assert_eq!(card.read_boot(&format!("qberrypi/{name}")), data, "{name}");
+            }
+            assert!(!card.has_boot("overlays"), "{shell}");
+            assert!(!card.has_boot("qberrypi/overlays"), "{shell}");
+        }
+    }
+
+    #[test]
+    fn the_script_says_when_the_build_carries_no_overlay_of_its_own() {
+        const NOTE: &str = "qberrypi-deploy: note: the build carries no overlay of its own: the \
+                            front panel will stay dark";
+        for shell in shells() {
+            // The usual stage has them: nothing to say, and nothing but that.
+            let card = Card::fresh();
+            let ran = card.run(shell);
+            assert_eq!(ran.status, Some(0), "{shell}: {}", ran.stderr);
+            assert!(
+                !ran.stdout.contains("note: the build carries no overlay"),
+                "{shell}: {}",
+                ran.stdout
+            );
+            assert!(!ran.stdout.contains("note:"), "{shell}: {}", ran.stdout);
+
+            // A stage without the one file or the other, or without either, gets the note.
+            for without in [
+                &["ov-README"][..],
+                &["ov-qb-piscreen.dtbo"],
+                &["ov-README", "ov-overlay_map.dtb", "ov-qb-piscreen.dtbo"],
+            ] {
+                let card = Card::fresh();
+                card.stage_all_but(without);
+                let ran = card.run(shell);
+                // It stops nothing.
+                assert_eq!(ran.status, Some(0), "{shell}, {without:?}: {}", ran.stderr);
+                assert_eq!(card.read_boot("config.txt"), OWN_CONFIG.as_bytes());
+                assert!(ran.stdout.contains(SELECTED_MARKER), "{}", ran.stdout);
+                assert_eq!(ran.stderr, "", "{shell}, {without:?}");
+                // It is said once, and before the first thing that is written.
+                let lines: Vec<&str> = ran.stdout.lines().collect();
+                let notes: Vec<usize> = (0..lines.len()).filter(|&i| lines[i] == NOTE).collect();
+                let first_write = lines
+                    .iter()
+                    .position(|line| line.contains("saving config.txt"));
+                assert!(
+                    notes.len() == 1 && Some(notes[0]) < first_write,
+                    "{shell}, {without:?}: {}",
+                    ran.stdout
+                );
+                // What the stage did bring was copied all the same.
+                assert_eq!(card.read_boot("qberrypi/kernel8.img"), b"KERNEL");
+            }
+
+            // A map the firmware can do without is no reason for the note.
+            let card = Card::fresh();
+            card.stage_all_but(&["ov-overlay_map.dtb"]);
+            let ran = card.run(shell);
+            assert_eq!(ran.status, Some(0), "{shell}: {}", ran.stderr);
+            assert!(!ran.stdout.contains("note:"), "{shell}: {}", ran.stdout);
+        }
+    }
+
+    #[test]
+    fn the_note_about_the_overlay_is_made_before_anything_is_written() {
+        // A stage with no overlay that the script then refuses for another reason: the note was
+        // said, and the card is as it was.
+        for shell in shells() {
+            let card = Card::new();
+            card.write_boot("config.txt", "os_prefix=qberrypi/\n");
+            card.stage_all_but(&["ov-README", "ov-qb-piscreen.dtbo"]);
+            let before = card.snapshot();
+
+            let ran = card.run(shell);
+
+            assert_eq!(
+                ran.status,
+                Some(ALREADY_SELECTED),
+                "{shell}: {}",
+                ran.stderr
+            );
+            assert!(
+                ran.stdout
+                    .contains("note: the build carries no overlay of its own"),
+                "{shell}: {}",
+                ran.stdout
+            );
+            assert_eq!(card.snapshot(), before, "{shell}");
+        }
+    }
+
+    /// A key and certificate left on the card by an earlier deploy: what no output may show.
+    const STALE_PEM: &str =
+        "-----BEGIN PRIVATE KEY-----\nSTALEKEYLINE\n-----END PRIVATE KEY-----\n";
+
+    /// Stages the files as `deploy` does, with the checksums that `staged_checksums` makes: the
+    /// build's files, the configuration, and `certificate` as `tls.pem` if there is one.
+    fn stage_as_deploy_does(card: &Card, certificate: Option<&[u8]>) {
+        let built: Vec<(&str, &[u8])> = STAGED
+            .iter()
+            .copied()
+            .filter(|(name, _)| *name != "qberrypi.toml")
+            .collect();
+        let toml: &[u8] = STAGED
+            .iter()
+            .find(|(name, _)| *name == "qberrypi.toml")
+            .unwrap()
+            .1;
+        let (_, sums) = staged_checksums(&sha256sums(&built), toml, certificate).unwrap();
+        let mut staged = built;
+        staged.push(("qberrypi.toml", toml));
+        card.stage_files(&staged);
+        if let Some(pem) = certificate {
+            card.write_stage(TLS_FILE, pem);
+        }
+        fs::write(card.stage.path().join("SHA256SUMS"), sums).unwrap();
+    }
+
+    #[test]
+    fn a_tls_pem_on_the_card_goes_when_the_deploy_brings_none() {
+        for shell in shells() {
+            let card = Card::fresh();
+            card.write_boot("qberrypi/tls.pem", STALE_PEM);
+            card.write_boot("qberrypi/log.txt", "LOG\n");
+            stage_as_deploy_does(&card, None);
+
+            let ran = card.run(shell);
+
+            assert_eq!(ran.status, Some(0), "{shell}: {}", ran.stderr);
+            assert!(!card.has_boot("qberrypi/tls.pem"), "{shell}");
+            // Nothing else of the folder was touched, and the build went in as usual.
+            assert_eq!(card.read_boot("qberrypi/log.txt"), b"LOG\n");
+            for (name, data) in STAGED {
+                assert_eq!(card.read_boot(&format!("qberrypi/{name}")), data, "{name}");
+            }
+            assert_eq!(card.read_boot("config.txt"), OWN_CONFIG.as_bytes());
+            // It says which file it removes, before it selects qberrypi, and shows none of it.
+            let removing = format!(
+                "qberrypi-deploy: removing {}/qberrypi/tls.pem: ",
+                card.boot.display()
+            );
+            let lines: Vec<&str> = ran.stdout.lines().collect();
+            let said = lines.iter().position(|line| line.starts_with(&removing));
+            let selecting = lines
+                .iter()
+                .position(|line| line.ends_with("selecting qberrypi"));
+            assert!(
+                said.is_some() && said < selecting,
+                "{shell}: {}",
+                ran.stdout
+            );
+            assert_eq!(ran.stderr, "", "{shell}");
+            for text in [&ran.stdout, &ran.stderr, &card.trace()] {
+                assert!(
+                    !text.contains("STALEKEY") && !text.contains("PRIVATE"),
+                    "{shell}: {text}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_tls_pem_the_deploy_brings_replaces_the_one_on_the_card_and_is_not_removed() {
+        for shell in shells() {
+            let card = Card::fresh();
+            card.write_boot("qberrypi/tls.pem", STALE_PEM);
+            let new_pem = "-----BEGIN PRIVATE KEY-----\nNEWKEYLINE\n-----END PRIVATE KEY-----\n";
+            stage_as_deploy_does(&card, Some(new_pem.as_bytes()));
+
+            let ran = card.run(shell);
+
+            assert_eq!(ran.status, Some(0), "{shell}: {}", ran.stderr);
+            assert_eq!(card.read_boot("qberrypi/tls.pem"), new_pem.as_bytes());
+            assert!(!ran.stdout.contains("removing"), "{shell}: {}", ran.stdout);
+            assert_eq!(ran.stderr, "", "{shell}");
+            for text in [&ran.stdout, &ran.stderr, &card.trace()] {
+                assert!(!text.contains("KEYLINE"), "{shell}: {text}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_card_without_a_tls_pem_is_not_told_of_one() {
+        for shell in shells() {
+            let card = Card::fresh();
+            stage_as_deploy_does(&card, None);
+            let ran = card.run(shell);
+            assert_eq!(ran.status, Some(0), "{shell}: {}", ran.stderr);
+            assert!(!card.has_boot("qberrypi/tls.pem"), "{shell}");
+            assert!(!ran.stdout.contains("tls.pem"), "{shell}: {}", ran.stdout);
+        }
+    }
+
+    #[test]
+    fn a_tls_pem_that_is_a_link_is_removed_and_what_it_pointed_at_is_not() {
+        for shell in shells() {
+            // A link that points at a file, and one that points at nothing.
+            for target_exists in [true, false] {
+                let card = Card::fresh();
+                let target = card.tmp.path().join("elsewhere");
+                if target_exists {
+                    fs::write(&target, "ELSEWHERE").unwrap();
+                }
+                fs::create_dir(card.boot.join("qberrypi")).unwrap();
+                std::os::unix::fs::symlink(&target, card.boot.join("qberrypi/tls.pem")).unwrap();
+                stage_as_deploy_does(&card, None);
+
+                let ran = card.run(shell);
+
+                assert_eq!(ran.status, Some(0), "{shell}: {}", ran.stderr);
+                let gone = fs::symlink_metadata(card.boot.join("qberrypi/tls.pem")).is_err();
+                assert!(gone, "{shell}, target {target_exists}");
+                assert_eq!(target.exists(), target_exists, "{shell}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_tls_pem_that_cannot_be_removed_stops_the_deploy_before_qberrypi_is_selected() {
+        for shell in shells() {
+            let card = Card::fresh();
+            // A folder of that name, which `rm -f` does not take away.
+            fs::create_dir_all(card.boot.join("qberrypi/tls.pem")).unwrap();
+            fs::write(card.boot.join("qberrypi/tls.pem/inside"), "X").unwrap();
+            stage_as_deploy_does(&card, None);
+
+            let ran = card.run(shell);
+
+            assert_eq!(ran.status, Some(BAD_COPY), "{shell}: {}", ran.stderr);
+            assert!(card.has_boot("qberrypi/tls.pem/inside"), "{shell}");
+            assert_eq!(card.read_boot("config.txt"), PIOS.as_bytes());
+            assert!(!card.trace().contains("restart"), "{shell}");
+            assert!(!ran.stdout.contains(SELECTED_MARKER), "{shell}");
+            assert!(
+                ran.stderr.contains("the next restart is Raspberry Pi OS"),
+                "{shell}: {}",
+                ran.stderr
+            );
+        }
+    }
+
+    #[test]
+    fn a_stage_that_lists_a_certificate_it_does_not_hold_removes_nothing() {
+        for shell in shells() {
+            let card = Card::fresh();
+            card.write_boot("qberrypi/tls.pem", STALE_PEM);
+            stage_as_deploy_does(&card, Some(b"NEW"));
+            // The file did not reach the stage; the checksums still list it.
+            fs::remove_file(card.stage.path().join("tls.pem")).unwrap();
+
+            let ran = card.run(shell);
+
+            // The card's file is not the listed one: the copy fails its check and nothing is selected.
+            assert_eq!(ran.status, Some(BAD_COPY), "{shell}: {}", ran.stderr);
+            assert_eq!(card.read_boot("qberrypi/tls.pem"), STALE_PEM.as_bytes());
+            assert_eq!(card.read_boot("config.txt"), PIOS.as_bytes());
+            assert!(!ran.stdout.contains("removing"), "{shell}: {}", ran.stdout);
+        }
+    }
+
     fn production_script() -> String {
         RemoteScript {
             boot_dir: "/boot/firmware".to_owned(),
@@ -2766,6 +3875,21 @@ mod tests {
         assert!(script.contains("\nboot='/boot/firmware'\n"));
         assert!(script.contains("\nstage='/tmp/qberrypi-stage.Ab12Cd'\n"));
         assert!(script.contains("\nhardware_checks=yes\n"));
+        assert!(script.contains("\nupgrading=11\n"));
+        // The certificate that it takes off the card is the one that init reads, by init's name.
+        assert_eq!(TLS_FILE, "tls.pem");
+        assert!(script.contains(r##"grep -q "^[0-9a-f]\{64\}  tls\.pem\$" "$stage/SHA256SUMS""##));
+        assert!(script.contains(r#"rm -f -- "$own/tls.pem""#));
+        assert!(script.contains("for p in apt apt-get dpkg; do"));
+        assert!(script.contains(r#"if pgrep -x "$p" >/dev/null 2>&1; then"#));
+        // The upgrade worker is found by its command line, not by the name it shares with the
+        // idle daemon, and by a pattern that cannot match the line that holds it.
+        assert!(
+            script
+                .contains("if pgrep -f '/usr/bin/unattended-upgrad[e]( |$)' >/dev/null 2>&1; then")
+        );
+        assert!(!script.contains("unattended-upgr;"));
+        assert!(!script.contains("-x unattended-upgr"));
         assert!(script.contains("\n    systemctl reboot\n"));
         assert!(script.contains("Raspberry Pi 3 Model B Plus"));
         assert!(script.contains("\nmodel_file='/proc/device-tree/model'\n"));
@@ -2775,6 +3899,25 @@ mod tests {
         assert!(script.contains(r#"findmnt -no SOURCE,FSTYPE "$boot""#));
         assert!(script.contains(r#"[ "$mounted" = "$boot_device vfat" ]"#));
         assert!(script.ends_with("\nmain\n"));
+    }
+
+    #[test]
+    fn the_worker_pattern_cannot_match_the_script_that_holds_it() {
+        // `pgrep -f` searches the command lines of every process, the shell that runs this
+        // script included. Written without the bracket, the pattern's own text would be a hit
+        // on any command line that carries the script, so the worker's path must not occur in
+        // the script as a word of its own.
+        let script = production_script();
+        assert!(script.contains("/usr/bin/unattended-upgrad[e]( |$)"));
+        let worker = "/usr/bin/unattended-upgrade";
+        for (at, _) in script.match_indices(worker) {
+            let after = script[at + worker.len()..].chars().next();
+            assert!(
+                !matches!(after, None | Some(' ' | '\t' | '\n')),
+                "the script holds the worker's path as it would be matched: {}",
+                &script[at..(at + 60).min(script.len())]
+            );
+        }
     }
 
     #[test]
@@ -2841,7 +3984,12 @@ mod tests {
     fn waits_for_the_pi_to_go_down_and_come_back() {
         let mut clock = FakeClock::new();
         let mut answers = VecDeque::from([true, true, false, false, false, true]);
-        let outcome = wait_for_return(&mut || answers.pop_front().unwrap(), &mut clock).unwrap();
+        let outcome = wait_for_return(
+            &mut || answers.pop_front().unwrap(),
+            back_within(0),
+            &mut clock,
+        )
+        .unwrap();
         assert_eq!(outcome, Returned::AfterRestart);
         assert!(answers.is_empty());
         assert_eq!(clock.sleeps, [5 * SECOND; 4]);
@@ -2856,6 +4004,7 @@ mod tests {
                 probes += 1;
                 true
             },
+            back_within(0),
             &mut clock,
         )
         .unwrap();
@@ -2869,11 +4018,16 @@ mod tests {
     fn a_pi_that_never_comes_back_is_an_error_that_says_how_to_recover() {
         let mut clock = FakeClock::new();
         let mut answers = VecDeque::from([true]);
-        let error = wait_for_return(&mut || answers.pop_front().unwrap_or(false), &mut clock)
-            .unwrap_err()
-            .to_string();
-        assert!(error.contains("another computer"), "{error}");
-        assert!(error.contains("config.pios.txt over config.txt"), "{error}");
+        let error = wait_for_return(
+            &mut || answers.pop_front().unwrap_or(false),
+            back_within(0),
+            &mut clock,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("return-to-pios"), "{error}");
+        assert!(error.contains("power cord"), "{error}");
+        assert!(!error.contains("another computer"), "{error}");
         // Gone after 5 s, then 300 s of asking every 5 s.
         assert_eq!(clock.now(), 305 * SECOND);
     }
@@ -2888,12 +4042,130 @@ mod tests {
                 now.set(now.get() + 10 * SECOND);
                 false
             },
+            back_within(0),
             &mut clock,
         );
         assert!(result.is_err());
         // Gone at the first answer; then 300 s, overrun by at most one answer and one pause.
         assert!(clock.now() >= 310 * SECOND, "{:?}", clock.now());
         assert!(clock.now() <= 325 * SECOND, "{:?}", clock.now());
+    }
+
+    #[test]
+    fn the_wait_for_the_return_covers_the_configured_run() {
+        let secs = Duration::from_secs;
+        // At least 300 s, else the run and 180 s.
+        assert_eq!(
+            (back_within(0), back_within(40), back_within(400)),
+            (secs(300), secs(300), secs(580))
+        );
+        // A run too long to count is still a limit, not an overflow.
+        assert_eq!(back_within(u64::MAX), Duration::MAX);
+    }
+
+    #[test]
+    fn a_pi_that_runs_longer_is_given_longer_to_come_back() {
+        let mut clock = FakeClock::new();
+        let mut answers = VecDeque::from([true]);
+        let error = wait_for_return(
+            &mut || answers.pop_front().unwrap_or(false),
+            back_within(400),
+            &mut clock,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("within 580 s"), "{error}");
+        // Gone after 5 s, then 580 s of asking every 5 s.
+        assert_eq!(clock.now(), 585 * SECOND);
+    }
+
+    #[test]
+    fn the_permanent_build_is_waited_for_until_it_reports_itself() {
+        let mut clock = FakeClock::new();
+        // Nothing, nothing, another build, this build.
+        let mut answers = VecDeque::from([None, None, Some(1), Some(7)]);
+        let took = wait_for_qberrypi(&mut || answers.pop_front().unwrap(), 7, &mut clock).unwrap();
+        assert_eq!(took, 3 * ASK_EVERY);
+        assert_eq!(clock.sleeps, [ASK_EVERY; 3]);
+        assert!(answers.is_empty());
+    }
+
+    #[test]
+    fn a_build_that_answers_at_once_costs_no_waiting() {
+        let mut clock = FakeClock::new();
+        let took = wait_for_qberrypi(&mut || Some(7), 7, &mut clock).unwrap();
+        assert_eq!(took, Duration::ZERO);
+        assert!(clock.sleeps.is_empty());
+    }
+
+    #[test]
+    fn a_build_that_never_answers_is_an_error_that_says_how_to_get_back() {
+        let mut clock = FakeClock::new();
+        let mut asked = 0;
+        let error = wait_for_qberrypi(
+            &mut || {
+                asked += 1;
+                None
+            },
+            7,
+            &mut clock,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            error.contains("return-to-pios") && error.contains("power cord"),
+            "{error}"
+        );
+        assert!(error.contains("180 s"), "{error}");
+        assert!(
+            error.ends_with(&format!("To return to Raspberry Pi OS: {WAY_BACK}")),
+            "{error}"
+        );
+        // Asked every 2 s up to 180 s, the last time at 180 s.
+        assert_eq!(clock.now(), ANSWER_WITHIN);
+        assert_eq!(asked, 91);
+    }
+
+    #[test]
+    fn only_another_build_answering_is_still_not_this_build() {
+        let mut clock = FakeClock::new();
+        let error = wait_for_qberrypi(&mut || Some(1), 7, &mut clock)
+            .unwrap_err()
+            .to_string();
+        // It says what answered, for a Pi that runs an older build.
+        assert!(error.contains("build 7"), "{error}");
+        assert!(error.contains("last build it reported was 1"), "{error}");
+        assert_eq!(clock.now(), ANSWER_WITHIN);
+    }
+
+    #[test]
+    fn slow_asks_do_not_stretch_the_wait_for_the_build() {
+        // An ask that gets no answer takes its whole timeout.
+        let mut clock = FakeClock::new();
+        let now = Rc::clone(&clock.now);
+        let result = wait_for_qberrypi(
+            &mut || {
+                now.set(now.get() + 2 * SECOND);
+                None
+            },
+            7,
+            &mut clock,
+        );
+        assert!(result.is_err());
+        assert!(clock.now() >= ANSWER_WITHIN, "{:?}", clock.now());
+        assert!(
+            clock.now() <= ANSWER_WITHIN + 2 * (2 * SECOND + ASK_EVERY),
+            "{:?}",
+            clock.now()
+        );
+    }
+
+    #[test]
+    fn the_way_back_names_the_tool_and_the_power_cord() {
+        assert!(WAY_BACK.contains("pull the Pi's power cord (safe for qberrypi)"));
+        assert!(WAY_BACK.contains("cargo xtask return-to-pios --boot"));
+        assert!(!WAY_BACK.contains("config.pios.txt over"));
+        assert!(RECOVERY.contains("switch the Pi off and on"));
     }
 
     // ---------------------------------------------------------------- back from qberrypi
@@ -2981,6 +4253,71 @@ mod tests {
         }
     }
 
+    // ---------------------------------------------------------------- secrets in the log
+
+    /// What the key derived from the example's passphrase and network name is, in lower-case hex.
+    fn example_key() -> String {
+        let pmk = Pmk::from_passphrase("example-passphrase", b"example-network").unwrap();
+        pmk.expose()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect()
+    }
+
+    #[test]
+    fn a_log_with_the_passphrase_or_the_key_is_refused() {
+        let key = example_key();
+        assert_eq!(key.len(), 64);
+        let secrets = secrets_of(EXAMPLE).unwrap();
+        assert_eq!(secrets, ["example-passphrase", key.as_str()]);
+
+        // The key is found in either case; the passphrase as it is.
+        for leaked in ["example-passphrase", &key, &key.to_uppercase()] {
+            let log = format!("{LOG}wifi: joined with {leaked}\n");
+            let error = check_log_has_no_secret(&log, &secrets).unwrap_err();
+            for shown in [
+                error.to_string(),
+                format!("{error:#}"),
+                format!("{error:?}"),
+            ] {
+                assert!(!shown.contains("example-passphrase"), "{shown}");
+                assert!(!shown.to_lowercase().contains(&key), "{shown}");
+            }
+        }
+        check_log_has_no_secret(LOG, &secrets).unwrap();
+
+        // A key in place of the passphrase is the whole list, in lower case.
+        let upper = "AB12CD34".repeat(8);
+        let text = EXAMPLE.replace(
+            "passphrase = \"example-passphrase\"",
+            &format!("pmk = \"{upper}\""),
+        );
+        assert_eq!(secrets_of(&text).unwrap(), [upper.to_lowercase()]);
+        let log = format!("{LOG}pmk {upper}\n");
+        assert!(check_log_has_no_secret(&log, &[upper.to_lowercase()]).is_err());
+    }
+
+    #[test]
+    fn the_key_to_look_for_is_the_one_the_ieee_standard_derives() {
+        // IEEE Std 802.11i-2004, Annex H.4.1: the passphrase "password" on the network "IEEE".
+        let text = EXAMPLE
+            .replace("example-passphrase", "password")
+            .replace("example-network", "IEEE");
+        assert_eq!(
+            secrets_of(&text).unwrap(),
+            [
+                "password",
+                "f42c6fc52df0ebef9ebb4b90b38a5f902e83fe1b135a70e23aed762e9710a12e"
+            ]
+        );
+    }
+
+    #[test]
+    fn secrets_are_not_listed_for_a_configuration_that_does_not_parse() {
+        let error = secrets_of(&format!("{CANARY} = [")).unwrap_err();
+        assert!(!error.contains(CANARY), "{error}");
+    }
+
     // ---------------------------------------------------------------- deploy and collect, end to end
 
     const STAGE: &str = "/tmp/qberrypi-stage.Ab12Cd";
@@ -3005,6 +4342,15 @@ mod tests {
         /// Answers to "are you there", in order; when they run out, `answering_after`.
         answering: VecDeque<bool>,
         answering_after: bool,
+        /// Answers to a ping, in order (true is a reply); when they run out, `pinging_after`.
+        pings: VecDeque<bool>,
+        pinging_after: bool,
+        /// Whether there is a `ping` program on this machine to start.
+        ping_installed: bool,
+        /// What the status page says is the build that answers, in order (none is no answer);
+        /// when they run out, `builds_after`.
+        builds: VecDeque<Option<u64>>,
+        builds_after: Option<u64>,
         tar: Finished,
         mktemp: Finished,
         scp: Finished,
@@ -3014,6 +4360,9 @@ mod tests {
         log: Option<Vec<u8>>,
         /// The staged checksums and the mode of the folder they were in, as scp found them.
         uploaded_sums: Option<(PathBuf, String, u32)>,
+        /// The staged certificate, the mode of the file and the mode of its folder, as scp found
+        /// them.
+        uploaded_tls: Option<(PathBuf, Vec<u8>, u32, u32)>,
     }
 
     impl FakePi {
@@ -3022,6 +4371,11 @@ mod tests {
                 calls: Vec::new(),
                 answering: VecDeque::from([true, false, false]),
                 answering_after: true,
+                pings: VecDeque::new(),
+                pinging_after: false,
+                ping_installed: true,
+                builds: VecDeque::new(),
+                builds_after: Some(BUILD_EPOCH),
                 tar: finished(0, BOOT_TAR, ""),
                 mktemp: finished(0, format!("{STAGE}\n"), ""),
                 scp: finished(0, "", ""),
@@ -3033,10 +4387,11 @@ mod tests {
                 compared: finished(0, "", ""),
                 log: Some(LOG.as_bytes().to_vec()),
                 uploaded_sums: None,
+                uploaded_tls: None,
             }
         }
 
-        /// The first word of each remote command, or `scp`, in the order they ran.
+        /// The first word of each remote command, or `scp`, `ping` or `stats`, in the order they ran.
         fn summary(&self) -> Vec<String> {
             self.calls
                 .iter()
@@ -3057,6 +4412,14 @@ mod tests {
             self.calls
                 .push((invocation.clone(), stdin.map(<[u8]>::to_vec)));
             let args = words(invocation);
+            if invocation.program == "ping" {
+                if !self.ping_installed {
+                    return Err(io::Error::from(ErrorKind::NotFound));
+                }
+                let replied = self.pings.pop_front().unwrap_or(self.pinging_after);
+                // ping ends with 1 when nothing answered.
+                return Ok(finished(if replied { 0 } else { 1 }, "", ""));
+            }
             if invocation.program == "scp" {
                 let sums = args
                     .iter()
@@ -3067,6 +4430,15 @@ mod tests {
                 let mode = fs::metadata(folder).unwrap().permissions().mode() & 0o7777;
                 let text = fs::read_to_string(&sums).unwrap();
                 self.uploaded_sums = Some((sums, text, mode));
+                if let Some(tls) = args
+                    .iter()
+                    .map(PathBuf::from)
+                    .find(|path| path.ends_with("tls.pem"))
+                {
+                    let bytes = fs::read(&tls).unwrap();
+                    let file_mode = fs::metadata(&tls).unwrap().permissions().mode() & 0o7777;
+                    self.uploaded_tls = Some((tls, bytes, file_mode, mode));
+                }
                 return Ok(self.scp.clone());
             }
             assert_eq!(invocation.program, "ssh");
@@ -3086,12 +4458,25 @@ mod tests {
                 other => panic!("unexpected remote command {other}"),
             })
         }
+
+        fn reported_build(&mut self, address: Ipv4Addr) -> Option<u64> {
+            // Written down with the commands, so that a test sees where in their order it came.
+            let asked = Invocation {
+                program: "stats",
+                args: vec![address.to_string().into()],
+            };
+            self.calls.push((asked, None));
+            self.builds.pop_front().unwrap_or(self.builds_after)
+        }
     }
 
-    const BUILT: [(&str, &[u8]); 3] = [
+    const BUILT: [(&str, &[u8]); 6] = [
         ("kernel8.img", b"KERNEL"),
         ("initramfs8", b"INITRAMFS"),
         ("config.txt", b"os_prefix=qberrypi/\n"),
+        ("ov-README", b"README"),
+        ("ov-overlay_map.dtb", b"OVERLAY_MAP"),
+        ("ov-qb-piscreen.dtbo", b"PISCREEN"),
     ];
 
     fn one_shot_toml() -> String {
@@ -3162,16 +4547,17 @@ mod tests {
         let outcome = run_deploy("pi", false, checkout.path(), &mut pi);
         outcome.result.as_ref().unwrap();
 
+        // Each probe that fails is followed by one ping, and no other is.
         assert_eq!(
             pi.summary(),
             [
-                "tar", "mktemp", "scp", "sudo", "true", "true", "true", "true", "cmp", "test",
-                "cat"
+                "tar", "mktemp", "scp", "sudo", "true", "true", "ping", "true", "ping", "true",
+                "cmp", "test", "cat"
             ]
         );
         // Nothing goes through a local shell.
         for (invocation, _) in &pi.calls {
-            assert!(["ssh", "scp"].contains(&invocation.program));
+            assert!(["ssh", "scp", "ping"].contains(&invocation.program));
         }
         let call = |index: usize| &pi.calls[index];
         assert_eq!(call(0).0, save_boot_partition("pi"));
@@ -3202,16 +4588,20 @@ mod tests {
             String::from_utf8(script_input.clone().unwrap()).unwrap(),
             expected.render()
         );
-        for index in [0, 1, 4, 5, 6, 7, 8, 9, 10] {
+        for index in [0, 1, 4, 5, 6, 7, 8, 9, 10, 11, 12] {
             assert_eq!(call(index).1, None, "call {index} was given input");
         }
-        for index in 4..8 {
+        for index in [4, 5, 7, 9] {
             assert_eq!(call(index).0, probe("pi"));
         }
+        // The Pi of the example configuration is pinged, and only when the probe before failed.
+        for index in [6, 8] {
+            assert_eq!(call(index).0, ping(Ipv4Addr::new(192, 0, 2, 53)));
+        }
         // Once it answers again: is it back on its own configuration? Then the log.
-        assert_eq!(call(8).0, compare_configs("pi"));
-        assert_eq!(call(9).0, log_exists("pi"));
-        assert_eq!(call(10).0, fetch_log("pi"));
+        assert_eq!(call(10).0, compare_configs("pi"));
+        assert_eq!(call(11).0, log_exists("pi"));
+        assert_eq!(call(12).0, fetch_log("pi"));
 
         // The staged checksums: the build's and a line for the configuration, built in a
         // private folder outside the checkout that is gone afterwards.
@@ -3232,6 +4622,202 @@ mod tests {
         assert!(outcome.said.contains(LOG));
     }
 
+    /// A password line of the shape the configuration reads. Nobody's password hashes to it.
+    const PASSWORD_LINE: &str = "password_hash = \"$pbkdf2-sha256$i=100000$00000000000000000000000000000000$0000000000000000000000000000000000000000000000000000000000000000\"";
+
+    fn api_toml() -> String {
+        format!("{}\n[api]\n{PASSWORD_LINE}\n", one_shot_toml())
+    }
+
+    /// A made certificate, for a Pi at the address of the example configuration.
+    fn made_certificate() -> String {
+        crate::cert::make("qberrypi", Ipv4Addr::new(192, 0, 2, 53), 1_800_000_000).unwrap()
+    }
+
+    /// The base64 lines of the key in a certificate file: what no output may show.
+    fn key_lines(pem: &str) -> Vec<String> {
+        pem.split("-----BEGIN CERTIFICATE-----")
+            .next()
+            .unwrap()
+            .lines()
+            .filter(|line| !line.starts_with("-----"))
+            .map(str::to_owned)
+            .collect()
+    }
+
+    /// The checkout with an `[api]` section in its configuration and `qberrypi-tls.pem` made.
+    fn api_checkout() -> (TempDir, String) {
+        let checkout = checkout();
+        fs::write(checkout.path().join("qberrypi.toml"), api_toml()).unwrap();
+        let pem = made_certificate();
+        fs::write(checkout.path().join("qberrypi-tls.pem"), &pem).unwrap();
+        (checkout, pem)
+    }
+
+    #[test]
+    fn an_api_configuration_stages_the_certificate_and_none_does_not() {
+        let (checkout, pem) = api_checkout();
+        let root = fs::canonicalize(checkout.path()).unwrap();
+        let mut pi = FakePi::new();
+        let outcome = run_deploy("pi", false, checkout.path(), &mut pi);
+        outcome.result.as_ref().unwrap();
+
+        // The upload lists a file named tls.pem, beside the staged checksums in the private
+        // scratch folder, whose bytes are those of qberrypi-tls.pem and that only this user reads.
+        let (tls_path, tls_bytes, file_mode, folder_mode) = pi.uploaded_tls.clone().unwrap();
+        let (sums_path, sums_text, _) = pi.uploaded_sums.clone().unwrap();
+        assert_eq!(tls_bytes, pem.as_bytes());
+        assert_eq!(tls_path.file_name().unwrap(), "tls.pem");
+        assert_eq!(tls_path.parent(), sums_path.parent());
+        assert_eq!((file_mode, folder_mode), (0o600, 0o700));
+        assert!(tls_path.is_absolute() && !tls_path.starts_with(&root));
+        let mut files: Vec<PathBuf> = BUILT
+            .iter()
+            .map(|(name, _)| root.join("out/qberrypi").join(name))
+            .collect();
+        files.extend([sums_path, root.join("qberrypi.toml"), tls_path.clone()]);
+        let scp = pi
+            .calls
+            .iter()
+            .find(|(call, _)| call.program == "scp")
+            .unwrap();
+        assert_eq!(scp.0, upload("pi", &files, STAGE));
+        // The stage is gone with the deploy, key and all.
+        assert!(!tls_path.exists());
+
+        // The staged checksums have a line for it, after the configuration's.
+        let added = sha256sums(&[
+            ("qberrypi.toml", api_toml().as_bytes()),
+            ("tls.pem", pem.as_bytes()),
+        ]);
+        assert_eq!(sums_text, format!("{}{added}", sha256sums(&BUILT)));
+
+        // The pin is said before anything is installed.
+        let pin =
+            qberrypi::api::tls::pin_text(&qberrypi::api::tls::leaf_sha256(pem.as_bytes()).unwrap());
+        assert_eq!(pin.len(), 95);
+        let pin_line = format!("deploy: pi: the API's certificate pin (SHA-256): {pin}\n");
+        let at = outcome.said.find(&pin_line).unwrap_or_else(|| {
+            panic!("no pin line in:\n{}", outcome.said);
+        });
+        assert!(at < outcome.said.find("deploy: pi: installing").unwrap());
+        // The build's files, the checksums, the configuration and the certificate.
+        let copying = format!("deploy: pi: copying {} files", BUILT.len() + 3);
+        assert!(outcome.said.contains(&copying), "{}", outcome.said);
+        assert_eq!(outcome.said.matches("certificate pin").count(), 1);
+
+        // The key is shown nowhere: not in what was printed, not in a command, not in an error.
+        let shown = everything_shown(&outcome, &pi);
+        assert!(!shown.contains("PRIVATE"), "{shown}");
+        for line in key_lines(&pem) {
+            assert!(!shown.contains(&line), "{shown}");
+        }
+        // Nor in out/, and the checkout's own file is as it was.
+        for entry in fs::read_dir(root.join("out/qberrypi")).unwrap() {
+            let name = entry.unwrap().file_name();
+            assert!(name != "tls.pem" && name != "qberrypi-tls.pem", "{name:?}");
+        }
+        assert_eq!(
+            fs::read_to_string(root.join("qberrypi-tls.pem")).unwrap(),
+            pem
+        );
+    }
+
+    #[test]
+    fn a_configuration_without_an_api_stages_no_certificate_and_prints_no_pin() {
+        // Even with a certificate file in the checkout.
+        let checkout = checkout();
+        fs::write(checkout.path().join("qberrypi-tls.pem"), made_certificate()).unwrap();
+        let mut pi = FakePi::new();
+        let outcome = run_deploy("pi", false, checkout.path(), &mut pi);
+        outcome.result.as_ref().unwrap();
+        assert!(pi.uploaded_tls.is_none());
+        let (_, sums_text, _) = pi.uploaded_sums.clone().unwrap();
+        assert!(!sums_text.contains("tls.pem"), "{sums_text}");
+        // The build's lines and the configuration's, and no more.
+        assert_eq!(sums_text.lines().count(), BUILT.len() + 1);
+        assert!(
+            !outcome.said.contains("certificate pin"),
+            "{}",
+            outcome.said
+        );
+        let copying = format!("deploy: pi: copying {} files", BUILT.len() + 2);
+        assert!(outcome.said.contains(&copying), "{}", outcome.said);
+    }
+
+    #[test]
+    fn an_api_without_a_certificate_file_stops_before_anything_runs_on_the_pi() {
+        let checkout = checkout();
+        fs::write(checkout.path().join("qberrypi.toml"), api_toml()).unwrap();
+        let mut pi = FakePi::new();
+        let outcome = run_deploy("pi", false, checkout.path(), &mut pi);
+        assert_eq!(
+            outcome.error(),
+            "qberrypi.toml has [api] but there is no qberrypi-tls.pem: run cargo xtask make-cert"
+        );
+        assert!(pi.calls.is_empty());
+        assert!(
+            !outcome.said.contains("certificate pin"),
+            "{}",
+            outcome.said
+        );
+    }
+
+    #[test]
+    fn a_certificate_file_the_api_cannot_serve_stops_the_deploy_with_the_reason_and_not_the_file() {
+        let (cert_only, key_only) = {
+            let pem = made_certificate();
+            let at = pem.find("-----BEGIN CERTIFICATE-----").unwrap();
+            (pem[at..].to_owned(), pem[..at].to_owned())
+        };
+        let other = made_certificate();
+        let mismatched = format!(
+            "{}{}",
+            &other[..other.find("-----BEGIN CERTIFICATE-----").unwrap()],
+            cert_only
+        );
+        let too_big = format!("{}{}", made_certificate(), "#".repeat(16 * 1024));
+        for (case, file, reason) in [
+            ("no key", cert_only.clone(), "no private key"),
+            ("no certificate", key_only.clone(), "no certificate"),
+            ("another's key", mismatched, "does not fit"),
+            ("not a PEM", "garbage".to_owned(), "no certificate"),
+            ("too big", too_big, "larger than 16384 bytes"),
+        ] {
+            let checkout = checkout();
+            fs::write(checkout.path().join("qberrypi.toml"), api_toml()).unwrap();
+            fs::write(checkout.path().join("qberrypi-tls.pem"), &file).unwrap();
+            let mut pi = FakePi::new();
+            let outcome = run_deploy("pi", false, checkout.path(), &mut pi);
+            let error = outcome.error();
+            assert!(error.contains("qberrypi-tls.pem"), "{case}: {error}");
+            assert!(error.contains(reason), "{case}: {error}");
+            assert!(pi.calls.is_empty(), "{case}");
+            assert!(pi.uploaded_tls.is_none(), "{case}");
+            let shown = everything_shown(&outcome, &pi);
+            assert!(
+                !shown.contains("PRIVATE") && !shown.contains("BEGIN"),
+                "{case}: {shown}"
+            );
+            for line in key_lines(&file) {
+                assert!(!shown.contains(&line), "{case}: {shown}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_certificate_the_stage_could_not_take_is_removed_with_the_stage_however_the_deploy_ends() {
+        let (checkout, _) = api_checkout();
+        let mut pi = FakePi::new();
+        pi.script = finished(7, "", "qberrypi-deploy: stopped: wrong board");
+        let outcome = run_deploy("pi", false, checkout.path(), &mut pi);
+        assert!(outcome.result.is_err());
+        let (tls_path, ..) = pi.uploaded_tls.clone().unwrap();
+        // The scratch folder with the key in it is gone, and so is the stage on the Pi.
+        assert!(!tls_path.exists());
+        assert!(pi.ran("rm"));
+    }
+
     #[test]
     fn a_deploy_says_each_step_before_it_takes_it() {
         let checkout = checkout();
@@ -3242,7 +4828,7 @@ mod tests {
         for step in [
             "deploy: pi: saving its boot partition",
             "deploy: pi: making a stage directory",
-            "deploy: pi: copying 5 files",
+            "deploy: pi: copying 8 files",
             "deploy: pi: installing",
             "qberrypi-deploy: copying",
             "deploy: pi: waiting",
@@ -3267,6 +4853,11 @@ mod tests {
         let shown = everything_shown(&outcome, &pi);
         assert!(!shown.contains(CANARY));
         assert!(!shown.contains("canary-firstboot-secret"));
+        // Nor the key derived from it, in the tally or in any command.
+        for secret in secrets_of(&one_shot_toml()).unwrap() {
+            assert!(!shown.contains(&secret));
+            assert!(!shown.to_lowercase().contains(&secret));
+        }
     }
 
     #[test]
@@ -3315,7 +4906,7 @@ mod tests {
     #[test]
     fn nothing_runs_when_a_local_check_fails() {
         type Spoil = fn(&Path);
-        let cases: [(&str, &str, bool, Spoil, &str); 8] = [
+        let cases: [(&str, &str, bool, Spoil, &str); 9] = [
             (
                 "a host that is an option",
                 "-oProxyCommand=x",
@@ -3333,6 +4924,13 @@ mod tests {
                     fs::write(root.join("qberrypi.toml"), text).unwrap();
                 },
                 "--permanent",
+            ),
+            (
+                "a one-shot configuration deployed for good",
+                "pi",
+                true,
+                |_| {},
+                "debug.one_shot",
             ),
             (
                 "a configuration that does not parse",
@@ -3490,30 +5088,156 @@ mod tests {
         assert!(!pi.ran("true") && !pi.ran("cat"));
     }
 
-    #[test]
-    fn a_permanent_deploy_does_not_wait_for_the_pi() {
+    /// A checkout whose `qberrypi.toml` is one that may be deployed for good.
+    fn permanent_checkout() -> TempDir {
         let checkout = checkout();
         let text = one_shot_toml().replace("one_shot = true", "one_shot = false");
         fs::write(checkout.path().join("qberrypi.toml"), text).unwrap();
+        checkout
+    }
+
+    #[test]
+    fn a_permanent_deploy_waits_for_the_pi_to_go_and_then_for_the_build() {
+        let checkout = permanent_checkout();
         let mut pi = FakePi::new();
+        // Nothing, nothing, another build, this build.
+        pi.builds = VecDeque::from([None, None, Some(BUILD_EPOCH - 1), Some(BUILD_EPOCH)]);
         let outcome = run_deploy("pi", true, checkout.path(), &mut pi);
         outcome.result.as_ref().unwrap();
-        assert_eq!(pi.summary(), ["tar", "mktemp", "scp", "sudo"]);
+        // SSH goes away first (the default Pi answers once and then not), then the status page is asked.
+        assert_eq!(
+            pi.summary(),
+            [
+                "tar", "mktemp", "scp", "sudo", "true", "true", "stats", "stats", "stats", "stats"
+            ]
+        );
+        // The Pi of the example configuration, asked each time.
+        for (call, _) in &pi.calls[6..] {
+            assert_eq!(call.args, [OsString::from("192.0.2.53")]);
+        }
+        // 5 s for SSH to go, then 3 asks that were not answered, 2 s apart.
+        let success = format!(
+            "deploy: pi: qberrypi build {BUILD_EPOCH} answers at 192.0.2.53 11 s after the restart; \
+             to return to Raspberry Pi OS later: {WAY_BACK}"
+        );
+        assert!(outcome.said.contains(&success), "{}", outcome.said);
+        // No log is collected and no comparison is made: qberrypi stays and Raspberry Pi OS is not back.
+        assert!(!pi.ran("cmp") && !pi.ran("test") && !pi.ran("cat"));
+        // The old advice is gone.
         assert!(
-            outcome.said.contains("config.pios.txt over config.txt"),
+            !outcome.said.contains("another computer"),
             "{}",
             outcome.said
         );
     }
 
     #[test]
-    fn a_one_shot_configuration_deployed_with_permanent_still_waits() {
-        let checkout = checkout();
+    fn a_permanent_deploy_does_not_ask_for_the_build_before_ssh_has_gone() {
+        let checkout = permanent_checkout();
         let mut pi = FakePi::new();
+        // SSH answers four times, then goes; the build answers from the start.
+        pi.answering = VecDeque::from([true, true, true, true, false]);
         run_deploy("pi", true, checkout.path(), &mut pi)
             .result
             .unwrap();
-        assert!(pi.ran("true") && pi.ran("cat"));
+        assert_eq!(
+            pi.summary(),
+            [
+                "tar", "mktemp", "scp", "sudo", "true", "true", "true", "true", "true", "stats"
+            ]
+        );
+    }
+
+    #[test]
+    fn a_pi_that_never_stops_answering_ssh_is_noted_and_the_build_is_still_waited_for() {
+        let checkout = permanent_checkout();
+        let mut pi = FakePi::new();
+        pi.answering = VecDeque::new(); // ssh answers for ever
+        pi.builds = VecDeque::from([None, Some(BUILD_EPOCH)]);
+        let outcome = run_deploy("pi", true, checkout.path(), &mut pi);
+        outcome.result.as_ref().unwrap();
+        assert!(
+            outcome.said.contains("never stopped answering"),
+            "{}",
+            outcome.said
+        );
+        assert!(outcome.said.contains("qberrypi build"), "{}", outcome.said);
+        assert_eq!(
+            pi.summary().iter().filter(|word| *word == "stats").count(),
+            2
+        );
+        // Asked every 5 s for 30 s, and it is no error that the Pi was never seen to go.
+        assert_eq!(
+            pi.summary().iter().filter(|word| *word == "true").count(),
+            7
+        );
+    }
+
+    #[test]
+    fn a_permanent_build_that_never_answers_fails_the_deploy_with_the_way_back() {
+        let checkout = permanent_checkout();
+        let mut pi = FakePi::new();
+        pi.builds_after = None;
+        let outcome = run_deploy("pi", true, checkout.path(), &mut pi);
+        let error = outcome.error();
+        assert!(error.contains("pi"), "{error}");
+        assert!(error.contains("return-to-pios"), "{error}");
+        assert!(error.contains("power cord"), "{error}");
+        assert!(error.contains("180 s"), "{error}");
+        assert!(!error.contains("another computer"), "{error}");
+        assert!(!outcome.said.contains("answers at"), "{}", outcome.said);
+        assert!(!pi.ran("cmp") && !pi.ran("test") && !pi.ran("cat"));
+    }
+
+    #[test]
+    fn a_permanent_deploy_names_the_pi_that_answers_not_the_host_alias() {
+        let checkout = permanent_checkout();
+        let text = fs::read_to_string(checkout.path().join("qberrypi.toml"))
+            .unwrap()
+            .replace("192.0.2.53", "192.0.2.77");
+        fs::write(checkout.path().join("qberrypi.toml"), text).unwrap();
+        let mut pi = FakePi::new();
+        let outcome = run_deploy("pi", true, checkout.path(), &mut pi);
+        outcome.result.as_ref().unwrap();
+        let (asked, _) = pi
+            .calls
+            .iter()
+            .find(|(call, _)| call.program == "stats")
+            .unwrap();
+        assert_eq!(asked.args, [OsString::from("192.0.2.77")]);
+        assert!(
+            outcome.said.contains("answers at 192.0.2.77"),
+            "{}",
+            outcome.said
+        );
+    }
+
+    #[test]
+    fn a_one_shot_configuration_deployed_with_permanent_is_refused_before_anything_runs() {
+        let checkout = checkout(); // debug.one_shot is on
+        let mut pi = FakePi::new();
+        let outcome = run_deploy("pi", true, checkout.path(), &mut pi);
+        let error = outcome.error();
+        assert!(error.contains("debug.one_shot"), "{error}");
+        assert!(error.ends_with("; nothing was copied"), "{error}");
+        // Nothing was copied and nothing ran on the Pi, not even the save of its boot partition.
+        assert!(pi.calls.is_empty(), "{:?}", pi.summary());
+        assert!(!checkout.path().join("vendor-cache").exists());
+    }
+
+    #[test]
+    fn a_permanent_deploy_does_not_wait_for_a_pi_that_could_not_be_installed_on() {
+        let checkout = permanent_checkout();
+        let mut pi = FakePi::new();
+        pi.script = finished(
+            UPGRADING,
+            "",
+            "qberrypi-deploy: stopped: Raspberry Pi OS is installing updates (dpkg is running); try again when it has finished. Nothing was changed\n",
+        );
+        let outcome = run_deploy("pi", true, checkout.path(), &mut pi);
+        assert!(outcome.error().contains("status 11"), "{}", outcome.error());
+        assert!(outcome.said.contains("try again when it has finished"));
+        assert_eq!(pi.summary(), ["tar", "mktemp", "scp", "sudo", "rm"]);
     }
 
     #[test]
@@ -3535,6 +5259,23 @@ mod tests {
     }
 
     #[test]
+    fn the_deploy_says_how_long_it_waits_for_the_return_of_a_configured_run() {
+        let checkout = checkout();
+        let text = one_shot_toml().replace("return_after_secs = 0", "return_after_secs = 400");
+        fs::write(checkout.path().join("qberrypi.toml"), text).unwrap();
+        let mut pi = FakePi::new();
+        let outcome = run_deploy("pi", false, checkout.path(), &mut pi);
+        outcome.result.as_ref().unwrap();
+        assert!(
+            outcome.said.contains(
+                "waiting up to 30 s for it to go down and then up to 580 s for it to answer again"
+            ),
+            "{}",
+            outcome.said
+        );
+    }
+
+    #[test]
     fn a_pi_that_never_stops_answering_is_noted_and_its_log_collected() {
         let checkout = checkout();
         let mut pi = FakePi::new();
@@ -3543,6 +5284,15 @@ mod tests {
         outcome.result.as_ref().unwrap();
         assert!(
             outcome.said.contains("never stopped answering"),
+            "{}",
+            outcome.said
+        );
+        // Nothing was pinged, and that is no error: a Pi that never left is not one that was lost.
+        assert!(!pi.ran("ping"));
+        assert!(
+            outcome
+                .said
+                .contains("answered 0 of 0 pings while the Pi was away"),
             "{}",
             outcome.said
         );
@@ -3557,9 +5307,150 @@ mod tests {
         let outcome = run_deploy("pi", false, checkout.path(), &mut pi);
         let error = outcome.error();
         assert!(error.contains("pi"), "{error}");
-        assert!(error.contains("another computer"), "{error}");
-        assert!(error.contains("config.pios.txt over config.txt"), "{error}");
+        assert!(error.contains("return-to-pios"), "{error}");
+        assert!(error.contains("power cord"), "{error}");
+        assert!(!error.contains("another computer"), "{error}");
         assert!(!pi.ran("test") && !pi.ran("cat"));
+    }
+
+    // ---------------------------------------------------------------- pings while the Pi is away
+
+    #[test]
+    fn the_pi_is_pinged_only_while_it_does_not_answer_ssh() {
+        let checkout = checkout();
+        let mut pi = FakePi::new();
+        pi.answering = VecDeque::from([true, false, false, false, true]);
+        pi.pings = VecDeque::from([true, false, true]);
+        let outcome = run_deploy("pi", false, checkout.path(), &mut pi);
+        outcome.result.as_ref().unwrap();
+
+        // Each of the three failed probes is followed by one ping, and nothing else is pinged.
+        assert_eq!(
+            pi.summary()[4..12],
+            [
+                "true", "true", "ping", "true", "ping", "true", "ping", "true"
+            ]
+        );
+        for (invocation, input) in pi.calls.iter().filter(|(call, _)| call.program == "ping") {
+            assert_eq!(invocation, &ping(Ipv4Addr::new(192, 0, 2, 53)));
+            assert_eq!(input, &None);
+        }
+        // Said once the wait is over, before the check of config.txt.
+        let tally = "deploy: pi: 192.0.2.53 answered 2 of 3 pings while the Pi was away";
+        let said = &outcome.said;
+        let at = said
+            .find(tally)
+            .unwrap_or_else(|| panic!("no tally in:\n{said}"));
+        assert!(said.find("it is back").unwrap() < at);
+        assert!(at < said.find("checking that config.txt").unwrap());
+        assert_eq!(said.matches("pings while the Pi was away").count(), 1);
+    }
+
+    #[test]
+    fn the_pi_pinged_is_the_one_at_net_address() {
+        let checkout = checkout();
+        let text = one_shot_toml().replace("192.0.2.53/24", "192.0.2.77/24");
+        fs::write(checkout.path().join("qberrypi.toml"), text).unwrap();
+        let mut pi = FakePi::new();
+        pi.pings = VecDeque::from([true, true]);
+        let outcome = run_deploy("pi", false, checkout.path(), &mut pi);
+        outcome.result.as_ref().unwrap();
+        assert!(pi.ran("ping"));
+        for (invocation, _) in pi.calls.iter().filter(|(call, _)| call.program == "ping") {
+            assert_eq!(invocation, &ping(Ipv4Addr::new(192, 0, 2, 77)));
+        }
+        assert!(
+            outcome
+                .said
+                .contains("deploy: pi: 192.0.2.77 answered 2 of 2 pings"),
+            "{}",
+            outcome.said
+        );
+    }
+
+    #[test]
+    fn a_ping_that_is_not_answered_or_cannot_be_run_is_no_failure_of_the_deploy() {
+        for installed in [true, false] {
+            let checkout = checkout();
+            let mut pi = FakePi::new();
+            pi.ping_installed = installed;
+            let outcome = run_deploy("pi", false, checkout.path(), &mut pi);
+            outcome.result.as_ref().unwrap();
+            // Two probes failed, so two pings were sent; neither was answered.
+            assert!(
+                outcome
+                    .said
+                    .contains("answered 0 of 2 pings while the Pi was away"),
+                "{installed}: {}",
+                outcome.said
+            );
+            assert!(pi.ran("cat"));
+        }
+    }
+
+    #[test]
+    fn a_ping_that_cannot_be_started_is_said_once_and_still_counts_as_sent() {
+        let without_ping = checkout();
+        let mut pi = FakePi::new();
+        pi.ping_installed = false;
+        pi.answering = VecDeque::from([true, false, false, false, true]);
+        let outcome = run_deploy("pi", false, without_ping.path(), &mut pi);
+        outcome.result.as_ref().unwrap();
+
+        // Three pings were tried, and the reason is given once, not once for each.
+        let cause = io::Error::from(ErrorKind::NotFound);
+        let said = format!("deploy: pi: ping could not be run: {cause}\n");
+        assert_eq!(outcome.said.matches(&said).count(), 1, "{}", outcome.said);
+        assert_eq!(outcome.said.matches("could not be run").count(), 1);
+        assert!(
+            outcome
+                .said
+                .contains("answered 0 of 3 pings while the Pi was away"),
+            "{}",
+            outcome.said
+        );
+        // Said when it first happened: before the Pi is back, not with the tally.
+        assert!(outcome.said.find(&said).unwrap() < outcome.said.find("it is back").unwrap());
+
+        // A ping that did start, and was not answered, says nothing of the kind.
+        let checkout = checkout();
+        let mut pi = FakePi::new();
+        let outcome = run_deploy("pi", false, checkout.path(), &mut pi);
+        outcome.result.as_ref().unwrap();
+        assert!(
+            !outcome.said.contains("could not be run"),
+            "{}",
+            outcome.said
+        );
+    }
+
+    #[test]
+    fn the_pings_are_tallied_even_when_the_pi_does_not_come_back() {
+        let checkout = checkout();
+        let mut pi = FakePi::new();
+        pi.answering_after = false;
+        pi.pings = VecDeque::from([true, true]);
+        let outcome = run_deploy("pi", false, checkout.path(), &mut pi);
+
+        let error = outcome.error();
+        assert!(error.contains("pi did not come back"), "{error}");
+        assert!(error.contains("return-to-pios"), "{error}");
+        let sent = pi
+            .calls
+            .iter()
+            .filter(|(call, _)| call.program == "ping")
+            .count();
+        assert!(sent > 2, "{sent}");
+        let tally =
+            format!("deploy: pi: 192.0.2.53 answered 2 of {sent} pings while the Pi was away");
+        assert!(outcome.said.contains(&tally), "{}", outcome.said);
+        assert_eq!(
+            outcome.said.matches("pings while the Pi was away").count(),
+            1
+        );
+        // Nothing went on from the wait.
+        assert!(!pi.ran("cmp") && !pi.ran("test") && !pi.ran("cat"));
+        assert!(!outcome.said.contains("it is back"), "{}", outcome.said);
     }
 
     #[test]
@@ -3618,6 +5509,95 @@ mod tests {
     }
 
     #[test]
+    fn a_log_that_holds_the_passphrase_or_the_key_fails_the_deploy_and_says_which_file_to_delete() {
+        let secrets = secrets_of(&one_shot_toml()).unwrap();
+        assert_eq!(secrets.len(), 2);
+        let leaks = [
+            secrets[0].clone(),
+            secrets[1].clone(),
+            secrets[1].to_uppercase(),
+        ];
+        for leaked in leaks {
+            let checkout = checkout();
+            let saved = fs::canonicalize(checkout.path())
+                .unwrap()
+                .join("out/logs/1700000000.log");
+            let mut pi = FakePi::new();
+            pi.log = Some(format!("{LOG}wifi: joined with {leaked}\n").into_bytes());
+            let outcome = run_deploy("pi", false, checkout.path(), &mut pi);
+            let error = outcome.error();
+            assert!(
+                error.contains(&format!("delete {} and report this", saved.display())),
+                "{error}"
+            );
+            assert!(error.contains("Wi-Fi passphrase or key"), "{error}");
+            let debug = format!("{:?}", outcome.result.as_ref().unwrap_err());
+            for secret in &secrets {
+                assert!(!error.contains(secret), "{error}");
+                assert!(!debug.contains(secret), "{debug}");
+            }
+            // Nothing of the log reaches the output, and nothing deploy shows holds a secret.
+            assert!(!outcome.said.contains("==== boot"), "{}", outcome.said);
+            let shown = everything_shown(&outcome, &pi).to_lowercase();
+            for secret in &secrets {
+                assert!(!shown.contains(&secret.to_lowercase()), "{shown}");
+            }
+            // The file is there, with the log in it, for the owner to delete.
+            assert!(fs::read_to_string(&saved).unwrap().contains(&leaked));
+            let mode = fs::metadata(&saved).unwrap().permissions().mode() & 0o7777;
+            assert_eq!(mode, 0o600);
+        }
+    }
+
+    #[test]
+    fn a_log_of_an_older_build_that_holds_a_secret_is_refused_as_that_and_not_shown() {
+        let secrets = secrets_of(&one_shot_toml()).unwrap();
+        let checkout = checkout();
+        let saved = fs::canonicalize(checkout.path())
+            .unwrap()
+            .join("out/logs/1700000000.log");
+        let mut pi = FakePi::new();
+        let old = format!("==== boot, build 1600000000 ====\n{CANARY}\n");
+        pi.log = Some(old.into_bytes());
+        let outcome = run_deploy("pi", false, checkout.path(), &mut pi);
+        let error = outcome.error();
+
+        // The refusal comes first, with the file to delete; the build is said too.
+        assert!(error.contains("Wi-Fi passphrase or key"), "{error}");
+        assert!(
+            error.contains(&format!("delete {} and report this", saved.display())),
+            "{error}"
+        );
+        assert!(error.contains("1600000000"), "{error}");
+        // Nothing was shown, so nothing is above.
+        assert!(!error.contains("above"), "{error}");
+        assert!(!outcome.said.contains("==== boot"), "{}", outcome.said);
+        let shown = everything_shown(&outcome, &pi);
+        assert!(!shown.contains(CANARY));
+        for secret in &secrets {
+            assert!(!shown.to_lowercase().contains(&secret.to_lowercase()));
+        }
+        assert!(fs::read_to_string(&saved).unwrap().contains(CANARY));
+    }
+
+    #[test]
+    fn the_error_for_a_log_of_an_older_build_does_not_point_above() {
+        let checkout = checkout();
+        let mut pi = FakePi::new();
+        let old = "==== boot, build 1600000000 ====\nan earlier run\n";
+        pi.log = Some(old.as_bytes().to_vec());
+        let outcome = run_deploy("pi", false, checkout.path(), &mut pi);
+        // The log is shown, and the error follows it.
+        assert!(outcome.said.contains(old), "{}", outcome.said);
+        assert!(
+            outcome.error().contains("earlier run"),
+            "{}",
+            outcome.error()
+        );
+        assert!(!outcome.error().contains("above"), "{}", outcome.error());
+    }
+
+    #[test]
     fn a_log_without_a_boot_header_fails_the_deploy() {
         let checkout = checkout();
         let mut pi = FakePi::new();
@@ -3653,6 +5633,83 @@ mod tests {
         assert_eq!(pi.summary(), ["test", "cat"]);
         assert_eq!(pi.calls[0], (log_exists("pi"), None));
         assert_eq!(pi.calls[1], (fetch_log("pi"), None));
+    }
+
+    /// The error, causes included, and everything collect showed or ran.
+    fn collect_shown(result: &Result<PathBuf>, said: &str, pi: &FakePi) -> String {
+        let mut shown = said.to_owned();
+        if let Err(error) = result {
+            shown.push_str(&format!("{error:#} {error:?}"));
+        }
+        for (invocation, _) in &pi.calls {
+            shown.push_str(&format!("{invocation:?}"));
+        }
+        shown
+    }
+
+    #[test]
+    fn collect_shows_no_log_that_holds_the_passphrase_or_the_key() {
+        let secrets = secrets_of(&one_shot_toml()).unwrap();
+        let leaks = [
+            secrets[0].clone(),
+            secrets[1].clone(),
+            secrets[1].to_uppercase(),
+        ];
+        for leaked in leaks {
+            let checkout = checkout();
+            let saved = checkout.path().join("out/logs/1700000000.log");
+            let mut pi = FakePi::new();
+            pi.log = Some(format!("{LOG}wifi: joined with {leaked}\n").into_bytes());
+            let (result, said) = run_collect("pi", checkout.path(), &mut pi);
+
+            let error = format!("{:#}", result.as_ref().unwrap_err());
+            assert!(error.contains("Wi-Fi passphrase or key"), "{error}");
+            assert!(
+                error.contains(&format!("delete {} and report this", saved.display())),
+                "{error}"
+            );
+            // The log is saved for the owner to delete, and none of it is shown.
+            assert!(fs::read_to_string(&saved).unwrap().contains(&leaked));
+            let mode = fs::metadata(&saved).unwrap().permissions().mode() & 0o7777;
+            assert_eq!(mode, 0o600);
+            assert!(!said.contains("==== boot"), "{said}");
+            assert!(!said.contains("collect: wrote"), "{said}");
+            let shown = collect_shown(&result, &said, &pi).to_lowercase();
+            for secret in &secrets {
+                assert!(!shown.contains(&secret.to_lowercase()), "{shown}");
+            }
+        }
+    }
+
+    #[test]
+    fn collect_shows_a_log_that_holds_no_secret_of_the_configuration() {
+        let checkout = checkout();
+        let mut pi = FakePi::new();
+        // Another passphrase than the checkout's is not what collect looks for.
+        pi.log = Some(format!("{LOG}wifi: someone else's passphrase\n").into_bytes());
+        let (result, said) = run_collect("pi", checkout.path(), &mut pi);
+        let path = result.unwrap();
+        assert!(said.contains("someone else's passphrase"), "{said}");
+        assert!(said.contains(&format!("collect: wrote {}", path.display())));
+    }
+
+    #[test]
+    fn collect_without_a_readable_configuration_shows_the_log_as_it_always_did() {
+        let leaking = format!("{LOG}wifi: joined with {CANARY}\n");
+        for text in [None, Some(format!("{CANARY} = [")), Some(String::new())] {
+            let checkout = checkout();
+            let toml = checkout.path().join("qberrypi.toml");
+            match &text {
+                None => fs::remove_file(&toml).unwrap(),
+                Some(text) => fs::write(&toml, text).unwrap(),
+            }
+            let mut pi = FakePi::new();
+            pi.log = Some(leaking.clone().into_bytes());
+            let (result, said) = run_collect("pi", checkout.path(), &mut pi);
+
+            result.unwrap();
+            assert!(said.contains(&leaking), "{text:?}: {said}");
+        }
     }
 
     #[test]

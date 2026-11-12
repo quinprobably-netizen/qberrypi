@@ -13,14 +13,24 @@ pub const MODULE_DIR: &str = "/lib/modules";
 /// The file in the initramfs that holds the module table.
 pub const MODULE_LIST: &str = "/lib/modules/modules.list";
 
-/// The module table for the Wi-Fi chip of the Raspberry Pi 3 B+.
+/// The module table of the image: the modules for the Wi-Fi chip of the
+/// Raspberry Pi 3 B+, then those for the touchscreen on its SPI bus.
 pub const DEFAULT_TABLE: &str = concat!(
     "rfkill\trfkill.ko\t\n",
     "cfg80211\tcfg80211.ko\trfkill\n",
     "brcmutil\tbrcmutil.ko\t\n",
     "brcmfmac\tbrcmfmac.ko\tbrcmutil,cfg80211\n",
     "brcmfmac-cyw\tbrcmfmac-cyw.ko\tbrcmfmac\n",
+    "backlight\tbacklight.ko\t\n",
+    "fbtft\tfbtft.ko\tbacklight\n",
+    "fb_ili9486\tfb_ili9486.ko\tfbtft,backlight\n",
+    "spi-bcm2835\tspi-bcm2835.ko\t\n",
+    "ads7846\tads7846.ko\t\n",
 );
+
+/// The modules the front panel asks `load` for, in this order: the SPI bus
+/// first, then the screen's driver, then the touch controller's.
+pub const PANEL_MODULES: [&str; 3] = ["spi-bcm2835", "fb_ili9486", "ads7846"];
 
 /// One module of the table.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -278,7 +288,12 @@ mod tests {
                 "cfg80211.ko",
                 "brcmutil.ko",
                 "brcmfmac.ko",
-                "brcmfmac-cyw.ko"
+                "brcmfmac-cyw.ko",
+                "backlight.ko",
+                "fbtft.ko",
+                "fb_ili9486.ko",
+                "spi-bcm2835.ko",
+                "ads7846.ko"
             ]
         );
         assert_eq!(ModuleTable::parse("").unwrap().files().count(), 0);
@@ -318,7 +333,18 @@ mod tests {
     #[test]
     fn the_default_table_parses_and_every_module_has_a_load_order() {
         let t = ModuleTable::parse(DEFAULT_TABLE).unwrap();
-        let names = ["rfkill", "cfg80211", "brcmutil", "brcmfmac", "brcmfmac-cyw"];
+        let names = [
+            "rfkill",
+            "cfg80211",
+            "brcmutil",
+            "brcmfmac",
+            "brcmfmac-cyw",
+            "backlight",
+            "fbtft",
+            "fb_ili9486",
+            "spi-bcm2835",
+            "ads7846",
+        ];
         for name in names {
             let order = order(&t, name);
             assert_eq!(order.last().map(String::as_str), Some(name));
@@ -327,6 +353,10 @@ mod tests {
             order(&t, "brcmfmac-cyw"),
             ["brcmutil", "rfkill", "cfg80211", "brcmfmac", "brcmfmac-cyw"]
         );
+        assert_eq!(
+            order(&t, "fb_ili9486"),
+            ["backlight", "fbtft", "fb_ili9486"]
+        );
         // The initramfs gets this text as it is: one line per module, three
         // tab-separated fields each.
         assert_eq!(DEFAULT_TABLE.lines().count(), names.len());
@@ -334,6 +364,29 @@ mod tests {
         for line in DEFAULT_TABLE.lines() {
             assert_eq!(line.split('\t').count(), 3, "{line:?}");
         }
+    }
+
+    #[test]
+    fn the_panel_modules_load_bus_first_and_bring_what_they_need() {
+        let table = ModuleTable::parse(DEFAULT_TABLE).unwrap();
+        let mut files = Vec::new();
+        for name in PANEL_MODULES {
+            let mut insert = |file: &Path, _: &str| {
+                files.push(file.to_str().unwrap().to_owned());
+                Ok(())
+            };
+            load(&table, name, "", &mut insert).unwrap();
+        }
+        assert_eq!(
+            files,
+            [
+                "/lib/modules/spi-bcm2835.ko",
+                "/lib/modules/backlight.ko",
+                "/lib/modules/fbtft.ko",
+                "/lib/modules/fb_ili9486.ko",
+                "/lib/modules/ads7846.ko"
+            ]
+        );
     }
 
     #[test]

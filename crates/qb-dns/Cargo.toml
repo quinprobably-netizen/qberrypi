@@ -1,0 +1,10 @@
+[package]
+name = "qb-dns"
+description = "DNS decisions for qberrypi: blocklists, cache and answers, with no sockets"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+hickory-proto = "0.26"

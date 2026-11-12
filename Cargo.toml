@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/qberrypi", "xtask"]
+members = ["crates/qberrypi", "crates/qb-wpa2", "crates/qb-dns", "crates/qb-panel", "xtask"]
 
 [workspace.package]
 version = "0.1.0"

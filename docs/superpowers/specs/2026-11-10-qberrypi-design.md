@@ -232,6 +232,21 @@ Scope is deliberately narrow: WPA2-PSK, CCMP, no protected management
 frames. That is what the target network uses. Anything else is rejected at
 scan time with a clear log line.
 
+Choosing and keeping an access point, learnt from the target network:
+
+- When the network name is offered on several bands, prefer 5 GHz, then the
+  strongest signal. On 2026-11-10 the stock supplicant roamed to the same
+  router's 2.4 GHz radio and aborted the handshake with "RSNXE mismatch
+  between Beacon/ProbeResp and EAPOL-Key msg 3/4".
+- In message 3, the RSN element must equal the one the access point
+  advertised (the standard's downgrade check); a mismatch aborts. An RSNXE
+  mismatch is logged and tolerated: it protects features qberrypi does not
+  use (SAE hash-to-element and later), and qberrypi advertises none.
+- A failed handshake or a lost association is never final. qberrypi retries
+  for as long as it runs, with backoff capped at 30 seconds, rescanning each
+  time. The stock network manager on the same Pi gave up after one failed
+  handshake and left it off the network until it was power-cycled.
+
 ## Network
 
 Static IPv4 only: one address, one default route, both from the
@@ -255,8 +270,12 @@ Listens on UDP and TCP port 53. For each query:
 4. Otherwise forward to an upstream over UDP, retrying over TCP when the
    answer is truncated, and fall over to the next upstream on timeout.
 
-Also: single-label names and reverse lookups for private address ranges are
-answered locally and never forwarded. Message parsing uses `hickory-proto`.
+Also: address queries (A and AAAA) for single-label names, and reverse
+lookups for private address ranges, are answered locally and never forwarded,
+as Pi-hole's `domain-needed` setting does. Other query types for a
+single-label name are forwarded: a DNSSEC-validating client asks for the DS
+and DNSKEY records of top-level domains such as `com.`, and a local NXDOMAIN
+would make it treat every name as bogus. Message parsing uses `hickory-proto`.
 
 The cache is bounded (10,000 entries, least recently used evicted). Counters
 and the last 50,000 queries are kept in memory for the status page and are
@@ -295,6 +314,79 @@ the local network:
 
 Nothing on this server changes state in version 1.
 
+## Front panel
+
+A 3.5-inch 480 × 320 SPI touchscreen on the GPIO header (ILI9486 display
+controller, XPT2046/ADS7846 resistive touch) shows a status panel. The
+approved design is "Drain", as refined in round 6 of the mockups: black
+ground, one blueberry-blue accent `#4a72ff` with its shades and greys,
+JetBrains Mono, and few, large elements on one grid.
+
+- **Lane:** a row of name tiles along the top, one letter to a tile, running
+  right to left. A name that is let through crosses the screen. The names are
+  the resolver's own: a refused name is always offered, a plain one at most
+  once a second, and when the panel is behind a name is dropped, never waited
+  for. A refused name fits the 15 cells after the gate (host labels are
+  dropped first, then a long site is cut with a `~`); a plain one keeps 20.
+  With nothing on the lane it says `JOINING WI-FI` until the Wi-Fi is joined
+  (and after a drop), `LISTENING` until the day's first query, then
+  `QUIET 47 MIN` (`3 H`, `2 D`) after two minutes without a name.
+- **Gate and melt:** a refused name stops against the gate, turns blue and
+  melts away from it, five tiles a frame. Its drips fall into a funnel of 146
+  dots (bowl, neck and spout) that starts empty, as dim sockets, and fills
+  from the spout's tip, a run in one of three shades to a name. A white drop
+  leaves the spout and the count under it ticks up: 15 to 17 frames, each
+  changing one place.
+- **Left column:** the blocked share (`44%`; `0%` only if nothing was blocked,
+  `<1%` if it rounds to nothing, never above `99%`, `ALL` if everything was),
+  the clock as `10:21` (`--:--` until it is set), and the key, an 80 × 80
+  square: `GATE SHUT` while blocking is on. While paused it is hollow and
+  reads `OPEN 4:37`, the gate refills in blue from the floor as the time runs
+  out, and names on the lists pass the gate outlined.
+- **Alert:** an unacknowledged alert takes the screen right of the gate as a
+  card, white for a high severity and blue for any other (a 40 px title, the
+  subject wrapped once after a dot, `TAP TO DISMISS` on a stub), until tapped.
+
+Behaviour:
+
+- The lane's names live in a small ring in RAM that only the screen reads: a
+  name on it is never logged, and the API and the status page have no way to
+  reach the ring.
+- The panel moves at 8 frames a second while names are moving and writes
+  nothing when the screen is still. The slow figures (share, clock, count,
+  key, refill, lane words, alert) each change in a write of their own. Every
+  write fits about a quarter of the screen's rows: the driver sends one span
+  from the first to the last changed row. A pause, an alert changing and the
+  Wi-Fi joining are the exceptions, one large write each.
+- A tap on the key while blocking is on pauses blocking for 5 minutes. A tap
+  while paused resumes it. Blocking resumes by itself when the time runs out;
+  a pause never outlives a reboot.
+- A tap on an alert's card (its target is the card, 344 × 224) acknowledges
+  that alert and nothing else; the key works as before.
+- The key's touch target is 96 × 108 pixels, larger than its 80 × 80 drawing,
+  because the resistive panel is imprecise. A press must stay inside it and
+  last at least 50 ms to count, so a brushed edge or noise does nothing.
+- Values not known yet (the share and the count before the Wi-Fi is joined,
+  the share before the day's first query, the clock before it is set) show as
+  a dash, never as zero; a zero is shown only when it is true.
+
+The drawing code is a pure crate, `qb-panel`: a scene (`Drain`) and the
+figures (`Stills`) in, an RGB565 frame of 480 × 320 out, repainting only the
+rows that changed, plus a hit test from screen coordinates to a control. It is
+tested against reference renderings of eight states (normal, paused, alert,
+boot, listening, quiet, long and six) and against the rows-per-write budget,
+with simulated traffic.
+The kernel's own drivers drive the hardware: `spi-bcm2835`, `fbtft`,
+`fb_ili9486`, `ads7846` and `backlight` are added to the image, and
+qberrypi's `config.txt` gains `dtparam=spi=on` and
+`dtoverlay=piscreen,speed=16000000,rotate=270`. qberrypi finds the screen by
+its driver name (`fb_ili9486`), never by framebuffer number, because the
+number changes with what else is connected.
+
+The typeface files are JetBrains Mono (SIL Open Font License 1.1), shipped
+with their licence. The owner asked for the JetBrainsMono Nerd Font; its
+letters are the same, and the panel uses no Nerd icons.
+
 ## Configuration
 
 One file, `qberrypi.toml`, on the SD card's FAT partition, editable from any
@@ -303,6 +395,7 @@ ignored by git because it holds the Wi-Fi passphrase.
 
 ```toml
 hostname = "qberrypi"
+timezone = "UTC0"          # a POSIX TZ rule; yours is the last line of your zone's file: tail -n 1 /usr/share/zoneinfo/Europe/Berlin
 
 [wifi]
 ssid = "example-network"
@@ -312,6 +405,7 @@ country = "US"
 [net]
 address = "192.0.2.53/24"
 gateway = "192.0.2.1"
+time_servers = ["time.cloudflare.com", "time.google.com"]
 
 [dns]
 upstreams = ["9.9.9.9", "149.112.112.112"]
@@ -420,7 +514,13 @@ implementation plan.
 | 2 | Resolver | It forwards and caches DNS; the clock is set. |
 | 3 | Blocker | It blocks from the snapshot and refreshes lists over HTTPS. |
 | 4 | Resilience | Status page, watchdog, rejoin and reboot policies; survives pulled power and a restarted access point. |
-| 5 | Pi-hole API subset | Existing Pi-hole clients that only read statistics and toggle blocking work unchanged. Needs its own design. |
+| 5 | Front panel | The touchscreen shows live numbers and its switch pauses and resumes blocking. |
+| 6 | Cutover | qberrypi stays selected across reboots and replaces the Pi-hole install for the whole network. Needs its own short design. |
+| 7 | Pi-hole API subset | Existing Pi-hole clients that only read statistics and toggle blocking work unchanged. Needs its own design. |
+
+The pure crates — `qb-wpa2`, `qb-dns` and `qb-panel` — depend on nothing that
+needs the board, so they are built in parallel ahead of the milestones that
+wire them in.
 
 Milestone 1 carries most of the risk and is attempted first for that reason.
 

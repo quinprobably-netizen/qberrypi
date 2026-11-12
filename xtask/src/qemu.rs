@@ -6,11 +6,14 @@
 //! display, no network and no device of this machine; its console is a pipe
 //! that is captured, and the card image is its only drive.
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::io::{ErrorKind, Read};
+use std::num::NonZeroUsize;
+use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, Mutex, PoisonError, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -18,6 +21,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use sha2::{Digest, Sha256};
 
 use qberrypi::bootpart;
+use qberrypi::config::Fault;
 
 use crate::build::{CMDLINE_TXT, CONFIG_TXT, read_build_epoch};
 use crate::sdimage;
@@ -99,6 +103,12 @@ const JUDGED_BY_THE_CARD: &str = "init has no console in this boot, so nothing i
 const RESET_ON_ARMING: &str = "this boot keeps the watchdog driver, and QEMU's raspi3b resets \
     the machine the moment init arms the watchdog. It stands for a board that would do the \
     same: by then init must have put Raspberry Pi OS's config.txt back";
+
+/// Printed with the scenario that asks the DNS and status servers over loopback.
+const NO_NETWORK: &str = "the guest has no network card, so every upstream is unreachable; this \
+    boot shows the listeners, the block set and the status server on the real kernel, and that a \
+    query that cannot be forwarded is answered SERVFAIL; forwarding, caching and the clock are \
+    tested on the development machine and on the Pi";
 
 /// Printed with the scenario that boots with the shipped command line.
 const SHIPPED_CONSOLE_UNSEEN: &str = "this boot has the kernel arguments of cmdline.txt, and \
@@ -184,6 +194,12 @@ const ACTIVE_CONFIG: &str = "config.txt";
 const PIOS_CONFIG: &str = "config.pios.txt";
 const SYSTEM_CONFIG: &str = "qberrypi/qberrypi.toml";
 const SYSTEM_LOG: &str = "qberrypi/log.txt";
+/// The API's key and certificate, where init reads them. The scenarios that serve the API get one
+/// made for the run, which is never written anywhere but the image.
+const TLS_PEM: &str = "qberrypi/tls.pem";
+/// The password of the API in the scenarios that serve it. It is no secret: the card of a QEMU run
+/// is a throwaway, and the hash has a salt of zeros.
+const API_PASSWORD: &[u8] = b"qemu";
 
 /// The template the scenarios make their `qberrypi.toml` from, under the repository root.
 const EXAMPLE_CONFIG: &str = "qberrypi.example.toml";
@@ -198,6 +214,18 @@ const NO_WATCHDOG: &str = "watchdog: No such file or directory (os error 2)";
 /// expander, which QEMU does not answer for, and the kernel's LED driver
 /// then gives up on both.
 const NO_LED: &str = "activity LED: No such file or directory (os error 2)";
+/// QEMU has no touchscreen, so there is no framebuffer of its driver to find: the front panel
+/// gives up waiting for it and init goes on without it. A scenario that ends before the panel
+/// has given up does not show the line.
+const NO_PANEL: &str = "panel: no fb_ili9486 framebuffer";
+/// The whole line that says the panel is absent, as the supervisor logs it for a component that
+/// is not there to run: the screen's name, and that the board runs on without it.
+const PANEL_ABSENT: &str = "panel: no fb_ili9486 framebuffer; running without it";
+/// QEMU has no Wi-Fi chip, so init finds no `wlan0` and does not try to join.
+const NO_WLAN: &str = "wifi: wlan0 is absent, not joining";
+/// The guest has no network card, so the resolver finds no upstream to ask, in the scenario that
+/// asks it a question that only an upstream can answer.
+const NO_UPSTREAM: &str = "dns: no upstream answers";
 /// The kernel was given a console that does not exist, in the scenario that is about that.
 const NO_CONSOLE: &str = "/dev/console: No such device (os error 19)";
 /// How the one error begins that a scenario expects: the configuration is not TOML.
@@ -408,6 +436,8 @@ enum Machine {
     WithWatchdog,
     /// The kernel arguments of `cmdline.txt`, and `QEMU_NEEDS`. The console is the display.
     Shipped,
+    /// `KERNEL_ARGS`, and the argument that has init ask its DNS and status servers over loopback.
+    DnsSelftest,
 }
 
 impl Machine {
@@ -418,6 +448,7 @@ impl Machine {
             Self::NoConsole => KERNEL_ARGS_NO_CONSOLE.to_owned(),
             Self::WithWatchdog => KERNEL_ARGS_WITH_WATCHDOG.to_owned(),
             Self::Shipped => format!("{} {QEMU_NEEDS}", CMDLINE_TXT.trim()),
+            Self::DnsSelftest => format!("{KERNEL_ARGS} {}", qberrypi::selftest::DNS_ARG),
         }
     }
 }
@@ -435,10 +466,10 @@ impl Allowed {
         errors: &[],
         warnings: &[],
     };
-    /// What a boot that gets through all its steps meets in QEMU.
+    /// What a boot that gets through all its steps meets in QEMU: no watchdog, no LED, no screen, no Wi-Fi chip.
     const NO_WATCHDOG_NO_LED: Self = Self {
         errors: &[],
-        warnings: &[NO_WATCHDOG, NO_LED],
+        warnings: &[NO_WATCHDOG, NO_LED, NO_PANEL, NO_WLAN],
     };
 }
 
@@ -697,6 +728,28 @@ fn one_shot_conditions(evidence: &Evidence) -> Vec<Condition> {
         evidence.serial_has(&banner_start()),
         evidence.serial_has("qberrypi-modhelper: net-pf-10: not in table"),
         evidence.serial_has("INFO  modules: inserted rfkill, cfg80211, brcmutil, brcmfmac"),
+        evidence.serial_has("INFO  boot: init started "),
+        // The services are made once the network is up as far as init takes it, and the
+        // supervisor starts the components in order: the services, the Wi-Fi, the panel last.
+        evidence.serial_has("INFO  services: started"),
+        evidence.serial_has("INFO  supervisor: started dns"),
+        evidence.serial_has("INFO  supervisor: started panel"),
+        // The watchdog's two components start with the services; QEMU has no `wlan0`, and the
+        // WARN check below is what shows that the device watch does not complain of it.
+        evidence.serial_has("INFO  supervisor: started analysis"),
+        evidence.serial_has("INFO  supervisor: started devices"),
+        // Each of them binds its port, or says what it waits for, as the services start.
+        evidence.serial_has("INFO  dns: listening on 0.0.0.0:53"),
+        evidence.serial_has("INFO  status: listening on 0.0.0.0:80"),
+        evidence.serial_has("INFO  clock: waiting for a default route"),
+        evidence.serial_has("INFO  lists: waiting for the clock"),
+        evidence.serial_has("INFO  net: lo is up"),
+        evidence.serial_has("INFO  regulatory: country US, as configured"),
+        // The kernel in QEMU has a cpufreq policy, so the governor is set there as on the Pi:
+        // no allowed warning, and this line proves the step was reached.
+        evidence.serial_has("INFO  cpu: governor performance"),
+        // The Wi-Fi task starts, finds no `wlan0` in QEMU, and says so.
+        evidence.serial_has(&format!("WARN  {NO_WLAN}")),
         evidence.serial_has("INFO  returning"),
         evidence.restart_requested(),
         evidence.exited(),
@@ -706,11 +759,66 @@ fn one_shot_conditions(evidence: &Evidence) -> Vec<Condition> {
         evidence.log_is_of_one_boot_of_this_build(),
         evidence.log_has(&banner_start()),
         evidence.log_has("INFO  config.txt: Restored"),
+        // From the card, not the console: with the kernel at loglevel 7, the
+        // warnings about the staging drivers can land inside this line there.
+        evidence.log_has(
+            "INFO  panel: modules: inserted spi-bcm2835, backlight, fbtft, fb_ili9486, ads7846",
+        ),
+        // The panel went looking for its screen, found none, and the board ran on without it: the
+        // card's copy, because the kernel's text can land in a serial line.
+        evidence.log_has(&format!("WARN  {PANEL_ABSENT}")),
         evidence.log_has("kernel: "),
         evidence.log_has("wlan0: absent"),
         evidence.log_lacks(PASSPHRASE),
         evidence.serial_lacks(PASSPHRASE),
         evidence.serial_has_no_unexpected_complaint(&Allowed::NO_WATCHDOG_NO_LED),
+    ]
+}
+
+fn dns_selftest_conditions(evidence: &Evidence) -> Vec<Condition> {
+    let allowed = Allowed {
+        errors: &[],
+        warnings: &[NO_WATCHDOG, NO_LED, NO_PANEL, NO_WLAN, NO_UPSTREAM],
+    };
+    vec![
+        evidence.serial_has("INFO  services: started"),
+        evidence.serial_has("INFO  net: lo is up"),
+        evidence.serial_has("INFO  dns: listening on 0.0.0.0:53"),
+        evidence.serial_has("INFO  status: listening on 0.0.0.0:80"),
+        // The API made its TLS configuration from the card's `tls.pem`, on the pool, and bound 443.
+        evidence.serial_has("INFO  api: listening on 0.0.0.0:443"),
+        // The key is a secret that no line shows.
+        evidence.serial_lacks("PRIVATE KEY"),
+        evidence.log_lacks("PRIVATE KEY"),
+        // The names that the self-test asks for, and what the real kernel's sockets answer.
+        evidence
+            .serial_has("INFO  selftest: dns: udp qberrypi-selftest.invalid A: NOERROR 0.0.0.0"),
+        evidence
+            .serial_has("INFO  selftest: dns: tcp qberrypi-selftest.invalid A: NOERROR 0.0.0.0"),
+        evidence.serial_has("INFO  selftest: dns: udp printer A: NXDOMAIN"),
+        // The snapshot in the initramfs was loaded before DNS listened, with no network and
+        // before any clock: its marker, which no configuration denies, is blocked.
+        evidence.serial_has("INFO  lists: snapshot: "),
+        evidence
+            .serial_has("INFO  selftest: dns: udp qberrypi-snapshot.invalid A: NOERROR 0.0.0.0"),
+        // Nothing can be forwarded, and the client is told so.
+        evidence.serial_has("INFO  selftest: dns: udp example.com A: SERVFAIL"),
+        evidence.serial_has("INFO  selftest: status: /api/v1/stats: 200"),
+        evidence.serial_has("INFO  selftest: dns: done"),
+        // The clock waits for a default route, which a guest without a network card never gets.
+        evidence.serial_has("INFO  clock: waiting for a default route"),
+        // The refresh waits for the clock, which no guest without a network card ever gets.
+        evidence.serial_has("INFO  lists: waiting for the clock"),
+        evidence.serial_lacks("clock: set by SNTP"),
+        evidence.serial_has("INFO  returning"),
+        evidence.restart_requested(),
+        evidence.exited(),
+        evidence.pios_config_is_active(),
+        evidence.log_is_of_one_boot_of_this_build(),
+        evidence.log_has("selftest: dns: done"),
+        evidence.log_lacks(PASSPHRASE),
+        evidence.serial_lacks(PASSPHRASE),
+        evidence.serial_has_no_unexpected_complaint(&allowed),
     ]
 }
 
@@ -736,7 +844,7 @@ fn broken_config_conditions(evidence: &Evidence) -> Vec<Condition> {
 fn no_console_conditions(evidence: &Evidence) -> Vec<Condition> {
     let allowed = Allowed {
         errors: &[],
-        warnings: &[NO_CONSOLE, NO_WATCHDOG, NO_LED],
+        warnings: &[NO_CONSOLE, NO_WATCHDOG, NO_LED, NO_PANEL, NO_WLAN],
     };
     vec![
         // What the scenario is about: without this it would be one-shot over again.
@@ -745,6 +853,7 @@ fn no_console_conditions(evidence: &Evidence) -> Vec<Condition> {
         evidence.exited(),
         evidence.pios_config_is_active(),
         evidence.log_has(&banner_start()),
+        evidence.log_has("INFO  regulatory: country US, as configured"),
         evidence.log_has("INFO  returning"),
         evidence.log_is_of_one_boot_of_this_build(),
         evidence.log_lacks(PASSPHRASE),
@@ -759,6 +868,7 @@ fn shipped_conditions(evidence: &Evidence) -> Vec<Condition> {
         evidence.serial_lacks(NO_INITIAL_CONSOLE),
         evidence.pios_config_is_active(),
         evidence.log_has(&banner_start()),
+        evidence.log_has("INFO  regulatory: country US, as configured"),
         evidence.log_has("INFO  returning"),
         evidence.log_is_of_one_boot_of_this_build(),
         evidence.log_lacks(PASSPHRASE),
@@ -793,6 +903,10 @@ fn permanent_conditions(evidence: &Evidence) -> Vec<Condition> {
     vec![
         // Without this the two below would hold for a guest that never started init.
         evidence.serial_has("INFO  returning"),
+        evidence.serial_has("INFO  regulatory: country US, as configured"),
+        // The panel looked for its screen, found none, and the board ran on without it. There is
+        // no copy of the log on the card here.
+        evidence.serial_has(&format!("WARN  {PANEL_ABSENT}")),
         evidence.restart_requested(),
         evidence.exited(),
         evidence.image_is_unchanged(),
@@ -800,9 +914,107 @@ fn permanent_conditions(evidence: &Evidence) -> Vec<Condition> {
     ]
 }
 
-/// Makes the six scenarios from the text of `qberrypi.example.toml`.
-fn scenarios(example: &str) -> Result<[Scenario; 6]> {
-    let returns = ("return_after_secs = 0", "return_after_secs = 5");
+/// The line that ends a boot whose provoked crash loop has used up the supervisor's patience.
+const CRASH_LOOP_RESTART: &str =
+    "ERROR supervisor: restarting: component fault failed 3 times in a minute";
+
+/// What the provoked crash loop logs as it fails, and as the supervisor gives up on it.
+const CRASH_LOOP_ERRORS: &[&str] = &[
+    "supervisor: fault failed: provoked",
+    "supervisor: restarting: component fault",
+];
+
+/// The boot whose `fault` component fails at each start: the supervisor starts it twice more, and
+/// the third failure within a minute restarts the board, which never reaches its return.
+fn crash_loop_conditions(evidence: &Evidence) -> Vec<Condition> {
+    let allowed = Allowed {
+        errors: CRASH_LOOP_ERRORS,
+        warnings: &[NO_WATCHDOG, NO_LED, NO_PANEL, NO_WLAN],
+    };
+    vec![
+        evidence.serial_has(CRASH_LOOP_RESTART),
+        evidence.serial_lacks("INFO  returning"),
+        evidence.restart_requested(),
+        evidence.exited(),
+        evidence.pios_config_is_active(),
+        evidence.log_has(CRASH_LOOP_RESTART),
+        evidence.log_is_of_one_boot_of_this_build(),
+        evidence.log_lacks(PASSPHRASE),
+        evidence.serial_has_no_unexpected_complaint(&allowed),
+    ]
+}
+
+/// The permanent system whose provoked crash loop has used up the supervisor's patience.
+///
+/// The board restarts, as in `crash_loop_conditions`; neither card switch is on, so the restart
+/// must leave the image as it was. This is the boot that the pulled-power case of a permanent
+/// system rests on: nothing of the supervisor's way out may reach the card without a switch.
+fn permanent_crash_loop_conditions(evidence: &Evidence) -> Vec<Condition> {
+    let allowed = Allowed {
+        errors: CRASH_LOOP_ERRORS,
+        warnings: &[NO_WATCHDOG, NO_LED, NO_PANEL, NO_WLAN],
+    };
+    vec![
+        evidence.serial_has(CRASH_LOOP_RESTART),
+        evidence.serial_lacks("INFO  returning"),
+        evidence.restart_requested(),
+        evidence.exited(),
+        evidence.image_is_unchanged(),
+        evidence.serial_has_no_unexpected_complaint(&allowed),
+    ]
+}
+
+/// The boot whose `fault` component panics ten seconds after it starts: the panic hook makes it a
+/// fatal error, which puts the card right and restarts the board, which never reaches its return.
+fn panic_conditions(evidence: &Evidence) -> Vec<Condition> {
+    let allowed = Allowed {
+        errors: &["panic at "],
+        warnings: &[NO_WATCHDOG, NO_LED, NO_PANEL, NO_WLAN],
+    };
+    vec![
+        evidence.serial_has("fault: panic"),
+        evidence.serial_lacks("INFO  returning"),
+        evidence.restart_requested(),
+        evidence.exited(),
+        evidence.pios_config_is_active(),
+        evidence.log_has("ERROR panic at "),
+        evidence.log_is_of_one_boot_of_this_build(),
+        evidence.log_lacks(PASSPHRASE),
+        evidence.serial_has_no_unexpected_complaint(&allowed),
+    ]
+}
+
+/// The line that ends a boot whose Wi-Fi never associated.
+const NO_ASSOCIATION_RESTART: &str = "ERROR supervisor: restarting: no Wi-Fi association for 90 s";
+
+/// The boot whose Wi-Fi never associates (`fault = "no-wifi"`, and QEMU has no radio to join with
+/// in any case): the supervisor ends it 90 seconds after it started, and the board restarts and never
+/// reaches a return, for it has none.
+fn no_association_conditions(evidence: &Evidence) -> Vec<Condition> {
+    let allowed = Allowed {
+        errors: &["supervisor: restarting: no Wi-Fi association"],
+        warnings: &[NO_WATCHDOG, NO_LED, NO_PANEL, NO_WLAN],
+    };
+    vec![
+        evidence.serial_has(NO_ASSOCIATION_RESTART),
+        evidence.serial_lacks("INFO  returning"),
+        evidence.restart_requested(),
+        evidence.exited(),
+        evidence.pios_config_is_active(),
+        evidence.log_has(NO_ASSOCIATION_RESTART),
+        evidence.log_is_of_one_boot_of_this_build(),
+        evidence.log_lacks(PASSPHRASE),
+        evidence.serial_has_no_unexpected_complaint(&allowed),
+    ]
+}
+
+/// Makes the scenarios from the text of `qberrypi.example.toml`.
+fn scenarios(example: &str) -> Result<Vec<Scenario>> {
+    // The supervisor starts the components only after the wait for `wlan0`, 20 s in QEMU, and the
+    // DNS service listens once the snapshot is loaded, which in QEMU takes a second or more. The
+    // panel is started last and takes about 2 s to find that there is no screen. The one-shot and
+    // the permanent boots are checked for the lines of all of that, so they return well after it.
+    let returns = ("return_after_secs = 0", "return_after_secs = 40");
     let one_shot = edited(
         example,
         &[
@@ -812,6 +1024,59 @@ fn scenarios(example: &str) -> Result<[Scenario; 6]> {
         ],
     )?;
     let permanent = edited(example, &[returns])?;
+    // The runtime, and so the services, start only after the wait for `wlan0`, which is 20 s in
+    // QEMU: the return is a minute in, so that the self-test has time before it.
+    let dns_selftest = edited(
+        example,
+        &[
+            ("deny = []", "deny = [\"qberrypi-selftest.invalid\"]"),
+            ("one_shot = false", "one_shot = true"),
+            ("log_to_sd = false", "log_to_sd = true"),
+            ("return_after_secs = 0", "return_after_secs = 60"),
+        ],
+    )?;
+    // The API on port 443 is served in this scenario alone: a throwaway password, and a
+    // certificate that `run_scenario` makes for the run.
+    let dns_selftest = format!(
+        "{dns_selftest}\n[api]\n{}\n",
+        crate::hashpw::hash_line(API_PASSWORD, [0; 16])?
+    );
+    // The provoked failures: a one-shot boot that keeps its log on the card and would return a
+    // minute in, if the failure did not restart the board first. The services start after the
+    // 20 s wait for `wlan0`, and the panic comes 10 s after that.
+    let provoking = |fault: &str| {
+        edited(
+            example,
+            &[
+                ("one_shot = false", "one_shot = true"),
+                ("log_to_sd = false", "log_to_sd = true"),
+                ("return_after_secs = 0", "return_after_secs = 60"),
+                ("fault = \"none\"", &format!("fault = \"{fault}\"")),
+            ],
+        )
+    };
+    let crash_loop = provoking("crash-loop")?;
+    let panic = provoking("panic")?;
+    // The same crash loop on a permanent system: neither card switch is on, and the restart that
+    // the supervisor asks for must leave the card as it was.
+    let permanent_crash_loop = edited(
+        example,
+        &[
+            ("return_after_secs = 0", "return_after_secs = 60"),
+            ("fault = \"none\"", "fault = \"crash-loop\""),
+        ],
+    )?;
+    // A Wi-Fi that never associates: a one-shot boot that keeps its log on the card and has no
+    // return of its own, for the 90 seconds of the rule end it, counted from the supervisor's
+    // start, 20 s into the boot in QEMU. Every other scenario returns before that, 40 to 60 s in.
+    let no_association = edited(
+        example,
+        &[
+            ("one_shot = false", "one_shot = true"),
+            ("log_to_sd = false", "log_to_sd = true"),
+            ("fault = \"none\"", "fault = \"no-wifi\""),
+        ],
+    )?;
     // Without the quote that closes the passphrase: the file stops being
     // TOML on the very line that holds the secret, which no message may show.
     let closed = format!("\"{PASSPHRASE}\"");
@@ -821,10 +1086,24 @@ fn scenarios(example: &str) -> Result<[Scenario; 6]> {
     let switches = |text: &str| {
         qberrypi::config::parse(text)
             .map(|cfg| cfg.debug)
-            .map(|debug| (debug.one_shot, debug.log_to_sd, debug.return_after_secs))
+            .map(|debug| {
+                (
+                    debug.one_shot,
+                    debug.log_to_sd,
+                    debug.return_after_secs,
+                    debug.fault,
+                )
+            })
             .map_err(|error| anyhow!("{EXAMPLE_CONFIG}, edited for a scenario: {error}"))
     };
-    if switches(&one_shot)? != (true, true, 5) || switches(&permanent)? != (false, false, 5) {
+    if switches(&one_shot)? != (true, true, 40, Fault::None)
+        || switches(&permanent)? != (false, false, 40, Fault::None)
+        || switches(&dns_selftest)? != (true, true, 60, Fault::None)
+        || switches(&crash_loop)? != (true, true, 60, Fault::CrashLoop)
+        || switches(&panic)? != (true, true, 60, Fault::Panic)
+        || switches(&no_association)? != (true, true, 0, Fault::NoWifi)
+        || switches(&permanent_crash_loop)? != (false, false, 60, Fault::CrashLoop)
+    {
         bail!("{EXAMPLE_CONFIG} did not take the scenarios' debug settings");
     }
     match qberrypi::config::parse(&broken) {
@@ -833,7 +1112,7 @@ fn scenarios(example: &str) -> Result<[Scenario; 6]> {
         Ok(_) => bail!("the broken configuration is a valid one"),
     }
 
-    Ok([
+    Ok(vec![
         Scenario {
             name: "one-shot",
             machine: Machine::Usual,
@@ -882,6 +1161,46 @@ fn scenarios(example: &str) -> Result<[Scenario; 6]> {
             system_config: one_shot,
             conditions: shipped_conditions,
         },
+        Scenario {
+            name: "dns without a network",
+            machine: Machine::DnsSelftest,
+            note: Some(NO_NETWORK),
+            file_stem: "dns-without-a-network",
+            system_config: dns_selftest,
+            conditions: dns_selftest_conditions,
+        },
+        Scenario {
+            name: "crash loop",
+            machine: Machine::Usual,
+            note: None,
+            file_stem: "crash-loop",
+            system_config: crash_loop,
+            conditions: crash_loop_conditions,
+        },
+        Scenario {
+            name: "panic",
+            machine: Machine::Usual,
+            note: None,
+            file_stem: "panic",
+            system_config: panic,
+            conditions: panic_conditions,
+        },
+        Scenario {
+            name: "no association",
+            machine: Machine::Usual,
+            note: None,
+            file_stem: "no-association",
+            system_config: no_association,
+            conditions: no_association_conditions,
+        },
+        Scenario {
+            name: "permanent, crash loop",
+            machine: Machine::Usual,
+            note: None,
+            file_stem: "permanent-crash-loop",
+            system_config: permanent_crash_loop,
+            conditions: permanent_crash_loop_conditions,
+        },
     ])
 }
 
@@ -897,12 +1216,20 @@ fn edited(example: &str, edits: &[(&str, &str)]) -> Result<String> {
     Ok(text)
 }
 
-/// Boots the six scenarios and prints how each went; an error if one did not hold.
+/// Boots the scenarios, up to `jobs` at once, and prints how each went; an
+/// error if one did not hold.
 ///
+/// Without `jobs` the number at once is `default_jobs` for this machine.
 /// `root` is the repository root. The build in its `out/qberrypi/` must be
 /// complete, and is the one that is booted; the images and the serial logs
-/// go to its `out/qemu/`.
-pub fn run_all(root: &Path) -> Result<()> {
+/// go to its `out/qemu/`. The scenarios share nothing but that build, which
+/// they only read: each writes its own image and serial log.
+///
+/// The results are printed in the order of the scenarios, each whole, once
+/// every one before it has been printed. A scenario that cannot be run stops
+/// any more from being started, and the error returned is the first of them in
+/// that order.
+pub fn run_all(root: &Path, jobs: Option<NonZeroUsize>) -> Result<()> {
     require_qemu(QEMU)?;
     let build = Build {
         folder: root.join(BOOT_FOLDER),
@@ -915,32 +1242,206 @@ pub fn run_all(root: &Path) -> Result<()> {
     let scenarios = scenarios(&example)?;
     let folder = root.join(QEMU_FOLDER);
     fs::create_dir_all(&folder).with_context(|| format!("cannot create {}", folder.display()))?;
+    let jobs = jobs
+        .map_or_else(|| jobs_for_this_machine(scenarios.len()), NonZeroUsize::get)
+        .min(scenarios.len());
 
-    let mut failed = Vec::new();
-    for scenario in &scenarios {
-        let started = Instant::now();
-        let conditions = run_scenario(scenario, &build, &folder)
-            .with_context(|| format!("{}: could not be run", scenario.name))?;
-        let (report, held) =
-            scenario_report(scenario.name, scenario.note, &conditions, started.elapsed());
-        print!("{report}");
-        if !held {
-            let log = serial_log_of(&folder.join(scenario.file_stem).with_extension("img"));
-            let serial = fs::read_to_string(&log).unwrap_or_default();
-            println!(
-                "  the last {SERIAL_TAIL_LINES} lines of the serial console ({}):",
-                log.display()
-            );
-            for line in last_lines(&serial, SERIAL_TAIL_LINES) {
-                println!("    {line}");
+    let run_started = Instant::now();
+    let mut order = InOrder::default();
+    let reports = run_concurrently(
+        scenarios.len(),
+        jobs,
+        |index| {
+            let scenario = &scenarios[index];
+            let started = Instant::now();
+            let conditions = run_scenario(scenario, &build, &folder)
+                .with_context(|| format!("{}: could not be run", scenario.name))?;
+            let (mut block, held) =
+                scenario_report(scenario.name, scenario.note, &conditions, started.elapsed());
+            if !held {
+                let image = folder.join(scenario.file_stem).with_extension("img");
+                block.push_str(&serial_tail(&serial_log_of(&image)));
             }
-            failed.push(scenario.name);
-        }
-    }
+            Ok((block, held))
+        },
+        |index, report| {
+            // A scenario that could not be run has no block; the error says so.
+            let block = report
+                .as_ref()
+                .map_or_else(|_| String::new(), |(block, _)| block.clone());
+            for block in order.finished(index, block) {
+                print!("{block}");
+            }
+        },
+    )?;
+    println!(
+        "qemu-test: {} scenarios in {} s with {jobs} at once",
+        scenarios.len(),
+        run_started.elapsed().as_secs()
+    );
+
+    let failed: Vec<&str> = scenarios
+        .iter()
+        .zip(&reports)
+        .filter(|(_, (_, held))| !held)
+        .map(|(scenario, _)| scenario.name)
+        .collect();
     if !failed.is_empty() {
         bail!("qemu-test: failed: {}", failed.join(", "));
     }
     Ok(())
+}
+
+/// How many scenarios to boot at once on this machine, when nobody says.
+fn jobs_for_this_machine(scenarios: usize) -> usize {
+    let cores = thread::available_parallelism().ok().map(NonZeroUsize::get);
+    let meminfo = fs::read_to_string("/proc/meminfo").ok();
+    default_jobs(scenarios, cores, meminfo.as_deref())
+}
+
+/// The last lines of the serial console that a failed scenario's boot saved in `log`, laid out for its report.
+fn serial_tail(log: &Path) -> String {
+    let serial = fs::read_to_string(log).unwrap_or_default();
+    let mut tail = format!(
+        "  the last {SERIAL_TAIL_LINES} lines of the serial console ({}):\n",
+        log.display()
+    );
+    for line in last_lines(&serial, SERIAL_TAIL_LINES) {
+        tail.push_str(&format!("    {line}\n"));
+    }
+    tail
+}
+
+/// What a guest is allowed to take of the memory that is available: its own
+/// 1 GiB, and a quarter more for QEMU around it.
+const MEMORY_PER_GUEST: u64 = 5 << 28;
+
+/// How many scenarios to boot at once when nobody says.
+///
+/// The smallest of the number of scenarios, half the cores (the guests are
+/// emulated, and the build and the host need the rest) and the memory that is
+/// available divided by `MEMORY_PER_GUEST`, and at least one. A figure that
+/// is not known (`None`, or a `meminfo` that does not state the memory
+/// available) is left out of it.
+fn default_jobs(scenarios: usize, cores: Option<usize>, meminfo: Option<&str>) -> usize {
+    let mut jobs = scenarios;
+    if let Some(cores) = cores {
+        jobs = jobs.min(cores / 2);
+    }
+    if let Some(available) = meminfo.and_then(mem_available_bytes) {
+        jobs = jobs.min(usize::try_from(available / MEMORY_PER_GUEST).unwrap_or(usize::MAX));
+    }
+    jobs.max(1)
+}
+
+/// The memory available, in bytes, as the `MemAvailable:` line of `/proc/meminfo` says.
+fn mem_available_bytes(meminfo: &str) -> Option<u64> {
+    let line = meminfo
+        .lines()
+        .find_map(|line| line.strip_prefix("MemAvailable:"))?;
+    let mut words = line.split_whitespace();
+    let (kib, unit) = (words.next()?, words.next()?);
+    if unit != "kB" || words.next().is_some() {
+        return None;
+    }
+    kib.parse::<u64>().ok()?.checked_mul(1024)
+}
+
+/// Holds the blocks of output that are finished and gives each back once
+/// every block before it has been, so that output stays in order.
+#[derive(Default)]
+struct InOrder {
+    /// The index of the block that is due next.
+    next: usize,
+    done: BTreeMap<usize, String>,
+}
+
+impl InOrder {
+    /// Takes the block at `index` and returns every block that is now due, in order.
+    fn finished(&mut self, index: usize, block: String) -> Vec<String> {
+        self.done.insert(index, block);
+        let mut due = Vec::new();
+        while let Some(block) = self.done.remove(&self.next) {
+            due.push(block);
+            self.next += 1;
+        }
+        due
+    }
+}
+
+/// Runs `work(0)` to `work(count - 1)` on up to `jobs` threads at once.
+///
+/// `finished` is called on the calling thread, with a job's index and its
+/// result, as each job ends; the order of those calls is the order the jobs
+/// end in. Returns what the jobs made, in the order of the jobs, or the first
+/// error in that order.
+///
+/// A job that fails or panics stops any further job from being started; the
+/// ones running are let finish. This returns only when every thread has
+/// ended, so what a job holds (a `Guest`, say) is released by then; a panic is
+/// passed on as it was raised once they have.
+fn run_concurrently<T: Send>(
+    count: usize,
+    jobs: usize,
+    work: impl Fn(usize) -> Result<T> + Sync,
+    mut finished: impl FnMut(usize, &Result<T>),
+) -> Result<Vec<T>> {
+    // The jobs not started yet. A job is started by taking the next one, and
+    // none is after the range is emptied.
+    let todo = Mutex::new(0..count);
+    let claim = || lock(&todo).next();
+    let stop = || *lock(&todo) = 0..0;
+    let (sender, receiver) = mpsc::channel();
+    let mut results: Vec<Option<Result<T>>> = (0..count).map(|_| None).collect();
+    let mut panicked = None;
+
+    thread::scope(|scope| {
+        let (work, claim, stop) = (&work, &claim, &stop);
+        let workers: Vec<_> = (0..jobs.max(1).min(count))
+            .map(|_| {
+                let sender = sender.clone();
+                scope.spawn(move || {
+                    while let Some(index) = claim() {
+                        match catch_unwind(AssertUnwindSafe(|| work(index))) {
+                            Ok(result) => {
+                                if result.is_err() {
+                                    stop();
+                                }
+                                if sender.send((index, result)).is_err() {
+                                    break;
+                                }
+                            }
+                            Err(payload) => {
+                                stop();
+                                resume_unwind(payload);
+                            }
+                        }
+                    }
+                })
+            })
+            .collect();
+        // The channel ends when the last worker has dropped its sender.
+        drop(sender);
+        for (index, result) in receiver {
+            finished(index, &result);
+            results[index] = Some(result);
+        }
+        for worker in workers {
+            if let Err(payload) = worker.join() {
+                panicked.get_or_insert(payload);
+            }
+        }
+    });
+    if let Some(payload) = panicked {
+        resume_unwind(payload);
+    }
+
+    // The jobs that were started are a run of the first ones, so that an
+    // error comes before any that was not started.
+    results
+        .into_iter()
+        .map(|result| result.expect("a job was left unstarted with no failure before it"))
+        .collect()
 }
 
 /// The build the scenarios boot.
@@ -951,17 +1452,37 @@ struct Build {
     epoch: u64,
 }
 
+/// The key and certificate for the card of a scenario whose configuration has an `[api]` section,
+/// made now for its hostname and address; `None` for one without, whose card holds no `tls.pem`.
+/// A configuration that does not parse has none either: it is the scenario of the one that must
+/// not, and init says so itself.
+///
+/// Made for the run and kept nowhere but on the image: the key is never written to the repository.
+fn card_certificate(system_config: &str, now_unix: u64) -> Result<Option<String>> {
+    match qberrypi::config::parse(system_config) {
+        Ok(cfg) if cfg.api.is_some() => {
+            crate::cert::make(&cfg.hostname, cfg.net.address.addr, now_unix).map(Some)
+        }
+        _ => Ok(None),
+    }
+}
+
 /// Makes a scenario's card in `folder`, boots the build from it and judges the boot.
 fn run_scenario(scenario: &Scenario, build: &Build, folder: &Path) -> Result<Vec<Condition>> {
     let image = folder.join(scenario.file_stem).with_extension("img");
-    sdimage::build(
-        &image,
-        &[
-            (ACTIVE_CONFIG, CONFIG_TXT.as_bytes()),
-            (PIOS_CONFIG, PIOS.as_bytes()),
-            (SYSTEM_CONFIG, scenario.system_config.as_bytes()),
-        ],
-    )?;
+    let certificate = card_certificate(&scenario.system_config, crate::unix_time()?)
+        .with_context(|| format!("{}: cannot make the API's certificate", scenario.name))?;
+    let mut files = vec![
+        (ACTIVE_CONFIG, CONFIG_TXT.as_bytes()),
+        (PIOS_CONFIG, PIOS.as_bytes()),
+        (SYSTEM_CONFIG, scenario.system_config.as_bytes()),
+    ];
+    if let Some(pem) = &certificate {
+        files.push((TLS_PEM, pem.as_bytes()));
+    }
+    sdimage::build(&image, &files)?;
+    // The key is on the image and nowhere else, and not in memory longer than that.
+    drop(certificate);
     // Taken once the image is written whole and closed.
     let image_before = file_sha256(&image)?;
 
@@ -1348,8 +1869,20 @@ mod tests {
 
     #[test]
     fn the_scenarios_differ_from_the_example_only_in_their_debug_settings() {
-        let [one_shot, broken, permanent, no_console, watchdog, shipped] =
-            scenarios(EXAMPLE).unwrap();
+        let [
+            one_shot,
+            broken,
+            permanent,
+            no_console,
+            watchdog,
+            shipped,
+            dns_selftest,
+            crash_loop,
+            panic,
+            no_association,
+            permanent_crash_loop,
+        ] = <[Scenario; 11]>::try_from(scenarios(EXAMPLE).unwrap())
+            .unwrap_or_else(|all| panic!("{} scenarios, not eleven", all.len()));
 
         assert_eq!(
             (one_shot.name, broken.name, permanent.name),
@@ -1363,24 +1896,82 @@ mod tests {
                 "shipped command line"
             )
         );
+        assert_eq!(
+            (
+                dns_selftest.name,
+                crash_loop.name,
+                panic.name,
+                no_association.name,
+                permanent_crash_loop.name
+            ),
+            (
+                "dns without a network",
+                "crash loop",
+                "panic",
+                "no association",
+                "permanent, crash loop"
+            )
+        );
         assert_eq!(no_console.system_config, one_shot.system_config);
         assert_eq!(watchdog.system_config, one_shot.system_config);
         assert_eq!(shipped.system_config, one_shot.system_config);
+        assert_eq!(
+            changed(&dns_selftest.system_config),
+            [
+                "deny = [\"qberrypi-selftest.invalid\"]",
+                "one_shot = true",
+                "log_to_sd = true",
+                "return_after_secs = 60"
+            ]
+        );
         assert_eq!(
             changed(&one_shot.system_config),
             [
                 "one_shot = true",
                 "log_to_sd = true",
-                "return_after_secs = 5"
+                "return_after_secs = 40"
             ]
         );
-        assert_eq!(changed(&permanent.system_config), ["return_after_secs = 5"]);
+        assert_eq!(
+            changed(&permanent.system_config),
+            ["return_after_secs = 40"]
+        );
+        // The provoked failures are one-shot boots that keep their log on the card, a minute long.
+        assert_eq!(
+            changed(&crash_loop.system_config),
+            [
+                "one_shot = true",
+                "log_to_sd = true",
+                "return_after_secs = 60",
+                "fault = \"crash-loop\""
+            ]
+        );
+        assert_eq!(
+            changed(&panic.system_config),
+            [
+                "one_shot = true",
+                "log_to_sd = true",
+                "return_after_secs = 60",
+                "fault = \"panic\""
+            ]
+        );
+        // The no-association boot is the one that has no return of its own: the rule ends it.
+        assert_eq!(
+            changed(&no_association.system_config),
+            ["one_shot = true", "log_to_sd = true", "fault = \"no-wifi\""]
+        );
+        // The permanent system keeps both card switches off, and is given only the fault and a minute.
+        assert_eq!(
+            changed(&permanent_crash_loop.system_config),
+            ["return_after_secs = 60", "fault = \"crash-loop\""]
+        );
         assert!(one_shot.system_config.contains(PASSPHRASE));
     }
 
     #[test]
     fn the_broken_configuration_breaks_on_the_line_that_holds_the_passphrase() {
-        let [_, broken, ..] = scenarios(EXAMPLE).unwrap();
+        let all = scenarios(EXAMPLE).unwrap();
+        let broken = &all[1];
 
         // The example, but for the quote that closes the passphrase.
         assert_eq!(
@@ -1424,7 +2015,12 @@ mod tests {
                 Machine::Usual,
                 Machine::NoConsole,
                 Machine::WithWatchdog,
-                Machine::Shipped
+                Machine::Shipped,
+                Machine::DnsSelftest,
+                Machine::Usual,
+                Machine::Usual,
+                Machine::Usual,
+                Machine::Usual
             ]
         );
         for scenario in &scenarios {
@@ -1444,7 +2040,12 @@ mod tests {
                 "permanent",
                 "no-console",
                 "watchdog-resets-on-arming",
-                "shipped-command-line"
+                "shipped-command-line",
+                "dns-without-a-network",
+                "crash-loop",
+                "panic",
+                "no-association",
+                "permanent-crash-loop"
             ]
         );
     }
@@ -1505,6 +2106,64 @@ mod tests {
     }
 
     #[test]
+    fn the_dns_scenario_denies_the_self_tests_name_and_gives_it_time() {
+        let all = scenarios(EXAMPLE).unwrap();
+        let cfg = qberrypi::config::parse(&all[6].system_config).unwrap();
+        assert_eq!(cfg.dns.deny, [qberrypi::selftest::DENIED]);
+        assert_eq!(
+            (
+                cfg.debug.one_shot,
+                cfg.debug.log_to_sd,
+                cfg.debug.return_after_secs
+            ),
+            (true, true, 60)
+        );
+        assert_eq!(
+            Machine::DnsSelftest.kernel_args(),
+            format!("{KERNEL_ARGS} {}", qberrypi::selftest::DNS_ARG)
+        );
+        assert!(
+            all.iter()
+                .filter(|s| s.name != "dns without a network")
+                .all(|s| {
+                    !s.machine
+                        .kernel_args()
+                        .contains(qberrypi::selftest::DNS_ARG)
+                })
+        );
+    }
+
+    #[test]
+    fn the_dns_scenario_alone_serves_the_api_with_a_throwaway_password_and_certificate() {
+        let all = scenarios(EXAMPLE).unwrap();
+        for scenario in &all {
+            let cert = card_certificate(&scenario.system_config, 1_800_000_000).unwrap();
+            // The one that is not TOML at all has no configuration to read.
+            let api = qberrypi::config::parse(&scenario.system_config)
+                .ok()
+                .and_then(|cfg| cfg.api);
+            if scenario.name == "dns without a network" {
+                // The password is `qemu`, hashed with a zero salt; nothing here is a secret.
+                let hash = api
+                    .expect("the DNS scenario has an [api] section")
+                    .password_hash;
+                assert!(hash.verify(b"qemu"));
+                // The certificate fits its hostname and address, and the server takes it.
+                let pem = cert.expect("its card holds a certificate");
+                assert!(qberrypi::api::tls::server_config(pem.as_bytes()).is_ok());
+            } else {
+                assert!(api.is_none(), "{}", scenario.name);
+                assert_eq!(cert, None, "{}", scenario.name);
+            }
+        }
+    }
+
+    #[test]
+    fn the_certificate_goes_where_init_reads_it() {
+        assert_eq!(TLS_PEM, format!("qberrypi/{}", bootpart::TLS_FILE));
+    }
+
+    #[test]
     fn the_lines_init_logged_are_told_from_the_kernels() {
         let text = "[    1.476157] reg-fixed-voltage cam1_regulator: error -EIO: can't get GPIO\n\
                     [   0.001] INFO  qberrypi 0.1.0 (build 1)\n\
@@ -1550,13 +2209,16 @@ mod tests {
     fn only_complaints_that_are_not_expected_are_unexpected() {
         let allowed = Allowed {
             errors: &[SYNTAX_ERROR],
-            warnings: &[NO_WATCHDOG, NO_LED],
+            warnings: &[NO_WATCHDOG, NO_LED, NO_WLAN],
         };
         let text = "[   0.009] WARN  watchdog: No such file or directory (os error 2)\n\
                     [   0.010] WARN  watchdog: the 15 s timeout was refused: Invalid argument\n\
                     [   0.020] ERROR qberrypi.toml: (syntax): not valid TOML at line 5, column 36\n\
                     [   0.021] ERROR qberrypi.toml: wifi.country: must be two letters\n\
-                    [   0.182] WARN  activity LED: No such file or directory (os error 2)\n\
+                    [   0.182] WARN  cpu: governor: No such file or directory (os error 2)\n\
+                    [   0.185] WARN  activity LED: No such file or directory (os error 2)\n\
+                    [   0.190] WARN  wifi: wlan0 is absent, not joining\n\
+                    [   0.191] WARN  wifi: wlan0 could not be opened: the wireless interface is gone\n\
                     [   0.200] WARN  /dev/console: No such device (os error 19)\n\
                     [  20.179] INFO  kernel: ERROR and WARN  are only words here\n\
                     [  20.200] ERROR log.txt: No space left on device\n";
@@ -1566,6 +2228,9 @@ mod tests {
             [
                 "WARN  watchdog: the 15 s timeout was refused: Invalid argument",
                 "ERROR qberrypi.toml: wifi.country: must be two letters",
+                // The kernel in QEMU has the policy, so a governor warning there is a real one.
+                "WARN  cpu: governor: No such file or directory (os error 2)",
+                "WARN  wifi: wlan0 could not be opened: the wireless interface is gone",
                 "WARN  /dev/console: No such device (os error 19)",
                 "ERROR log.txt: No space left on device",
             ]
@@ -1595,14 +2260,36 @@ mod tests {
         format!(
             "[    1.5] Run /init as init process\n\
              [   0.001] INFO  qberrypi {} (build 1700000000)\n\
+             [   0.001] INFO  boot: init started 1.500 s after the kernel\n\
              [   0.050] INFO  config.txt: Restored\n\
              [   0.051] WARN  watchdog: No such file or directory (os error 2)\n\
              [   0.180] INFO  modules: inserted rfkill, cfg80211, brcmutil, brcmfmac\n\
-             [   0.182] WARN  activity LED: No such file or directory (os error 2)\n\
+             [   0.182] INFO  cpu: governor performance\n\
+             [   0.185] WARN  activity LED: No such file or directory (os error 2)\n\
              [   2.000] INFO  kernel: qberrypi-modhelper: net-pf-10: not in table\n\
-             [  25.000] INFO  returning\n\
-             [   27.1] reboot: Restarting system\n\
-             [   27.2] Reboot failed -- System halted\n",
+             [  22.100] INFO  net: lo is up\n\
+             [  22.150] INFO  regulatory: country US, as configured\n\
+             [  22.200] INFO  services: started\n\
+             [  22.300] INFO  supervisor: started dns\n\
+             [  22.301] INFO  supervisor: started utc offset\n\
+             [  22.302] INFO  supervisor: started clock\n\
+             [  22.303] INFO  supervisor: started status\n\
+             [  22.304] INFO  supervisor: started lists\n\
+             [  22.304] INFO  supervisor: started analysis\n\
+             [  22.304] INFO  supervisor: started devices\n\
+             [  22.305] INFO  supervisor: started wifi\n\
+             [  22.306] INFO  supervisor: started signal\n\
+             [  22.307] INFO  supervisor: started panel\n\
+             [  22.310] INFO  dns: listening on 0.0.0.0:53\n\
+             [  22.311] INFO  status: listening on 0.0.0.0:80\n\
+             [  22.312] INFO  clock: waiting for a default route\n\
+             [  22.313] INFO  lists: waiting for the clock\n\
+             [  22.314] WARN  wifi: wlan0 is absent, not joining\n\
+             [  22.320] INFO  panel: modules: inserted spi-bcm2835, backlight, fbtft, fb_ili9486, ads7846\n\
+             [  24.350] WARN  panel: no fb_ili9486 framebuffer; running without it\n\
+             [  40.000] INFO  returning\n\
+             [   42.1] reboot: Restarting system\n\
+             [   42.2] Reboot failed -- System halted\n",
             qberrypi::VERSION
         )
     }
@@ -1619,7 +2306,9 @@ mod tests {
                  [   0.050] INFO  config.txt: Restored\n\
                  [  20.000] INFO  wlan0: absent\n\
                  [  20.100] INFO  kernel: Booting Linux\n\
-                 [  25.000] INFO  returning\n",
+                 [  22.320] INFO  panel: modules: inserted spi-bcm2835, backlight, fbtft, fb_ili9486, ads7846\n\
+                 [  24.350] WARN  panel: no fb_ili9486 framebuffer; running without it\n\
+                 [  40.000] INFO  returning\n",
                 qberrypi::VERSION
             )),
             image_before: "aa".to_owned(),
@@ -1649,14 +2338,14 @@ mod tests {
         let conditions = one_shot_conditions(&good_evidence());
 
         assert_eq!(failures(&conditions), [""; 0]);
-        assert_eq!(conditions.len(), 16);
+        assert_eq!(conditions.len(), 32);
     }
 
     #[test]
     fn each_thing_wrong_with_a_one_shot_boot_fails_its_condition() {
         /// What the failed condition is about, and what makes the evidence wrong.
         type Wrong = (&'static str, fn(&mut Evidence));
-        let wrong: [Wrong; 20] = [
+        let wrong: [Wrong; 38] = [
             ("has `qberrypi 0.", |e| {
                 e.serial = e.serial.replace("INFO  qberrypi ", "INFO  qberrypi-")
             }),
@@ -1667,6 +2356,105 @@ mod tests {
                 "has `INFO  modules: inserted rfkill, cfg80211, brcmutil, brcmfmac`",
                 |e| e.serial = e.serial.replace("brcmutil, brcmfmac", "brcmutil"),
             ),
+            // Judged from the card's copy: the kernel's text can land in the serial line.
+            (
+                "log.txt on the card has `INFO  panel: modules: inserted spi-bcm2835, backlight, fbtft, fb_ili9486, ads7846`",
+                |e| {
+                    let log = e.system_log.as_mut().unwrap();
+                    *log = log.replace("fb_ili9486, ads7846", "fb_ili9486");
+                },
+            ),
+            ("has `INFO  boot: init started `", |e| {
+                e.serial = e.serial.replace("boot: init started", "boot: init")
+            }),
+            // The supervisor did not start the DNS service or the panel.
+            ("has `INFO  supervisor: started dns`", |e| {
+                e.serial = e
+                    .serial
+                    .replace("supervisor: started dns", "supervisor: starting dns")
+            }),
+            ("has `INFO  supervisor: started panel`", |e| {
+                e.serial = e
+                    .serial
+                    .replace("supervisor: started panel", "supervisor: starting panel")
+            }),
+            // The supervisor did not start the watchdog's two components.
+            ("has `INFO  supervisor: started analysis`", |e| {
+                e.serial = e.serial.replace(
+                    "supervisor: started analysis",
+                    "supervisor: starting analysis",
+                )
+            }),
+            ("has `INFO  supervisor: started devices`", |e| {
+                e.serial = e.serial.replace(
+                    "supervisor: started devices",
+                    "supervisor: starting devices",
+                )
+            }),
+            // Judged from the card's copy: the kernel's text can land in the serial line.
+            (
+                "log.txt on the card has `WARN  panel: no fb_ili9486 framebuffer; running without it`",
+                |e| {
+                    let log = e.system_log.as_mut().unwrap();
+                    *log = log.replace("running without it", "running");
+                },
+            ),
+            // The runtime did not get its services.
+            ("has `INFO  services: started`", |e| {
+                e.serial = e
+                    .serial
+                    .replace("INFO  services: started", "INFO  services: startup")
+            }),
+            // The listeners did not bind, or the clock and the lists did not start.
+            ("has `INFO  dns: listening on 0.0.0.0:53`", |e| {
+                e.serial = e.serial.replace(
+                    "INFO  dns: listening on 0.0.0.0:53",
+                    "ERROR dns: stopped: Address already in use (os error 98)",
+                )
+            }),
+            ("has `INFO  status: listening on 0.0.0.0:80`", |e| {
+                e.serial = e
+                    .serial
+                    .replace("status: listening on", "status: listening at")
+            }),
+            ("has `INFO  clock: waiting for a default route`", |e| {
+                e.serial = e
+                    .serial
+                    .replace("clock: waiting for a default route", "clock: stopped")
+            }),
+            ("has `INFO  lists: waiting for the clock`", |e| {
+                e.serial = e
+                    .serial
+                    .replace("lists: waiting for the clock", "lists: stopped")
+            }),
+            ("has `INFO  net: lo is up`", |e| {
+                // `lo` that could not be brought up is a warning, as init logs it.
+                e.serial = e.serial.replace(
+                    "INFO  net: lo is up",
+                    "WARN  net: lo: no network interface named lo",
+                )
+            }),
+            // The country the kernel holds is not the configured one.
+            ("has `INFO  regulatory: country US, as configured`", |e| {
+                e.serial = e.serial.replace(
+                    "INFO  regulatory: country US, as configured",
+                    "WARN  regulatory: country is 00, not the configured US",
+                )
+            }),
+            // The governor could not be set: the boot says so, and it is no longer the INFO line.
+            ("has `INFO  cpu: governor performance`", |e| {
+                e.serial = e.serial.replace(
+                    "INFO  cpu: governor performance",
+                    "WARN  cpu: governor: No such file or directory (os error 2)",
+                )
+            }),
+            // A board with the Wi-Fi chip would join; QEMU has none, and init says it does not.
+            ("has `WARN  wifi: wlan0 is absent, not joining`", |e| {
+                e.serial = e.serial.replace(
+                    "WARN  wifi: wlan0 is absent, not joining",
+                    "INFO  wifi: wlan0 is up, station a0:a1:a1:a3:a4:a5",
+                )
+            }),
             ("has `INFO  returning`", |e| {
                 e.serial = e.serial.replace("INFO  returning", "")
             }),
@@ -1682,7 +2470,7 @@ mod tests {
             // Each save of the boot wrote a header of its own.
             ("has one boot header", |e| {
                 let log = e.system_log.as_mut().unwrap();
-                *log = log.replace("[  25.", "==== boot, build 1700000000 ====\n[  25.");
+                *log = log.replace("[  40.", "==== boot, build 1700000000 ====\n[  40.");
             }),
             // The log on the card is one that an earlier build left.
             ("has one boot header", |e| {
@@ -1733,6 +2521,16 @@ mod tests {
                 e.serial
                     .push_str("[   0.002] WARN  /dev/console: No such device (os error 19)\n")
             }),
+            // QEMU has no screen, so the panel has no more to say than that.
+            (NO_COMPLAINT_ON_SERIAL, |e| {
+                e.serial
+                    .push_str("[  26.000] ERROR panel: writing the screen: No such device\n")
+            }),
+            (NO_COMPLAINT_ON_SERIAL, |e| {
+                e.serial.push_str(
+                    "[  26.000] WARN  panel: fb_ili9486 is 320,480 at 16 bpp, not 480,320 at 16 bpp; running without it\n",
+                )
+            }),
         ];
         for (about, spoil) in wrong {
             let mut evidence = good_evidence();
@@ -1749,6 +2547,20 @@ mod tests {
     }
 
     #[test]
+    fn kernel_text_landing_inside_the_panel_modules_line_on_the_serial_console_is_no_failure() {
+        // The staging drivers' warnings reach the console as init writes the line.
+        let mut evidence = good_evidence();
+        evidence.serial = evidence.serial.replace(
+            "fbtft, fb_ili9486, ads7846",
+            "fbtft, fb_ili9486, ads\n[    0.191] fbtft: module is from the staging directory\n7846",
+        );
+
+        let conditions = one_shot_conditions(&evidence);
+
+        assert_eq!(failures(&conditions), [""; 0]);
+    }
+
+    #[test]
     fn a_log_that_cannot_be_read_fails_every_condition_about_it() {
         let mut evidence = good_evidence();
         evidence.system_log = Err("cannot read qberrypi/log.txt".into());
@@ -1756,7 +2568,7 @@ mod tests {
         let conditions = one_shot_conditions(&evidence);
 
         // Among them the one that the passphrase is not in it.
-        assert_eq!(failures(&conditions).len(), 7);
+        assert_eq!(failures(&conditions).len(), 9);
     }
 
     #[test]
@@ -1916,10 +2728,14 @@ mod tests {
         evidence.image_after = evidence.image_before.clone();
         let conditions = permanent_conditions(&evidence);
         assert_eq!(failures(&conditions), [""; 0]);
-        assert_eq!(conditions.len(), 5);
+        assert_eq!(conditions.len(), 7);
 
         evidence.image_after = "cc".into();
         evidence.serial = evidence.serial.replace("INFO  returning", "");
+        evidence.serial = evidence.serial.replace(
+            "INFO  regulatory: country US, as configured",
+            "WARN  regulatory: country is 00, not the configured US",
+        );
         evidence
             .serial
             .push_str("[  26.000] ERROR log.txt: mounting /dev/mmcblk0p1: busy\n");
@@ -1929,10 +2745,436 @@ mod tests {
             failures(&conditions),
             [
                 "the serial console has `INFO  returning`",
+                "the serial console has `INFO  regulatory: country US, as configured`",
                 "the card image has the SHA-256 it had before the boot",
                 NO_COMPLAINT_ON_SERIAL,
             ]
         );
+    }
+
+    #[test]
+    fn a_permanent_boot_must_have_let_the_panel_look_for_its_screen() {
+        // A board that returned before the panel had given up on a screen shows no such line.
+        let mut evidence = good_evidence();
+        evidence.image_after = evidence.image_before.clone();
+        evidence.serial = evidence.serial.replace(
+            "WARN  panel: no fb_ili9486 framebuffer; running without it",
+            "",
+        );
+
+        let conditions = permanent_conditions(&evidence);
+
+        assert_eq!(
+            failures(&conditions),
+            ["the serial console has `WARN  panel: no fb_ili9486 framebuffer; running without it`"]
+        );
+    }
+
+    /// What a one-shot boot leaves behind when the supervisor meets a provoked failure: the
+    /// board's start as `good_evidence` has it, with the fault's component among the others, and
+    /// `ending` where the board would have returned.
+    fn good_fault_evidence(ending: &str) -> Evidence {
+        let mut evidence = good_evidence();
+        evidence.serial = evidence
+            .serial
+            .replace(
+                "[  22.307] INFO  supervisor: started panel\n",
+                "[  22.307] INFO  supervisor: started panel\n\
+                 [  22.308] INFO  supervisor: started fault\n",
+            )
+            .replace("[  40.000] INFO  returning\n", ending);
+        let log = evidence.system_log.as_mut().unwrap();
+        *log = log.replace("[  40.000] INFO  returning\n", ending);
+        evidence
+    }
+
+    /// The end of a boot whose provoked crash loop used up the supervisor's patience.
+    const CRASH_LOOP_ENDING: &str = "\
+        [  22.330] ERROR supervisor: fault failed: provoked\n\
+        [  23.331] INFO  supervisor: starting fault again\n\
+        [  23.332] ERROR supervisor: fault failed: provoked\n\
+        [  24.333] INFO  supervisor: starting fault again\n\
+        [  24.334] ERROR supervisor: fault failed: provoked\n\
+        [  24.335] ERROR supervisor: restarting: component fault failed 3 times in a minute\n";
+
+    /// The text of `PANIC_LINE`, as a macro so that `PANIC_ENDING` can be built from it with `concat!`.
+    macro_rules! panic_line {
+        () => {
+            "ERROR panic at crates/qberrypi/src/fault.rs:78:5: fault: panic"
+        };
+    }
+
+    /// What the panic hook logs for the provoked panic: the place is the `panic!` in `fault.rs` as
+    /// the board reports it, line and column, which no condition looks at.
+    const PANIC_LINE: &str = panic_line!();
+
+    /// The end of a boot whose provoked panic went through the panic hook to the rescue.
+    const PANIC_ENDING: &str = concat!("[  32.330] ", panic_line!(), "\n");
+
+    /// The end of a boot whose Wi-Fi never associated: the supervisor's rule, 90 s after it started.
+    const NO_ASSOCIATION_ENDING: &str = "\
+        [ 112.310] ERROR supervisor: restarting: no Wi-Fi association for 90 s\n";
+
+    /// What a one-shot boot leaves behind when the Wi-Fi never associated: `good_evidence`, with
+    /// no return, and the rule's line where the board would have returned.
+    fn good_no_association_evidence() -> Evidence {
+        let mut evidence = good_evidence();
+        evidence.serial = evidence
+            .serial
+            .replace("[  40.000] INFO  returning\n", NO_ASSOCIATION_ENDING);
+        let log = evidence.system_log.as_mut().unwrap();
+        *log = log.replace("[  40.000] INFO  returning\n", NO_ASSOCIATION_ENDING);
+        evidence
+    }
+
+    #[test]
+    fn a_good_no_association_boot_fails_no_condition() {
+        let conditions = no_association_conditions(&good_no_association_evidence());
+
+        assert_eq!(failures(&conditions), [""; 0]);
+        assert_eq!(conditions.len(), 9);
+    }
+
+    #[test]
+    fn a_no_association_boot_that_returned_instead_of_restarting_fails() {
+        let mut instead = good_no_association_evidence();
+        let restart = "ERROR supervisor: restarting: no Wi-Fi association for 90 s";
+        instead.serial = instead.serial.replace(restart, "INFO  returning");
+        let log = instead.system_log.as_mut().unwrap();
+        *log = log.replace(restart, "INFO  returning");
+
+        assert_eq!(
+            failures(&no_association_conditions(&instead)),
+            [
+                "the serial console has `ERROR supervisor: restarting: no Wi-Fi association for 90 s`",
+                "the serial console does not have `INFO  returning`",
+                "qberrypi/log.txt on the card has `ERROR supervisor: restarting: no Wi-Fi association for 90 s`",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_no_association_boot_expects_its_own_error_and_no_other_complaint() {
+        let mut evidence = good_no_association_evidence();
+        evidence
+            .serial
+            .push_str("[ 113.000] ERROR log.txt: mounting /dev/mmcblk0p1: busy\n");
+        evidence
+            .serial
+            .push_str("[ 113.001] WARN  wifi: association lost\n");
+        assert_eq!(
+            failures(&no_association_conditions(&evidence)),
+            [NO_COMPLAINT_ON_SERIAL]
+        );
+        // A boot that never associated cannot have lost an association; and the other provoked
+        // failures' errors are no part of this one.
+        for stray in [PANIC_ENDING, CRASH_LOOP_ENDING] {
+            let mut evidence = good_no_association_evidence();
+            evidence.serial.push_str(stray);
+            assert_eq!(
+                failures(&no_association_conditions(&evidence)),
+                [NO_COMPLAINT_ON_SERIAL]
+            );
+        }
+    }
+
+    #[test]
+    fn a_no_association_boot_must_leave_the_card_as_a_one_shot_boot_does() {
+        let mut evidence = good_no_association_evidence();
+        evidence.active_config = Ok(CONFIG_TXT.as_bytes().to_vec());
+        evidence
+            .system_log
+            .as_mut()
+            .unwrap()
+            .push_str("==== boot, build 1700000000 ====\nexample-passphrase\n");
+        assert_eq!(
+            failures(&no_association_conditions(&evidence)),
+            [
+                "config.txt on the card equals config.pios.txt",
+                ONE_BOOT_OF_THIS_BUILD,
+                "qberrypi/log.txt on the card does not have `example-passphrase`",
+            ]
+        );
+    }
+
+    #[test]
+    fn the_no_association_scenario_has_no_return_of_its_own_and_every_other_returns_first() {
+        let all = scenarios(EXAMPLE).unwrap();
+        let debug_of = |scenario: &Scenario| {
+            qberrypi::config::parse(&scenario.system_config)
+                .map(|cfg| cfg.debug)
+                .ok()
+        };
+        let scenario = all.iter().find(|s| s.name == "no association").unwrap();
+        let debug = debug_of(scenario).unwrap();
+        assert_eq!(
+            (
+                debug.one_shot,
+                debug.log_to_sd,
+                debug.return_after_secs,
+                debug.fault
+            ),
+            (true, true, 0, qberrypi::config::Fault::NoWifi)
+        );
+        assert_eq!(scenario.machine, Machine::Usual);
+        assert!(scenario.note.is_none());
+        // The board's own Wi-Fi never associates in QEMU (there is no radio), so every scenario that
+        // runs the supervisor must return on its own before the 90 s of the rule have passed: the
+        // return is counted from the start of the boot, the rule from the supervisor's start.
+        for other in all.iter().filter(|s| s.name != "no association") {
+            if let Some(debug) = debug_of(other) {
+                assert!(
+                    (1..90).contains(&debug.return_after_secs),
+                    "{}: returns after {} s",
+                    other.name,
+                    debug.return_after_secs
+                );
+            }
+        }
+    }
+
+    /// What a permanent boot leaves behind when the supervisor meets a provoked crash loop: the
+    /// board's start as `good_fault_evidence` has it, no log on the card, and the image as it was.
+    fn good_permanent_crash_loop_evidence() -> Evidence {
+        let mut evidence = good_fault_evidence(CRASH_LOOP_ENDING);
+        evidence.system_log = Err("qberrypi/log.txt: not found".to_owned());
+        evidence.image_after = evidence.image_before.clone();
+        evidence
+    }
+
+    #[test]
+    fn a_good_permanent_crash_loop_boot_fails_no_condition() {
+        let conditions = permanent_crash_loop_conditions(&good_permanent_crash_loop_evidence());
+
+        assert_eq!(failures(&conditions), [""; 0]);
+        assert_eq!(conditions.len(), 6);
+    }
+
+    #[test]
+    fn a_permanent_crash_loop_boot_that_returned_instead_of_restarting_fails() {
+        let mut instead = good_permanent_crash_loop_evidence();
+        instead.serial = instead.serial.replace(
+            "ERROR supervisor: restarting: component fault failed 3 times in a minute",
+            "INFO  returning",
+        );
+
+        assert_eq!(
+            failures(&permanent_crash_loop_conditions(&instead)),
+            [
+                "the serial console has `ERROR supervisor: restarting: component fault failed 3 times in a minute`",
+                "the serial console does not have `INFO  returning`",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_permanent_crash_loop_boot_that_wrote_to_the_card_fails() {
+        let mut evidence = good_permanent_crash_loop_evidence();
+        evidence.image_after = "cc".to_owned();
+
+        assert_eq!(
+            failures(&permanent_crash_loop_conditions(&evidence)),
+            ["the card image has the SHA-256 it had before the boot"]
+        );
+    }
+
+    #[test]
+    fn a_permanent_crash_loop_boot_expects_the_loops_errors_and_no_other_complaint() {
+        let mut evidence = good_permanent_crash_loop_evidence();
+        evidence
+            .serial
+            .push_str("[  25.000] ERROR log.txt: mounting /dev/mmcblk0p1: busy\n");
+        evidence
+            .serial
+            .push_str("[  25.001] WARN  dns: no upstream answers\n");
+        assert_eq!(
+            failures(&permanent_crash_loop_conditions(&evidence)),
+            [NO_COMPLAINT_ON_SERIAL]
+        );
+        // The panic is no part of a crash loop.
+        let mut evidence = good_permanent_crash_loop_evidence();
+        evidence.serial.push_str(PANIC_ENDING);
+        assert_eq!(
+            failures(&permanent_crash_loop_conditions(&evidence)),
+            [NO_COMPLAINT_ON_SERIAL]
+        );
+    }
+
+    #[test]
+    fn the_permanent_crash_loop_scenario_keeps_both_card_switches_off_and_runs_a_minute() {
+        let all = scenarios(EXAMPLE).unwrap();
+        let scenario = all
+            .iter()
+            .find(|s| s.name == "permanent, crash loop")
+            .unwrap();
+        let debug = qberrypi::config::parse(&scenario.system_config)
+            .unwrap()
+            .debug;
+
+        assert_eq!(
+            (
+                debug.one_shot,
+                debug.log_to_sd,
+                debug.return_after_secs,
+                debug.fault
+            ),
+            (false, false, 60, qberrypi::config::Fault::CrashLoop)
+        );
+        assert_eq!(scenario.machine, Machine::Usual);
+        assert!(scenario.note.is_none());
+    }
+
+    #[test]
+    fn a_good_crash_loop_boot_fails_no_condition() {
+        let conditions = crash_loop_conditions(&good_fault_evidence(CRASH_LOOP_ENDING));
+
+        assert_eq!(failures(&conditions), [""; 0]);
+        assert_eq!(conditions.len(), 9);
+    }
+
+    #[test]
+    fn a_crash_loop_boot_that_returned_instead_of_restarting_fails() {
+        // The line that ends the loop, replaced by the line of a board that ran to its return.
+        let instead = good_fault_evidence(&CRASH_LOOP_ENDING.replace(
+            "ERROR supervisor: restarting: component fault failed 3 times in a minute",
+            "INFO  returning",
+        ));
+
+        assert_eq!(
+            failures(&crash_loop_conditions(&instead)),
+            [
+                "the serial console has `ERROR supervisor: restarting: component fault failed 3 times in a minute`",
+                "the serial console does not have `INFO  returning`",
+                "qberrypi/log.txt on the card has `ERROR supervisor: restarting: component fault failed 3 times in a minute`",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_good_panic_boot_fails_no_condition() {
+        let conditions = panic_conditions(&good_fault_evidence(PANIC_ENDING));
+
+        assert_eq!(failures(&conditions), [""; 0]);
+        assert_eq!(conditions.len(), 9);
+    }
+
+    #[test]
+    fn a_panic_boot_that_returned_instead_of_restarting_fails() {
+        let instead = good_fault_evidence(&PANIC_ENDING.replace(PANIC_LINE, "INFO  returning"));
+
+        assert_eq!(
+            failures(&panic_conditions(&instead)),
+            [
+                "the serial console has `fault: panic`",
+                "the serial console does not have `INFO  returning`",
+                "qberrypi/log.txt on the card has `ERROR panic at `",
+            ]
+        );
+    }
+
+    #[test]
+    fn the_provoked_failures_expect_their_own_errors_and_no_other_complaint() {
+        let stray = "[  25.000] ERROR log.txt: mounting /dev/mmcblk0p1: busy\n";
+        let odd = "[  25.001] WARN  dns: no upstream answers\n";
+        for (conditions, ending) in [
+            (
+                crash_loop_conditions as fn(&Evidence) -> Vec<Condition>,
+                CRASH_LOOP_ENDING,
+            ),
+            (panic_conditions, PANIC_ENDING),
+        ] {
+            let mut evidence = good_fault_evidence(ending);
+            evidence.serial.push_str(stray);
+            evidence.serial.push_str(odd);
+            assert_eq!(failures(&conditions(&evidence)), [NO_COMPLAINT_ON_SERIAL]);
+        }
+        // Each expects its own error only: the panic is no part of a crash loop, nor the loop of a panic.
+        let mut evidence = good_fault_evidence(CRASH_LOOP_ENDING);
+        evidence.serial.push_str(PANIC_ENDING);
+        assert_eq!(
+            failures(&crash_loop_conditions(&evidence)),
+            [NO_COMPLAINT_ON_SERIAL]
+        );
+        let mut evidence = good_fault_evidence(PANIC_ENDING);
+        evidence.serial.push_str(CRASH_LOOP_ENDING);
+        assert_eq!(
+            failures(&panic_conditions(&evidence)),
+            [NO_COMPLAINT_ON_SERIAL]
+        );
+    }
+
+    #[test]
+    fn a_provoked_failure_boot_must_leave_the_card_as_a_one_shot_boot_does() {
+        for (conditions, ending) in [
+            (
+                crash_loop_conditions as fn(&Evidence) -> Vec<Condition>,
+                CRASH_LOOP_ENDING,
+            ),
+            (panic_conditions, PANIC_ENDING),
+        ] {
+            let mut evidence = good_fault_evidence(ending);
+            evidence.active_config = Ok(CONFIG_TXT.as_bytes().to_vec());
+            evidence
+                .system_log
+                .as_mut()
+                .unwrap()
+                .push_str("==== boot, build 1700000000 ====\n");
+            evidence
+                .system_log
+                .as_mut()
+                .unwrap()
+                .push_str("example-passphrase\n");
+            assert_eq!(
+                failures(&conditions(&evidence)),
+                [
+                    "config.txt on the card equals config.pios.txt",
+                    ONE_BOOT_OF_THIS_BUILD,
+                    "qberrypi/log.txt on the card does not have `example-passphrase`",
+                ]
+            );
+        }
+    }
+
+    #[test]
+    fn the_provoked_failure_scenarios_name_their_fault_and_run_a_minute_on_the_usual_machine() {
+        let all = scenarios(EXAMPLE).unwrap();
+        for (name, fault) in [
+            ("crash loop", qberrypi::config::Fault::CrashLoop),
+            ("panic", qberrypi::config::Fault::Panic),
+        ] {
+            let scenario = all.iter().find(|s| s.name == name).unwrap();
+            let debug = qberrypi::config::parse(&scenario.system_config)
+                .unwrap()
+                .debug;
+            assert_eq!(
+                (
+                    debug.one_shot,
+                    debug.log_to_sd,
+                    debug.return_after_secs,
+                    debug.fault
+                ),
+                (true, true, 60, fault),
+                "{name}"
+            );
+            assert_eq!(scenario.machine, Machine::Usual, "{name}");
+            assert!(scenario.note.is_none(), "{name}");
+        }
+        // No other scenario provokes anything.
+        for scenario in &all {
+            if let Ok(cfg) = qberrypi::config::parse(&scenario.system_config)
+                && !matches!(
+                    scenario.name,
+                    "crash loop" | "panic" | "no association" | "permanent, crash loop"
+                )
+            {
+                assert_eq!(
+                    cfg.debug.fault,
+                    qberrypi::config::Fault::None,
+                    "{}",
+                    scenario.name
+                );
+            }
+        }
     }
 
     /// What init logs in a one-shot boot without a console, as the card's log holds it.
@@ -1940,10 +3182,16 @@ mod tests {
         format!(
             "==== boot, build 1700000000 ====\n\
              [   0.003] INFO  qberrypi {} (build 1700000000)\n\
+             [   0.003] INFO  boot: init started 1.500 s after the kernel\n\
              [   0.005] WARN  /dev/console: No such device (os error 19)\n\
              [   0.050] INFO  config.txt: Restored\n\
              [   0.051] WARN  watchdog: No such file or directory (os error 2)\n\
-             [   0.182] WARN  activity LED: No such file or directory (os error 2)\n\
+             [   0.182] INFO  cpu: governor performance\n\
+             [   0.185] WARN  activity LED: No such file or directory (os error 2)\n\
+             [   2.350] WARN  panel: no fb_ili9486 framebuffer; running without it\n\
+             [  20.200] INFO  net: lo is up\n\
+             [  20.250] INFO  regulatory: country US, as configured\n\
+             [  20.255] WARN  wifi: wlan0 is absent, not joining\n\
              [  20.265] INFO  returning\n",
             qberrypi::VERSION
         )
@@ -1967,7 +3215,7 @@ mod tests {
         let conditions = no_console_conditions(&good_no_console_evidence());
 
         assert_eq!(failures(&conditions), [""; 0]);
-        assert_eq!(conditions.len(), 9);
+        assert_eq!(conditions.len(), 10);
     }
 
     #[test]
@@ -1990,6 +3238,7 @@ mod tests {
                     "qberrypi/log.txt on the card has `qberrypi {} (build `",
                     qberrypi::VERSION
                 ),
+                "qberrypi/log.txt on the card has `INFO  regulatory: country US, as configured`",
                 "qberrypi/log.txt on the card has `INFO  returning`",
                 ONE_BOOT_OF_THIS_BUILD,
                 "qberrypi/log.txt on the card does not have `example-passphrase`",
@@ -2015,6 +3264,7 @@ mod tests {
         assert_eq!(
             failures(&conditions),
             [
+                "qberrypi/log.txt on the card has `INFO  regulatory: country US, as configured`",
                 "qberrypi/log.txt on the card has `INFO  returning`",
                 NO_COMPLAINT_IN_LOG,
             ]
@@ -2197,7 +3447,7 @@ mod tests {
         let conditions = shipped_conditions(&good_shipped_evidence());
 
         assert_eq!(failures(&conditions), [""; 0]);
-        assert_eq!(conditions.len(), 8);
+        assert_eq!(conditions.len(), 9);
         // It is judged from the card: nothing is left unchecked.
         assert!(
             conditions
@@ -2244,6 +3494,7 @@ mod tests {
                     "qberrypi/log.txt on the card has `qberrypi {} (build `",
                     qberrypi::VERSION
                 ),
+                "qberrypi/log.txt on the card has `INFO  regulatory: country US, as configured`",
                 "qberrypi/log.txt on the card has `INFO  returning`",
             ]
         );
@@ -2260,7 +3511,7 @@ mod tests {
         let mut lines = report.lines();
         assert_eq!(
             lines.next().unwrap(),
-            "one-shot: ok (42 s; 15 of 16 conditions hold, 1 cannot be checked in QEMU)"
+            "one-shot: ok (42 s; 31 of 32 conditions hold, 1 cannot be checked in QEMU)"
         );
         let unchecked = lines.next().unwrap();
         assert!(
@@ -2286,7 +3537,7 @@ mod tests {
         assert!(!held);
         assert_eq!(
             report,
-            "one-shot: FAILED (7 s; 14 of 16 conditions hold)\n  \
+            "one-shot: FAILED (7 s; 30 of 32 conditions hold)\n  \
              FAILED: config.txt on the card equals config.pios.txt: \
              it is \"os_prefix=qberrypi/\\n\"\n  \
              FAILED: init logged no ERROR and no unexpected WARN on the serial console: \
@@ -2309,11 +3560,195 @@ mod tests {
         let lines: Vec<&str> = report.lines().collect();
         assert_eq!(
             lines[0],
-            "no console: ok (23 s; 8 of 9 conditions hold, 1 cannot be checked in QEMU)"
+            "no console: ok (23 s; 9 of 10 conditions hold, 1 cannot be checked in QEMU)"
         );
         assert_eq!(lines[1], "  note: judged by the card.");
         assert!(lines[2].starts_with("  cannot be checked in QEMU: "));
         assert_eq!(lines.len(), 3);
+    }
+
+    /// What the boot of the DNS self-test leaves behind when it went well, in QEMU: the
+    /// self-test's lines among the services', the warning of a resolver with nowhere to forward
+    /// to, and the return a minute in.
+    fn good_dns_selftest_evidence() -> Evidence {
+        let mut evidence = good_evidence();
+        evidence.serial = evidence.serial.replace(
+            "[  22.310] INFO  dns: listening on 0.0.0.0:53\n",
+            "[  22.250] INFO  lists: snapshot: 302176 names, fetched unix 1800000000, loaded in 900 ms\n\
+             [  22.310] INFO  dns: listening on 0.0.0.0:53\n\
+             [  22.360] INFO  api: listening on 0.0.0.0:443\n",
+        );
+        evidence.serial = evidence.serial.replace(
+            "[  40.000] INFO  returning\n",
+            "[  22.700] INFO  selftest: dns: udp qberrypi-selftest.invalid A: NOERROR 0.0.0.0\n\
+             [  22.710] INFO  selftest: dns: tcp qberrypi-selftest.invalid A: NOERROR 0.0.0.0\n\
+             [  22.720] INFO  selftest: dns: udp printer A: NXDOMAIN\n\
+             [  22.725] INFO  selftest: dns: udp qberrypi-snapshot.invalid A: NOERROR 0.0.0.0\n\
+             [  22.730] WARN  dns: no upstream answers\n\
+             [  22.731] INFO  selftest: dns: udp example.com A: SERVFAIL\n\
+             [  22.740] INFO  selftest: status: /api/v1/stats: 200\n\
+             [  22.741] INFO  selftest: dns: done\n\
+             [  60.000] INFO  returning\n",
+        );
+        evidence
+            .system_log
+            .as_mut()
+            .unwrap()
+            .push_str("[  22.741] INFO  selftest: dns: done\n");
+        evidence
+    }
+
+    #[test]
+    fn a_good_dns_selftest_boot_fails_no_condition() {
+        let conditions = dns_selftest_conditions(&good_dns_selftest_evidence());
+
+        assert_eq!(failures(&conditions), [""; 0]);
+        assert_eq!(conditions.len(), 27);
+    }
+
+    #[test]
+    fn the_warning_of_a_resolver_with_no_upstream_is_expected_in_the_dns_boot_only() {
+        let evidence = good_dns_selftest_evidence();
+        assert!(evidence.serial.contains(NO_UPSTREAM));
+
+        assert_eq!(
+            failures(&one_shot_conditions(&evidence)),
+            [NO_COMPLAINT_ON_SERIAL]
+        );
+    }
+
+    #[test]
+    fn each_thing_wrong_with_the_dns_selftest_boot_fails_its_condition() {
+        /// What the failed condition is about, and what makes the evidence wrong.
+        type Wrong = (&'static str, fn(&mut Evidence));
+        let wrong: [Wrong; 22] = [
+            ("has `INFO  services: started`", |e| {
+                e.serial = e.serial.replace("services: started", "services: startup")
+            }),
+            // The API did not bind port 443, or its certificate was refused.
+            ("has `INFO  api: listening on 0.0.0.0:443`", |e| {
+                e.serial = e.serial.replace("api: listening on", "api: listening at")
+            }),
+            // A line that shows the TLS key, on the console or in the card's log.
+            ("serial console does not have `PRIVATE KEY`", |e| {
+                e.serial.push_str("-----BEGIN PRIVATE KEY-----\n")
+            }),
+            ("log.txt on the card does not have `PRIVATE KEY`", |e| {
+                e.system_log.as_mut().unwrap().push_str("PRIVATE KEY")
+            }),
+            ("has `INFO  dns: listening on 0.0.0.0:53`", |e| {
+                e.serial = e.serial.replace("dns: listening on", "dns: listening at")
+            }),
+            ("has `INFO  status: listening on 0.0.0.0:80`", |e| {
+                e.serial = e
+                    .serial
+                    .replace("status: listening on", "status: listening at")
+            }),
+            // The denied name is answered by an upstream, or by nothing, or not by TCP.
+            (
+                "has `INFO  selftest: dns: udp qberrypi-selftest.invalid A: NOERROR 0.0.0.0`",
+                |e| {
+                    e.serial = e.serial.replace(
+                        "udp qberrypi-selftest.invalid A: NOERROR 0.0.0.0",
+                        "udp qberrypi-selftest.invalid A: SERVFAIL",
+                    )
+                },
+            ),
+            (
+                "has `INFO  selftest: dns: tcp qberrypi-selftest.invalid A: NOERROR 0.0.0.0`",
+                |e| {
+                    e.serial = e.serial.replace(
+                        "tcp qberrypi-selftest.invalid A: NOERROR 0.0.0.0",
+                        "tcp qberrypi-selftest.invalid A: no answer",
+                    )
+                },
+            ),
+            ("has `INFO  selftest: dns: udp printer A: NXDOMAIN`", |e| {
+                e.serial = e
+                    .serial
+                    .replace("printer A: NXDOMAIN", "printer A: NOERROR 192.0.2.1")
+            }),
+            // The snapshot was not loaded, or loaded but not blocking: the marker is answered by
+            // an upstream, or by nothing.
+            ("has `INFO  lists: snapshot: `", |e| {
+                e.serial = e
+                    .serial
+                    .replace("lists: snapshot: ", "lists: no snapshot: ")
+            }),
+            (
+                "has `INFO  selftest: dns: udp qberrypi-snapshot.invalid A: NOERROR 0.0.0.0`",
+                |e| {
+                    e.serial = e.serial.replace(
+                        "udp qberrypi-snapshot.invalid A: NOERROR 0.0.0.0",
+                        "udp qberrypi-snapshot.invalid A: SERVFAIL",
+                    )
+                },
+            ),
+            // Forwarded and answered, which no guest without a network card can see.
+            (
+                "has `INFO  selftest: dns: udp example.com A: SERVFAIL`",
+                |e| {
+                    e.serial = e
+                        .serial
+                        .replace("example.com A: SERVFAIL", "example.com A: no answer")
+                },
+            ),
+            ("has `INFO  selftest: status: /api/v1/stats: 200`", |e| {
+                e.serial = e.serial.replace("stats: 200", "stats: no answer")
+            }),
+            ("has `INFO  selftest: dns: done`", |e| {
+                e.serial = e.serial.replace("INFO  selftest: dns: done", "")
+            }),
+            ("has `INFO  clock: waiting for a default route`", |e| {
+                e.serial = e
+                    .serial
+                    .replace("clock: waiting for a default route", "clock: stopped")
+            }),
+            ("has `INFO  lists: waiting for the clock`", |e| {
+                e.serial = e
+                    .serial
+                    .replace("lists: waiting for the clock", "lists: stopped")
+            }),
+            // A network where there is none.
+            ("does not have `clock: set by SNTP`", |e| {
+                e.serial
+                    .push_str("[  30.000] INFO  clock: set by SNTP to 1800000000\n")
+            }),
+            ("log.txt on the card has `selftest: dns: done`", |e| {
+                let log = e.system_log.as_mut().unwrap();
+                *log = log.replace("selftest: dns: done", "");
+            }),
+            // The self-test ran before `lo` was up.
+            (NO_COMPLAINT_ON_SERIAL, |e| {
+                e.serial
+                    .push_str("[  22.000] ERROR selftest: lo is not up\n")
+            }),
+            // An upstream that is given up on is a state this boot cannot have: none was asked
+            // for long enough, and every send failed at once.
+            (NO_COMPLAINT_ON_SERIAL, |e| {
+                e.serial
+                    .push_str("[  22.800] WARN  dns: upstream 192.0.2.53 does not answer\n")
+            }),
+            ("serial console does not have `example-passphrase`", |e| {
+                e.serial.push_str(PASSPHRASE)
+            }),
+            (
+                "log.txt on the card does not have `example-passphrase`",
+                |e| e.system_log.as_mut().unwrap().push_str(PASSPHRASE),
+            ),
+        ];
+        for (about, spoil) in wrong {
+            let mut evidence = good_dns_selftest_evidence();
+            spoil(&mut evidence);
+
+            let conditions = dns_selftest_conditions(&evidence);
+
+            let failed = failures(&conditions);
+            assert!(
+                failed.iter().any(|what| what.contains(about)),
+                "{about}: {failed:?}"
+            );
+        }
     }
 
     #[test]
@@ -2321,6 +3756,291 @@ mod tests {
         assert_eq!(last_lines("a\nb\nc\n", 2), ["b", "c"]);
         assert_eq!(last_lines("a\nb\n", 40), ["a", "b"]);
         assert_eq!(last_lines("", 40), [""; 0]);
+    }
+
+    #[test]
+    fn the_serial_tail_of_a_failed_scenario_is_one_block_of_whole_lines() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("one-shot.log");
+        let boot: String = (1..=SERIAL_TAIL_LINES + 5)
+            .map(|line| format!("line {line}\n"))
+            .collect();
+        fs::write(&log, boot).unwrap();
+
+        let tail = serial_tail(&log);
+
+        let lines: Vec<&str> = tail.lines().collect();
+        assert_eq!(
+            lines[0],
+            format!(
+                "  the last {SERIAL_TAIL_LINES} lines of the serial console ({}):",
+                log.display()
+            )
+        );
+        assert_eq!(lines[1], "    line 6");
+        assert_eq!(lines.last(), Some(&"    line 45"));
+        assert_eq!(lines.len(), SERIAL_TAIL_LINES + 1);
+        assert!(tail.ends_with('\n'));
+        // A log that was never written is an empty console, not an error.
+        let nothing = serial_tail(&dir.path().join("missing.log"));
+        assert_eq!(nothing.lines().count(), 1);
+    }
+
+    /// A `/proc/meminfo` that says `kib` KiB are available.
+    fn meminfo(kib: u64) -> String {
+        format!(
+            "MemTotal:       32000000 kB\nMemFree:          100 kB\nMemAvailable: {kib:>10} kB\n"
+        )
+    }
+
+    const GIB: u64 = 1024 * 1024;
+
+    #[test]
+    fn the_memory_available_is_the_memavailable_line_in_bytes() {
+        assert_eq!(
+            mem_available_bytes(&meminfo(5 * GIB)),
+            Some(5 * 1024 * 1024 * 1024)
+        );
+        assert_eq!(mem_available_bytes("MemAvailable: 1 kB"), Some(1024));
+    }
+
+    #[test]
+    fn memory_that_meminfo_does_not_state_in_kilobytes_is_unknown() {
+        for text in [
+            "",
+            "no such field\n",
+            "MemTotal: 5 kB\n",
+            "MemAvailable:\n",
+            "MemAvailable: lots kB\n",
+            "MemAvailable: 5\n",
+            "MemAvailable: 5 MB\n",
+            "MemAvailableAlmost: 5 kB\n",
+            " MemAvailable: 5 kB\n",
+            "MemAvailable: 18446744073709551615 kB\n",
+        ] {
+            assert_eq!(mem_available_bytes(text), None, "{text:?}");
+        }
+    }
+
+    #[test]
+    fn the_default_jobs_are_the_smallest_of_scenarios_half_the_cores_and_memory_for_guests() {
+        let cases: [(usize, Option<usize>, Option<String>, usize); 11] = [
+            // 5 GiB / 1.25 GiB = 4; 12 / 2 = 6; 6 scenarios.
+            (6, Some(12), Some(meminfo(5 * GIB)), 4),
+            (6, Some(4), Some(meminfo(64 * GIB)), 2),
+            (3, Some(64), Some(meminfo(64 * GIB)), 3),
+            // Under 1.25 GiB is still one.
+            (6, Some(12), Some("MemAvailable: 1000000 kB\n".into()), 1),
+            // 1.25 GiB exactly is one, and a byte short of 2.5 GiB is still one.
+            (6, Some(12), Some(meminfo(GIB * 5 / 4)), 1),
+            (6, Some(12), Some(meminfo(GIB * 5 / 2 - 1)), 1),
+            (6, Some(12), Some(meminfo(GIB * 5 / 2)), 2),
+            // 1 / 2 = 0, which is still one.
+            (6, Some(1), None, 1),
+            // A term that cannot be read is left out, not taken for one.
+            (6, None, None, 6),
+            (6, Some(12), Some("no such field\n".into()), 6),
+            (6, None, Some(meminfo(5 * GIB)), 4),
+        ];
+        for (scenarios, cores, meminfo, expected) in cases {
+            assert_eq!(
+                default_jobs(scenarios, cores, meminfo.as_deref()),
+                expected,
+                "{scenarios} scenarios, {cores:?} cores, {meminfo:?}"
+            );
+        }
+        assert_eq!(default_jobs(6, Some(8), None), 4);
+    }
+
+    #[test]
+    fn blocks_are_due_in_order_however_they_finish() {
+        let mut order = InOrder::default();
+
+        assert_eq!(order.finished(2, "2".into()), [""; 0]);
+        assert_eq!(order.finished(0, "0".into()), ["0"]);
+        assert_eq!(order.finished(1, "1".into()), ["1", "2"]);
+        assert_eq!(order.finished(3, "3".into()), ["3"]);
+    }
+
+    #[test]
+    fn the_runner_gives_back_what_each_job_made_in_the_order_of_the_jobs() {
+        let mut finished = Vec::new();
+
+        let made = run_concurrently(
+            5,
+            3,
+            |index| {
+                // The later ones are done first.
+                thread::sleep(Duration::from_millis(40 * (5 - index as u64)));
+                Ok(index * 10)
+            },
+            |index, result| finished.push((index, *result.as_ref().unwrap())),
+        )
+        .unwrap();
+
+        assert_eq!(made, [0, 10, 20, 30, 40]);
+        finished.sort();
+        assert_eq!(finished, [(0, 0), (1, 10), (2, 20), (3, 30), (4, 40)]);
+    }
+
+    #[test]
+    fn the_runner_runs_as_many_jobs_at_once_as_it_is_given_and_no_more() {
+        use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+        let (running, most) = (AtomicUsize::new(0), AtomicUsize::new(0));
+
+        run_concurrently(
+            6,
+            2,
+            |index| {
+                most.fetch_max(running.fetch_add(1, SeqCst) + 1, SeqCst);
+                // The first two wait for each other, so that they are known to overlap.
+                let waiting_since = Instant::now();
+                while index < 2 && running.load(SeqCst) < 2 && waiting_since.elapsed().as_secs() < 5
+                {
+                    thread::sleep(Duration::from_millis(5));
+                }
+                thread::sleep(Duration::from_millis(30));
+                running.fetch_sub(1, SeqCst);
+                Ok(())
+            },
+            |_, _| {},
+        )
+        .unwrap();
+
+        assert_eq!(most.load(SeqCst), 2);
+    }
+
+    #[test]
+    fn the_runner_can_have_more_jobs_than_work() {
+        let made = run_concurrently(2, 9, Ok, |_, _| {}).unwrap();
+
+        assert_eq!(made, [0, 1]);
+        assert!(run_concurrently(0, 4, Ok, |_, _| {}).unwrap().is_empty());
+    }
+
+    #[test]
+    fn the_error_returned_is_the_first_in_the_order_of_the_jobs_not_the_first_to_happen() {
+        let mut finished = Vec::new();
+
+        let error = run_concurrently(
+            4,
+            4,
+            |index| match index {
+                1 => {
+                    thread::sleep(Duration::from_millis(150));
+                    bail!("one")
+                }
+                3 => bail!("three"),
+                _ => Ok(index),
+            },
+            |index, _| finished.push(index),
+        )
+        .unwrap_err();
+
+        assert_eq!(error.to_string(), "one");
+        // Every job that was started is accounted for, the failed ones too.
+        finished.sort();
+        assert_eq!(finished, [0, 1, 2, 3]);
+    }
+
+    /// Where the stand-in guest of a job writes its process id.
+    fn pid_file(dir: &Path, index: usize) -> PathBuf {
+        dir.join(format!("guest-{index}.pid"))
+    }
+
+    /// A job that boots a stand-in guest, which would run for 30 s if its guard did not stop it.
+    fn stand_in_guest(dir: &Path, index: usize) -> Result<bool> {
+        let script = format!(
+            "echo $$ > {}; exec sleep 30",
+            pid_file(dir, index).display()
+        );
+        let (_, exited) = run_guest(shell(&script), Duration::from_secs(1), None)?;
+        Ok(exited)
+    }
+
+    /// Waits until the stand-in guests of these jobs are running.
+    fn wait_for_stand_ins(dir: &Path, indexes: &[usize]) {
+        let waiting_since = Instant::now();
+        while indexes.iter().any(|&index| !pid_file(dir, index).exists()) {
+            assert!(
+                waiting_since.elapsed().as_secs() < 10,
+                "stand-ins did not start"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    /// Asserts that the stand-in guest of each of these jobs is gone.
+    fn assert_stand_ins_are_gone(dir: &Path, indexes: &[usize]) {
+        for &index in indexes {
+            let pid = fs::read_to_string(pid_file(dir, index)).unwrap();
+            let pid = pid.trim();
+            assert!(
+                !is_running(pid),
+                "the guest of job {index} ({pid}) was left running"
+            );
+        }
+    }
+
+    #[test]
+    fn a_job_that_fails_stops_new_ones_and_leaves_no_guest_running() {
+        use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+        let dir = tempfile::tempdir().unwrap();
+        let begun = AtomicUsize::new(0);
+        let started = Instant::now();
+
+        let error = run_concurrently(
+            6,
+            3,
+            |index| {
+                begun.fetch_add(1, SeqCst);
+                if index == 0 {
+                    // Fails only once the other two guests are running.
+                    wait_for_stand_ins(dir.path(), &[1, 2]);
+                    bail!("job 0 could not be run");
+                }
+                stand_in_guest(dir.path(), index)
+            },
+            |_, _| {},
+        )
+        .unwrap_err();
+
+        // Back once the guards have stopped the guests: far less than the 30 s they would run.
+        assert!(started.elapsed() < Duration::from_secs(15));
+        assert_eq!(error.to_string(), "job 0 could not be run");
+        assert_eq!(begun.load(SeqCst), 3, "a job was started after the failure");
+        assert_stand_ins_are_gone(dir.path(), &[1, 2]);
+    }
+
+    #[test]
+    fn a_job_that_panics_is_passed_on_only_once_every_guest_is_gone() {
+        use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+        let dir = tempfile::tempdir().unwrap();
+        let begun = AtomicUsize::new(0);
+        let started = Instant::now();
+
+        let panic = catch_unwind(AssertUnwindSafe(|| {
+            run_concurrently(
+                6,
+                3,
+                |index| {
+                    begun.fetch_add(1, SeqCst);
+                    if index == 0 {
+                        wait_for_stand_ins(dir.path(), &[1, 2]);
+                        panic!("job 0 blew up");
+                    }
+                    stand_in_guest(dir.path(), index)
+                },
+                |_, _| {},
+            )
+        }))
+        .unwrap_err();
+
+        // The panic arrives as it was raised, after the other jobs are over.
+        assert_eq!(panic.downcast_ref::<&str>(), Some(&"job 0 blew up"));
+        assert!(started.elapsed() < Duration::from_secs(15));
+        assert_eq!(begun.load(SeqCst), 3, "a job was started after the panic");
+        assert_stand_ins_are_gone(dir.path(), &[1, 2]);
     }
 
     /// A boot folder with stand-ins for its files and checksums that match.
@@ -2341,6 +4061,35 @@ mod tests {
     #[test]
     fn a_boot_folder_that_matches_its_checksums_is_accepted() {
         verify_boot_folder(boot_folder().path()).unwrap();
+    }
+
+    #[test]
+    fn a_boot_folder_that_carries_the_overlay_files_is_checked_with_them() {
+        let dir = boot_folder();
+        let overlays: [(&str, &[u8]); 3] = [
+            ("ov-README", b"readme"),
+            ("ov-overlay_map.dtb", b"map"),
+            ("ov-qb-piscreen.dtbo", b"screen"),
+        ];
+        let mut listed: Vec<(&str, &[u8])> = vec![
+            (KERNEL, b"kernel"),
+            (DEVICE_TREE, b"dtb"),
+            (INITRAMFS, b"initramfs"),
+        ];
+        listed.extend(overlays);
+        for (name, data) in overlays {
+            fs::write(dir.path().join(name), data).unwrap();
+        }
+        fs::write(dir.path().join(CHECKSUMS), sha256sums(&listed)).unwrap();
+
+        verify_boot_folder(dir.path()).unwrap();
+
+        // One of them damaged is as much a stale build as a damaged kernel.
+        fs::write(dir.path().join("ov-qb-piscreen.dtbo"), b"changed").unwrap();
+        let e = verify_boot_folder(dir.path()).unwrap_err();
+        let e = format!("{e:#}");
+        assert!(e.contains("ov-qb-piscreen.dtbo"), "{e}");
+        assert!(e.contains("cargo xtask build"), "{e}");
     }
 
     #[test]

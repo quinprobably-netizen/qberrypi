@@ -1,0 +1,19 @@
+[Adblock Plus]
+! Synthetic sample for qb-dns tests. Every name is reserved (RFC 2606, RFC 6761).
+! Number of entries: 6
+||ads.example.com^
+||Tracker.Example.NET^
+||xn--bcher-kva.example^
+||example.org^
+||ads.example.com^
+||test^
+||options.example.com^$third-party
+||important.example.com^$important
+@@||allowed.example.com^
+||*.wild.example.com^
+||noseparator.example.com
+/banner/ads/*
+example.com##.ad-banner
+|http://exact.example.com/|
+||bad..name.example^
+||spa ce.example.com^

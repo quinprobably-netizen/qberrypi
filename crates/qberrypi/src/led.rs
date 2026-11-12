@@ -12,7 +12,7 @@ use std::path::Path;
 pub const LED_DIR: &str = "/sys/class/leds/ACT";
 
 /// What the LED can say about the system.
-#[derive(Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LedState {
     /// Up and answering: a slow heartbeat.
     Serving,

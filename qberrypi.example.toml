@@ -1,4 +1,5 @@
 hostname = "qberrypi"
+timezone = "UTC0"          # a POSIX TZ rule; yours is the last line of your zone's file: tail -n 1 /usr/share/zoneinfo/Europe/Berlin
 
 [wifi]
 ssid = "example-network"
@@ -8,17 +9,68 @@ country = "US"
 [net]
 address = "192.0.2.53/24"
 gateway = "192.0.2.1"
+time_servers = ["time.cloudflare.com", "time.google.com"]
 
 [dns]
 upstreams = ["9.9.9.9", "149.112.112.112"]
 lists = [
   "https://raw.githubusercontent.com/StevenBlack/hosts/master/hosts",
   "https://raw.githubusercontent.com/hagezi/dns-blocklists/main/adblock/pro.txt",
+  # public DoH resolvers, so devices fall back to this resolver; remove to allow them
+  "https://raw.githubusercontent.com/hagezi/dns-blocklists/main/adblock/doh.txt",
+]
+# malware, phishing and scam names, and newly registered random-looking names; a hit also raises an
+# alert. Not in the image's snapshot: blocked from the first refresh.
+threat_lists = [
+  "https://raw.githubusercontent.com/hagezi/dns-blocklists/main/adblock/tif.medium.txt",
+  "https://raw.githubusercontent.com/hagezi/nrd/main/adblock/dga7.txt",
 ]
 deny = []
 allow = []
+doh_canary = true         # NXDOMAIN for use-application-dns.net, which turns off browsers' own DoH
+
+[upstream]
+tls = false                 # DNS-over-TLS on port 853. Once on, nothing is forwarded unencrypted: until the
+                            # clock is set (a certificate check needs it) only the time servers' names are
+                            # looked up in the clear, and other forwarded questions wait or fail
+tls_name = "dns.quad9.net"  # the name on the upstreams' certificate
+
+[speed]
+prefetch = false    # renew popular answers shortly before they expire
+# runtime_cpu = 1   # pin the DNS runtime to this core (0-3); core 0 takes the Wi-Fi and SPI interrupts
 
 [debug]
 one_shot = false          # restore Raspberry Pi OS's config.txt at every boot
 log_to_sd = false         # append the log to qberrypi/log.txt
 return_after_secs = 0     # restart after this long; 0 means never
+calibrate_touch = false   # show four crosses to tap and log the touch calibration
+fault = "none"            # development only: provoke a failure to watch the recovery
+
+# The touch screen's calibration, here at its defaults. A boot with
+# calibrate_touch = true prints these lines for your own screen.
+# [panel]
+# touch_left = 200
+# touch_right = 3900
+# touch_top = 200
+# touch_bottom = 3900
+# touch_swap_xy = false
+
+# What the watchdog is told to leave alone. Both keys are optional, and a file without this
+# section behaves as the values below say.
+#   rebind_allow  names that may answer a private address (10/8, 172.16/12, 192.168/16, fc00::/7,
+#                 loopback, link-local) without being blocked: a media server's names, say. Any
+#                 other public name that does gets 0.0.0.0 instead, and an alert. A name stands
+#                 for itself and everything below it. [] allows none; plex.direct is Plex's.
+#   quiet         names that the behaviour alerts (random names, tunnelling, beaconing, bursts)
+#                 do not count a question for, because they are noisy on purpose.
+# [watch]
+# rebind_allow = ["plex.direct"]
+# quiet = []
+
+# The Pi-hole API that qnet and other Pi-hole clients use, served over TLS on port 443. Without
+# this section there is none. password_hash is made from the password that opens it: pipe the
+# password into `cargo xtask hash-password` (so that it is never shown) and paste the line it
+# prints. The line below is for the password "example" and a salt of zeros, so make your own.
+# Run `cargo xtask make-cert` once before deploying with [api] set.
+# [api]
+# password_hash = "$pbkdf2-sha256$i=100000$00000000000000000000000000000000$fc75aed9ead867673337593df6b35ff94cdddeece7b4ef4a446497942ac0fbf9"
