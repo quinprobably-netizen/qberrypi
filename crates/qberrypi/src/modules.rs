@@ -138,6 +138,11 @@ impl ModuleTable {
         Ok(table)
     }
 
+    /// The modules of the table, in the table's order.
+    pub fn entries(&self) -> &[ModuleEntry] {
+        &self.entries
+    }
+
     /// The file of every module in the table, in the table's order.
     pub fn files(&self) -> impl Iterator<Item = &str> {
         self.entries.iter().map(|entry| entry.file.as_str())

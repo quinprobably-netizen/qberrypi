@@ -2327,6 +2327,8 @@ dependencies = [
  "qb-wpa2",
  "qberrypi",
  "rcgen",
+ "rustix",
+ "rustls",
  "serde_json",
  "sha2",
  "tar",

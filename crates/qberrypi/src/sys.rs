@@ -419,6 +419,11 @@ pub fn register_module_helper(path: &str) -> io::Result<()> {
     fs::write(MODULE_HELPER_SETTING, path)
 }
 
+/// The kernel's command line, as `/proc/cmdline` has it (one line, with its line end).
+pub fn kernel_cmdline() -> io::Result<String> {
+    fs::read_to_string(KERNEL_COMMAND_LINE)
+}
+
 /// Whether the kernel was started with an argument, given as a whole word.
 pub fn kernel_arg(name: &str) -> bool {
     fs::read_to_string(KERNEL_COMMAND_LINE).is_ok_and(|cmdline| cmdline_has(&cmdline, name))
@@ -452,6 +457,37 @@ pub fn reboot() -> ! {
     // The restart was refused. If the watchdog has been started, it is no
     // longer petted from here and restarts the board instead. Before that,
     // in the first steps of the boot, nothing does: init stays here.
+    loop {
+        thread::sleep(Duration::from_secs(60));
+    }
+}
+
+/// The command that `reboot_tryboot` gives the kernel: the firmware's driver takes the word
+/// `tryboot` after the partition `0` and sets the one-shot flag that makes the firmware read
+/// `tryboot.txt` at the next start.
+const TRYBOOT_COMMAND: &CStr = c"0 tryboot";
+
+/// Writes everything to the card and restarts the board in the firmware's `tryboot` mode.
+///
+/// The kernel is asked with `LINUX_REBOOT_CMD_RESTART2` and the command `0 tryboot`, and logs
+/// `reboot: Restarting system with command '0 tryboot'` before it restarts. The firmware clears
+/// the flag before it starts the system, so only this one start reads `tryboot.txt`. If the
+/// restart is refused the board waits as [`reboot`] does: the watchdog, if it runs, restarts it
+/// plainly, which boots the slot that `config.txt` selects.
+pub fn reboot_tryboot() -> ! {
+    sync();
+    // SAFETY: `reboot(2)` reads no memory but the command string, which the kernel copies in
+    // before the call returns; the pointer is to a NUL-terminated string that lives for the
+    // whole program. The call restarts the machine or fails with an error that is ignored.
+    let _ = unsafe {
+        libc::syscall(
+            libc::SYS_reboot,
+            libc::LINUX_REBOOT_MAGIC1,
+            libc::LINUX_REBOOT_MAGIC2,
+            libc::LINUX_REBOOT_CMD_RESTART2,
+            TRYBOOT_COMMAND.as_ptr(),
+        )
+    };
     loop {
         thread::sleep(Duration::from_secs(60));
     }
@@ -800,6 +836,14 @@ mod tests {
     use rustix::net::RecvFlags;
 
     const SELFTEST: &str = "qberrypi.selftest";
+
+    #[test]
+    fn the_tryboot_restart_gives_the_kernel_the_firmwares_command() {
+        // The word the firmware's driver acts on, after the partition it is for: nothing else
+        // of this call can be run here, so the text it carries is what is pinned.
+        assert_eq!(TRYBOOT_COMMAND.to_bytes(), b"0 tryboot");
+        assert_eq!(TRYBOOT_COMMAND.to_bytes_with_nul(), b"0 tryboot\0");
+    }
 
     #[test]
     fn the_soft_limit_on_open_files_goes_up_to_the_hard_one_and_never_down() {

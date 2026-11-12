@@ -20,6 +20,9 @@ pub struct WifiStatus {
     pub signal_dbm: Option<i8>,
     /// The name of the access point, if it is known.
     pub ap: Option<String>,
+    /// The frequency, in MHz, of the channel the access point is joined on, if it is known: what the
+    /// join found when it scanned. It is what `wifi.hint_mhz` takes.
+    pub freq_mhz: Option<u32>,
 }
 
 /// Everything known at one moment.

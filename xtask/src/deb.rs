@@ -38,6 +38,8 @@ pub fn extract(deb: &Path, wanted: &[(&str, &str)], out_dir: &Path) -> Result<()
         let program = match name.as_str() {
             "data.tar.xz" => "xz",
             "data.tar.zst" => "zstd",
+            // The boot firmware's package (`raspi-firmware`) is still packed this way.
+            "data.tar.gz" => "gzip",
             _ => bail!(
                 "{} keeps its files in {name}, which this tool cannot unpack",
                 deb.display()
@@ -503,15 +505,28 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn an_unsupported_data_archive_is_named() {
+    fn reads_a_gzip_compressed_data_archive() {
         let dir = tempfile::tempdir().unwrap();
         let deb = dir.path().join("gz.deb");
-        write_deb(&deb, "data.tar.gz", b"irrelevant");
+        let tar = data_tar(&[("./usr/lib/a.txt", Member::File(b"alpha"))]);
+        write_deb(&deb, "data.tar.gz", &compress("gzip", &tar));
+        let out = &dir.path().join("out");
+
+        extract(&deb, &[("usr/lib/a.txt", "a.txt")], out).unwrap();
+
+        assert_eq!(read(out, "a.txt"), "alpha");
+    }
+
+    #[test]
+    fn an_unsupported_data_archive_is_named() {
+        let dir = tempfile::tempdir().unwrap();
+        let deb = dir.path().join("bz2.deb");
+        write_deb(&deb, "data.tar.bz2", b"irrelevant");
         let out = &dir.path().join("out");
 
         let e = extract(&deb, &[("usr/lib/a.txt", "a.txt")], out).unwrap_err();
 
-        assert!(format!("{e:#}").contains("data.tar.gz"), "{e:#}");
+        assert!(format!("{e:#}").contains("data.tar.bz2"), "{e:#}");
     }
 
     #[test]

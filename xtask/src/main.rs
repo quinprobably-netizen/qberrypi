@@ -10,20 +10,28 @@ use clap::{Parser, Subcommand};
 
 mod boottime;
 mod build;
+mod card;
 mod cert;
 mod cpio;
 mod deb;
 mod deploy;
 mod fetch;
 mod hashpw;
+mod image;
 mod latency;
 mod lists;
 mod panel;
+mod pinned;
 mod pins;
 mod pios;
 mod probe;
 mod qemu;
 mod sdimage;
+mod slot;
+#[cfg(test)]
+mod standin;
+mod update;
+mod wifihint;
 
 #[derive(Parser)]
 #[command(name = "xtask", about = "Development tasks for qberrypi")]
@@ -67,6 +75,24 @@ enum Command {
         #[arg(long, value_name = "DIR")]
         boot: PathBuf,
     },
+    /// Copy the whole card in a USB reader into a file (compressed when its name ends in .zst);
+    /// refuses anything but a removable USB /dev/sd* disk of 1 to 512 GiB that nothing uses, and
+    /// does nothing without --yes
+    BackupCard(card::BackupArgs),
+    /// Write an image (decompressed when its name ends in .zst) onto the card in a USB reader and
+    /// read it back to check it; refuses anything but a removable USB /dev/sd* disk of 1 to
+    /// 512 GiB that nothing uses, and does nothing without --yes
+    Flash(card::FlashArgs),
+    /// Make a complete card image on this computer: the boot firmware and both slots, holding this
+    /// build and your qberrypi.toml, slot a selected; flash it with `flash`. Refuses a
+    /// configuration with a development switch on or no [api] section; the image holds the Wi-Fi
+    /// passphrase and the API's key, so it goes to the git-ignored private/ folder
+    Image(image::ImageArgs),
+    /// Send this build to the Pi's other slot over the network, let it try the build, and say
+    /// whether the Pi kept it or rolled back. The API password is read from standard input (never
+    /// from a terminal); the Pi's certificate must be the one in qberrypi-tls.pem. Refuses what the
+    /// Pi would refuse, and a configuration with a development switch on
+    Update(update::UpdateArgs),
     /// Draw the front panel into a PNG, and with --push onto the Pi's 3.5-inch screen
     PanelPreview(panel::PreviewArgs),
     /// While a one-shot boot is running, ask the Pi's DNS and status servers what a client would
@@ -183,6 +209,18 @@ fn main() -> Result<()> {
             println!("{}", pios::return_to_pios(&boot)?);
             Ok(())
         }
+        Command::BackupCard(args) => card::backup(
+            &card::Host::real(workspace_root(), unix_time()?)?,
+            &args,
+            &mut std::io::stdout(),
+        ),
+        Command::Flash(args) => card::flash(
+            &card::Host::real(workspace_root(), unix_time()?)?,
+            &args,
+            &mut std::io::stdout(),
+        ),
+        Command::Image(args) => image::run(workspace_root(), &args, &mut std::io::stdout()),
+        Command::Update(args) => update::run(workspace_root(), &args, &mut std::io::stdout()),
         Command::PanelPreview(args) => panel::run(&args, workspace_root()),
         Command::BootTime { server } => boottime::run(server, workspace_root()),
         Command::HashPassword => hashpw::run(),
@@ -238,6 +276,187 @@ mod tests {
         assert!(replace);
         assert!(parse(&["make-cert", "--replace=yes"]).is_err());
         assert!(parse(&["make-cert", "qberrypi-tls.pem"]).is_err());
+    }
+
+    #[test]
+    fn backup_card_takes_a_device_an_optional_file_and_waits_for_yes() {
+        let Command::BackupCard(args) = parse(&["backup-card", "--device", "/dev/sdb"])
+            .unwrap()
+            .command
+        else {
+            panic!("not the backup-card command");
+        };
+        assert_eq!(
+            (args.device, args.out, args.yes),
+            (PathBuf::from("/dev/sdb"), None, false)
+        );
+        let Command::BackupCard(args) = parse(&[
+            "backup-card",
+            "--device",
+            "/dev/sdb",
+            "--out",
+            "card.img.zst",
+            "--yes",
+        ])
+        .unwrap()
+        .command
+        else {
+            panic!("not the backup-card command");
+        };
+        assert_eq!(
+            (args.out, args.yes),
+            (Some(PathBuf::from("card.img.zst")), true)
+        );
+        // The device has no default, and nothing is taken but flags.
+        assert!(parse(&["backup-card"]).is_err());
+        assert!(parse(&["backup-card", "--yes"]).is_err());
+        assert!(parse(&["backup-card", "/dev/sdb"]).is_err());
+        assert!(parse(&["backup-card", "--device", "/dev/sdb", "--yes=true"]).is_err());
+    }
+
+    #[test]
+    fn flash_takes_an_image_and_a_device_and_waits_for_yes() {
+        let Command::Flash(args) = parse(&["flash", "--image", "a.img", "--device", "/dev/sdb"])
+            .unwrap()
+            .command
+        else {
+            panic!("not the flash command");
+        };
+        assert_eq!(
+            (args.image, args.device, args.yes),
+            (PathBuf::from("a.img"), PathBuf::from("/dev/sdb"), false)
+        );
+        let Command::Flash(args) = parse(&[
+            "flash",
+            "--device",
+            "/dev/sdb",
+            "--yes",
+            "--image",
+            "a.img.zst",
+        ])
+        .unwrap()
+        .command
+        else {
+            panic!("not the flash command");
+        };
+        assert!(args.yes);
+        // Both the image and the device are needed, and there is no --out.
+        assert!(parse(&["flash", "--image", "a.img"]).is_err());
+        assert!(parse(&["flash", "--device", "/dev/sdb"]).is_err());
+        assert!(
+            parse(&[
+                "flash", "--image", "a.img", "--device", "/dev/sdb", "--out", "x"
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn image_takes_an_optional_file_and_an_optional_firmware_folder() {
+        let Command::Image(args) = parse(&["image"]).unwrap().command else {
+            panic!("not the image command");
+        };
+        assert_eq!((args.out, args.firmware), (None, None));
+        let Command::Image(args) = parse(&["image", "--out", "card.img", "--firmware", "fw"])
+            .unwrap()
+            .command
+        else {
+            panic!("not the image command");
+        };
+        assert_eq!(
+            (args.out, args.firmware),
+            (Some(PathBuf::from("card.img")), Some(PathBuf::from("fw")))
+        );
+        // The other order of the flags is the same command.
+        let Command::Image(args) = parse(&["image", "--firmware", "fw", "--out", "card.img"])
+            .unwrap()
+            .command
+        else {
+            panic!("not the image command");
+        };
+        assert_eq!(args.out, Some(PathBuf::from("card.img")));
+    }
+
+    #[test]
+    fn image_takes_nothing_but_those_two_flags_and_each_needs_its_value() {
+        assert!(parse(&["image", "card.img"]).is_err());
+        assert!(parse(&["image", "--yes"]).is_err());
+        assert!(parse(&["image", "--device", "/dev/sdb"]).is_err());
+        assert!(parse(&["image", "--out"]).is_err());
+        assert!(parse(&["image", "--firmware"]).is_err());
+        assert!(parse(&["image", "--out", "a.img", "--out", "b.img"]).is_err());
+    }
+
+    #[test]
+    fn update_with_no_flags_sends_to_the_configured_pi_by_the_firmware_trial() {
+        let Command::Update(args) = parse(&["update"]).unwrap().command else {
+            panic!("not the update command");
+        };
+        assert_eq!(
+            args,
+            update::UpdateArgs {
+                server: None,
+                allow_kernel: false,
+                force: false,
+                software_trial: false,
+                rollback_drill: None,
+            }
+        );
+    }
+
+    #[test]
+    fn update_takes_its_flags_in_any_order_and_a_drill_of_either_kind() {
+        let Command::Update(args) = parse(&[
+            "update",
+            "--software-trial",
+            "--server",
+            "192.0.2.53",
+            "--force",
+            "--allow-kernel",
+            "--rollback-drill",
+            "panic",
+        ])
+        .unwrap()
+        .command
+        else {
+            panic!("not the update command");
+        };
+        assert_eq!(
+            args,
+            update::UpdateArgs {
+                server: Some(Ipv4Addr::new(192, 0, 2, 53)),
+                allow_kernel: true,
+                force: true,
+                software_trial: true,
+                rollback_drill: Some(update::Drill::Panic),
+            }
+        );
+        let Command::Update(args) = parse(&["update", "--rollback-drill=stall"])
+            .unwrap()
+            .command
+        else {
+            panic!("not the update command");
+        };
+        assert_eq!(args.rollback_drill, Some(update::Drill::Stall));
+    }
+
+    #[test]
+    fn update_refuses_what_is_not_one_of_its_flags_and_a_drill_of_no_known_kind() {
+        for bad in [
+            &["update", "192.0.2.53"][..],
+            &["update", "--server"],
+            &["update", "--server", "not-an-address"],
+            &["update", "--server", "2001:db8::1"],
+            &["update", "--rollback-drill"],
+            &["update", "--rollback-drill", "crash"],
+            &["update", "--rollback-drill", "Panic"],
+            &["update", "--force=yes"],
+            &["update", "--password", "hunter2"],
+            &["update", "--yes"],
+            &["update", "--server", "192.0.2.1", "--server", "192.0.2.2"],
+        ] {
+            assert!(parse(bad).is_err(), "{bad:?}");
+        }
     }
 
     #[test]

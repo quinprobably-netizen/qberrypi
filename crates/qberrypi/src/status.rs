@@ -3,9 +3,10 @@
 //!
 //! Two paths answer, `/api/v1/stats` and `/log`; `/api/v1/queries` is a 403, as the list of what
 //! was asked is behind the API's login; every other is a 404. Only the first line of a request is
-//! read. The statistics hold counts, the state of the block lists, the Wi-Fi link and the board's
-//! temperature, never a name that was asked for or the address of a device that asked, and the one
-//! line logged here says where the server listens.
+//! read. The statistics hold counts, the state of the block lists, the Wi-Fi link, the board's
+//! temperature, the slot that runs and how an update stands, never a name that was asked for or
+//! the address of a device that asked, and the one line logged here says where the server
+//! listens.
 //!
 //! Nothing here holds a lock across an `.await`: the answer is made first, and then written.
 
@@ -24,6 +25,7 @@ use crate::dns::upstream::TlsState;
 use crate::lists::Lists;
 use crate::live;
 use crate::logbuf::LogBuf;
+use crate::update::{self, UpdateCtl};
 
 /// The port that the status is served on.
 pub const PORT: u16 = 80;
@@ -108,6 +110,9 @@ pub struct Status {
     /// The board's temperature in whole degrees, read for each request of the statistics;
     /// `None` if it cannot be read.
     pub board_c: Arc<dyn Fn() -> Option<i8> + Send + Sync>,
+    /// The slot this boot runs and how an update stands, copied out for each request of the
+    /// statistics under the short lock of [`UpdateCtl`] and no longer than that takes.
+    pub update: Arc<UpdateCtl>,
 }
 
 impl Status {
@@ -145,6 +150,7 @@ impl Status {
         // the Wi-Fi firmware here, which would hold the runtime thread. The board's temperature,
         // below, is one read of the SoC's own sensor: microseconds.
         let link = (self.link)();
+        let update = self.update.view();
         json!({
             "version": crate::VERSION,
             "build": crate::BUILD_EPOCH,
@@ -171,6 +177,8 @@ impl Status {
             "upstream_queries": upstreams.queries(),
             "upstream_tls": tls_state(upstreams.tls()),
             "watch_events_dropped": self.dns.watch_events_dropped(),
+            "exempt_default": self.dns.exempt().by_default(),
+            "exempt_clients": self.dns.exempt().exempt_clients(),
             "blocking": if paused_until.is_some() { "paused" } else { "on" },
             "pause_left_secs": paused_until.map(|until| until.saturating_sub(now.mono_secs)),
             "list_source": lists.source.as_str(),
@@ -181,9 +189,13 @@ impl Status {
                 "associated": link.associated,
                 "signal_dbm": link.signal_dbm,
                 "ap": link.ap,
+                "freq_mhz": link.freq_mhz,
             },
             "board_c": (self.board_c)(),
             "stalls": crate::stall::json(),
+            "slot": update.slot.map(|slot| slot.letter()),
+            "boot_files": update.boot_files.as_deref(),
+            "update": update_json(&update),
         })
     }
 
@@ -319,6 +331,34 @@ async fn read_request_line(stream: &mut TcpStream) -> io::Result<Option<Vec<u8>>
     }
 }
 
+/// The `update` entry of the statistics: `null` on the old layout, which has no slots to update;
+/// else the state (`"idle"`, `"receiving"` or `"trial"`), the trial this boot is on with its
+/// build, the slot a rollback boots, the seconds since init started and what it still waits for
+/// (`null` if there is none), and how the last trial that this boot knows of ended (`null` if
+/// none): `"confirmed"` or `"rolled_back"`, the build, and for a rollback which case it was.
+///
+/// Only numbers, slot letters and the fixed words of the design are in it, and the reason a
+/// trial build gave up with, which the trial itself wrote.
+fn update_json(update: &update::View) -> Value {
+    if update.slot.is_none() {
+        return Value::Null;
+    }
+    json!({
+        "state": update.state,
+        "trial": update.trial.as_ref().map(|trial| json!({
+            "build": trial.build,
+            "from": trial.from.letter(),
+            "secs": trial.secs,
+            "waiting_for": trial.waiting_for.iter().map(|w| w.word()).collect::<Vec<_>>(),
+        })),
+        "last": update.last.as_ref().map(|last| json!({
+            "outcome": last.kind.word(),
+            "build": last.build,
+            "detail": last.detail,
+        })),
+    })
+}
+
 /// The `upstream_tls` entry of the statistics: the text `"off"` or `"waiting for the clock"`, or,
 /// once the questions go over TLS, an object with the connections that have a session (`up`: an
 /// idle one has none until the next question), the handshakes completed (`connects`) and resumed
@@ -402,6 +442,7 @@ mod tests {
             started: Instant::now(),
             link: Arc::new(live::WifiStatus::default),
             board_c: Arc::new(|| None),
+            update: UpdateCtl::off(),
         };
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -568,12 +609,133 @@ mod tests {
         );
         // No way over TLS is configured here.
         assert_eq!(v["upstream_tls"], "off");
-        // No watch is set on this service: nothing was dropped.
+        // No watch is set on this service: nothing was dropped, and no device is exempt.
         assert_eq!(v["watch_events_dropped"].as_u64(), Some(0));
+        assert_eq!(v["exempt_clients"].as_u64(), Some(0));
+        assert_eq!(v["exempt_default"], false);
         // The stall marks, as `stall` keeps them.
         assert!(v["stalls"]["runtime_gap_max_ms"].is_u64());
         assert!(v["stalls"]["resolver_lock_hold_max_us"].is_u64());
-        assert_eq!(v.as_object().unwrap().len(), 34);
+        // The old layout has no slot, no digest and no update to tell of.
+        assert!(v["slot"].is_null() && v["boot_files"].is_null() && v["update"].is_null());
+        assert_eq!(v.as_object().unwrap().len(), 39);
+    }
+
+    /// A status on slot `slot` whose update state is `ctl`.
+    async fn on_slot(ctl: Arc<UpdateCtl>) -> Status {
+        let (status, _http, _dns) = served(Reply::Silent).await;
+        Status {
+            update: ctl,
+            ..status
+        }
+    }
+
+    fn marker(slot: crate::slots::Slot) -> crate::slots::Marker {
+        crate::slots::Marker {
+            slot,
+            from: slot.other(),
+            build: 1_794_470_000,
+            mode: crate::slots::Mode::Tryboot,
+            started: true,
+            failed: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn the_stats_name_the_slot_and_the_digest_and_an_idle_update() {
+        use crate::slots::Slot;
+        let ctl = UpdateCtl::new(
+            Some(Slot::B),
+            Some("0123456789abcdef".repeat(4)),
+            Arc::new(crate::update::NoCard),
+        );
+        let v = on_slot(ctl).await.stats();
+        assert_eq!(v["slot"], "b");
+        assert_eq!(v["boot_files"], "0123456789abcdef".repeat(4));
+        assert_eq!(
+            v["update"],
+            json!({"state": "idle", "trial": null, "last": null})
+        );
+        assert_eq!(v.as_object().unwrap().len(), 39);
+    }
+
+    #[tokio::test]
+    async fn a_slot_with_no_digest_says_null_for_it() {
+        use crate::slots::Slot;
+        let ctl = UpdateCtl::new(Some(Slot::A), None, Arc::new(crate::update::NoCard));
+        let v = on_slot(ctl).await.stats();
+        assert_eq!(
+            (v["slot"].as_str(), v["boot_files"].is_null()),
+            (Some("a"), true)
+        );
+        assert_eq!(v["update"]["state"], "idle");
+    }
+
+    #[tokio::test]
+    async fn a_trial_shows_its_build_its_origin_its_seconds_and_what_it_waits_for() {
+        use crate::slots::Slot;
+        use crate::update::Waiting;
+        let ctl = UpdateCtl::new(Some(Slot::B), None, Arc::new(crate::update::NoCard));
+        ctl.begin_trial(marker(Slot::B), tokio::time::Instant::now());
+        let status = on_slot(ctl.clone()).await;
+        let v = status.stats();
+        assert_eq!(v["update"]["state"], "trial");
+        assert_eq!(v["update"]["last"], Value::Null);
+        let trial = &v["update"]["trial"];
+        assert_eq!(
+            (trial["build"].as_u64(), trial["from"].as_str()),
+            (Some(1_794_470_000), Some("a"))
+        );
+        assert!(trial["secs"].as_u64().unwrap() < 5);
+        assert_eq!(
+            trial["waiting_for"],
+            json!(["wifi", "clock", "upstream", "time"])
+        );
+        // What is still waited for follows the trial's own account of it.
+        ctl.set_waiting(vec![Waiting::Time]);
+        assert_eq!(
+            status.stats()["update"]["trial"]["waiting_for"],
+            json!(["time"])
+        );
+        ctl.set_waiting(Vec::new());
+        assert_eq!(status.stats()["update"]["trial"]["waiting_for"], json!([]));
+    }
+
+    #[tokio::test]
+    async fn a_receive_shows_as_receiving_with_no_trial() {
+        use crate::slots::Slot;
+        let ctl = UpdateCtl::new(Some(Slot::A), None, Arc::new(crate::update::NoCard));
+        let receiving = ctl.begin_receive().unwrap();
+        let v = on_slot(ctl).await.stats();
+        assert_eq!(v["update"]["state"], "receiving");
+        assert_eq!(v["update"]["trial"], Value::Null);
+        drop(receiving);
+    }
+
+    #[tokio::test]
+    async fn the_last_outcome_shows_which_way_it_ended_and_for_a_rollback_which_case() {
+        use crate::slots::Slot;
+        use crate::update::Outcome;
+        let ctl = UpdateCtl::new(Some(Slot::A), None, Arc::new(crate::update::NoCard));
+        let status = on_slot(ctl.clone()).await;
+        ctl.finish(Outcome::rolled_back(
+            1_794_470_000,
+            "the trial build restarted before it confirmed",
+        ));
+        assert_eq!(
+            status.stats()["update"]["last"],
+            json!({
+                "outcome": "rolled_back",
+                "build": 1_794_470_000u64,
+                "detail": "the trial build restarted before it confirmed",
+            })
+        );
+        ctl.finish(Outcome::confirmed(1_794_480_000));
+        assert_eq!(
+            status.stats()["update"]["last"],
+            json!({"outcome": "confirmed", "build": 1_794_480_000u64, "detail": ""})
+        );
+        assert_eq!(status.stats()["update"]["state"], "idle");
     }
 
     #[tokio::test]
@@ -789,6 +951,7 @@ mod tests {
                 associated: true,
                 signal_dbm: Some(-61),
                 ap: Some("00:00:5e:00:53:01".to_owned()),
+                freq_mhz: Some(5180),
             }),
             board_c: Arc::new(|| Some(51)),
             ..status
@@ -796,7 +959,12 @@ mod tests {
         let v = status.stats();
         assert_eq!(
             v["wifi"],
-            json!({"associated": true, "signal_dbm": -61, "ap": "00:00:5e:00:53:01"})
+            json!({
+                "associated": true,
+                "signal_dbm": -61,
+                "ap": "00:00:5e:00:53:01",
+                "freq_mhz": 5180
+            })
         );
         assert_eq!(v["board_c"], 51);
     }
@@ -807,7 +975,7 @@ mod tests {
         let v = status.stats();
         assert_eq!(
             v["wifi"],
-            json!({"associated": false, "signal_dbm": null, "ap": null})
+            json!({"associated": false, "signal_dbm": null, "ap": null, "freq_mhz": null})
         );
         assert!(v["board_c"].is_null());
     }

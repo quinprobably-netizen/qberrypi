@@ -16,6 +16,8 @@ use tz::{TimeZone, TimeZoneSettings};
 
 use crate::api::password::PasswordHash;
 use crate::panel::touch::RAW_MAX;
+use crate::watch::devices::{MAX_BLOCK, MAX_EXEMPT};
+use crate::watch::frames::Mac;
 
 const DEFAULT_HOSTNAME: &str = "qberrypi";
 
@@ -66,6 +68,30 @@ pub struct Wifi {
     pub key: WifiKey,
     /// Regulatory domain, as a two-letter country code.
     pub country: String,
+    /// The channel centre frequencies, in MHz, that the first scan of a join covers alone (`hint_mhz`):
+    /// at most [`MAX_WIFI_HINTS`], none repeated, each a channel of the 2.4 or the 5 GHz band
+    /// ([`is_channel_centre_mhz`]). Empty when the file has no hint, and then every scan covers every
+    /// channel. The hint is meant for the 5 GHz channel: a hinted scan whose best access point is on
+    /// 2.4 GHz is not taken, and the join scans every channel (`wifi::run`).
+    pub hint_mhz: Vec<u32>,
+}
+
+/// The most channels `wifi.hint_mhz` may list: a scan of more is not much shorter than a full one.
+pub const MAX_WIFI_HINTS: usize = 4;
+
+/// Whether `mhz` is the centre frequency of a 20 MHz channel of the 2.4 GHz or the 5 GHz band:
+/// channels 1 to 13 (2412 to 2472 MHz) and 14 (2484 MHz), and, from 5000 MHz up in steps of 5 MHz
+/// to the channel numbers, 32 to 68 and 96 to 144 in fours, and 149 to 177 in fours. It says
+/// nothing of which of them a country allows or a radio has: the radio refuses what it lacks.
+pub fn is_channel_centre_mhz(mhz: u32) -> bool {
+    match mhz {
+        2412..=2472 => (mhz - 2412).is_multiple_of(5),
+        2484 => true,
+        5160..=5340 => (mhz - 5160).is_multiple_of(20),
+        5480..=5720 => (mhz - 5480).is_multiple_of(20),
+        5745..=5885 => (mhz - 5745).is_multiple_of(20),
+        _ => false,
+    }
 }
 
 /// The Wi-Fi secret, in whichever of its two forms the file gave.
@@ -199,8 +225,8 @@ pub struct SpeedCfg {
 
 /// What the watchdog is told to leave alone: the optional `[watch]` table.
 ///
-/// Each entry is a domain name as written in the file, and stands for that name and every name
-/// below it.
+/// Each entry of the two lists of names is a domain name as written in the file, and stands for
+/// that name and every name below it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WatchCfg {
     /// Names that may answer a private address without being blocked for it:
@@ -208,6 +234,17 @@ pub struct WatchCfg {
     pub rebind_allow: Vec<String>,
     /// Names that the behaviour alerts do not count a question for.
     pub quiet: Vec<String>,
+    /// The devices, by Ethernet address, that the ads lists do not apply to: the threat lists
+    /// still do. At most [`MAX_EXEMPT`], sorted, each once; none when unset. It has no effect
+    /// while `exempt_default` is in force.
+    pub exempt: Vec<Mac>,
+    /// Whether every device is exempt from the ads lists but those of `block`, the router and the
+    /// Pi itself: the exempt-by-default mode. False when unset, which is the list mode.
+    pub exempt_default: bool,
+    /// The devices, by Ethernet address, that stay fully blocked in the exempt-by-default mode.
+    /// At most [`MAX_BLOCK`], sorted, each once; none when unset. It has no effect in the list
+    /// mode.
+    pub block: Vec<Mac>,
 }
 
 impl Default for WatchCfg {
@@ -216,6 +253,9 @@ impl Default for WatchCfg {
         Self {
             rebind_allow: DEFAULT_REBIND_ALLOW.map(str::to_owned).to_vec(),
             quiet: Vec::new(),
+            exempt: Vec::new(),
+            exempt_default: false,
+            block: Vec::new(),
         }
     }
 }
@@ -275,7 +315,22 @@ pub struct DebugCfg {
     pub calibrate_touch: bool,
     /// The failure the board provokes in itself to show how it recovers; `Fault::None` in use.
     pub fault: Fault,
+    /// How many seconds after init starts a trial build may confirm itself: 0 is the default,
+    /// [`TRIAL_CONFIRM_DEFAULT_SECS`], and any other value is 1 to [`TRIAL_CONFIRM_MAX_SECS`]. Has
+    /// no effect on a boot that is not on trial.
+    pub trial_confirm_secs: u64,
+    /// Whether a trial build confirms without waiting for the Wi-Fi, the clock or an upstream, as
+    /// on a board with no network (the QEMU guest); only the time is waited for. Has no effect on
+    /// a boot that is not on trial.
+    pub trial_offline: bool,
 }
+
+/// How long after init starts a trial build confirms itself when `debug.trial_confirm_secs` is
+/// not set (or is 0).
+pub const TRIAL_CONFIRM_DEFAULT_SECS: u64 = 120;
+
+/// The most seconds `debug.trial_confirm_secs` may ask for.
+pub const TRIAL_CONFIRM_MAX_SECS: u64 = 3600;
 
 /// A failure that `debug.fault` makes the board provoke, for watching the recovery work.
 ///
@@ -299,6 +354,14 @@ pub enum Fault {
     /// The Wi-Fi radio's liveness probe stops being answered, from a minute after the supervisor
     /// starts and for one hold of the link: the board calls the link lost and joins again. No restart.
     MuteProbe,
+    /// The supervisor's stall, as [`Fault::Stall`], and only on a boot that is on trial of an
+    /// update (`debug.fault = "trial_stall"`): a boot that is not does nothing. The watchdog
+    /// restarts the board, and the slot the trial came from boots.
+    TrialStall,
+    /// An essential component that panics a few seconds after the supervisor starts, and only on
+    /// a boot that is on trial of an update (`debug.fault = "trial_panic"`): a boot that is not
+    /// does nothing. The fatal error restarts the board, and the slot the trial came from boots.
+    TrialPanic,
 }
 
 /// The Pi-hole API's settings: the optional `[api]` table.
@@ -352,7 +415,10 @@ pub fn parse(text: &str) -> Result<Config, ConfigError> {
         }
         None => TimeZoneRule::utc(),
     };
-    let wifi = wifi(&root.required_section("wifi", &["ssid", "passphrase", "pmk", "country"])?)?;
+    let wifi = wifi(&root.required_section(
+        "wifi",
+        &["ssid", "passphrase", "pmk", "country", "hint_mhz"],
+    )?)?;
     let net = net(&root.required_section("net", &["address", "gateway", "time_servers"])?)?;
     let dns = dns(&root.required_section(
         "dns",
@@ -400,6 +466,8 @@ pub fn parse(text: &str) -> Result<Config, ConfigError> {
             "return_after_secs",
             "calibrate_touch",
             "fault",
+            "trial_confirm_secs",
+            "trial_offline",
         ],
     )? {
         Some(section) => debug(&section)?,
@@ -409,9 +477,14 @@ pub fn parse(text: &str) -> Result<Config, ConfigError> {
             return_after_secs: 0,
             calibrate_touch: false,
             fault: Fault::None,
+            trial_confirm_secs: 0,
+            trial_offline: false,
         },
     };
-    let watch = match root.section("watch", &["rebind_allow", "quiet"])? {
+    let watch = match root.section(
+        "watch",
+        &["rebind_allow", "quiet", "exempt", "exempt_default", "block"],
+    )? {
         Some(section) => watch(&section)?,
         None => WatchCfg::default(),
     };
@@ -461,11 +534,45 @@ fn wifi(section: &Section) -> Result<Wifi, ConfigError> {
     if country.len() != 2 || !country.bytes().all(|b| b.is_ascii_uppercase()) {
         return Err(section.error("country", "must be two upper-case letters"));
     }
+    let hint_mhz = hint_mhz(section)?;
     Ok(Wifi {
         ssid: ssid.to_owned(),
         key,
         country: country.to_owned(),
+        hint_mhz,
     })
+}
+
+/// `wifi.hint_mhz`: a list of at most `MAX_WIFI_HINTS` channel centre frequencies, none repeated; empty when
+/// unset. The error says which rule the list broke and never quotes a value.
+fn hint_mhz(section: &Section) -> Result<Vec<u32>, ConfigError> {
+    let Some(value) = section.get("hint_mhz") else {
+        return Ok(Vec::new());
+    };
+    let items = value
+        .as_array()
+        .ok_or_else(|| section.error("hint_mhz", "must be a list of whole numbers"))?;
+    if items.len() > MAX_WIFI_HINTS {
+        return Err(section.error("hint_mhz", "must list at most 4 frequencies"));
+    }
+    let mut hints = Vec::with_capacity(items.len());
+    for item in items {
+        let mhz = item
+            .as_integer()
+            .and_then(|number| u32::try_from(number).ok())
+            .ok_or_else(|| section.error("hint_mhz", "must be a list of whole numbers"))?;
+        if !is_channel_centre_mhz(mhz) {
+            return Err(section.error(
+                "hint_mhz",
+                "must list channel centre frequencies of the 2.4 or 5 GHz band in MHz, such as 2437 or 5180",
+            ));
+        }
+        if hints.contains(&mhz) {
+            return Err(section.error("hint_mhz", "must not list a frequency twice"));
+        }
+        hints.push(mhz);
+    }
+    Ok(hints)
 }
 
 fn net(section: &Section) -> Result<Net, ConfigError> {
@@ -648,17 +755,33 @@ fn debug(section: &Section) -> Result<DebugCfg, ConfigError> {
                 )
             })?,
     };
+    let trial_confirm_secs = match section.get("trial_confirm_secs") {
+        None => 0,
+        Some(value) => value
+            .as_integer()
+            .and_then(|secs| u64::try_from(secs).ok())
+            .filter(|secs| *secs <= TRIAL_CONFIRM_MAX_SECS)
+            .ok_or_else(|| {
+                section.error(
+                    "trial_confirm_secs",
+                    "must be a whole number of seconds from 1 to 3600, or 0 for the default of 120",
+                )
+            })?,
+    };
     Ok(DebugCfg {
         one_shot: section.bool_or_false("one_shot")?,
         log_to_sd: section.bool_or_false("log_to_sd")?,
         return_after_secs,
         calibrate_touch: section.bool_or_false("calibrate_touch")?,
         fault: fault(section)?,
+        trial_confirm_secs,
+        trial_offline: section.bool_or_false("trial_offline")?,
     })
 }
 
-/// The `[watch]` table: two lists of names. An unset `rebind_allow` is the default, which an
-/// empty list is not, and an unset `quiet` is empty.
+/// The `[watch]` table: two lists of names, two of Ethernet addresses and a flag. An unset
+/// `rebind_allow` is the default, which an empty list is not; an unset `quiet`, `exempt` or
+/// `block` is empty, and an unset `exempt_default` is false.
 fn watch(section: &Section) -> Result<WatchCfg, ConfigError> {
     let rebind_allow = match section.get("rebind_allow") {
         None => WatchCfg::default().rebind_allow,
@@ -667,13 +790,47 @@ fn watch(section: &Section) -> Result<WatchCfg, ConfigError> {
     Ok(WatchCfg {
         rebind_allow,
         quiet: names_or_empty(section, "quiet")?,
+        exempt: devices_at(section, "exempt", MAX_EXEMPT)?,
+        exempt_default: section.bool_or_false("exempt_default")?,
+        block: devices_at(section, "block", MAX_BLOCK)?,
     })
 }
 
-/// The `fault` key: one of seven words, and `none` when unset.
+// The reason for a list that is too long names the most that both lists take.
+const _: () = assert!(MAX_EXEMPT == 64 && MAX_BLOCK == 64);
+
+/// The reason an `exempt` or `block` entry that is not one device's Ethernet address gets.
+const DEVICE_ENTRY: &str = "every entry must be the Ethernet address of one device: six pairs of \
+                            hex digits separated by : or -, neither all zeros nor a multicast or \
+                            broadcast address";
+
+/// Reads the list of devices `key` of `[watch]` (`exempt` or `block`): at most `most`, which is
+/// 64, different Ethernet addresses, in either spelling and either case, each one that a device
+/// can have. They come back sorted and each once; none when unset.
+fn devices_at(section: &Section, key: &str, most: usize) -> Result<Vec<Mac>, ConfigError> {
+    let entries = section.strings(key)?.unwrap_or_default();
+    let mut macs = entries
+        .into_iter()
+        .map(|entry| {
+            entry
+                .parse::<Mac>()
+                .ok()
+                .filter(|mac| mac.can_be_a_device())
+        })
+        .collect::<Option<Vec<Mac>>>()
+        .ok_or_else(|| section.error(key, DEVICE_ENTRY))?;
+    macs.sort_unstable();
+    macs.dedup();
+    if macs.len() > most {
+        return Err(section.error(key, "must list at most 64 different Ethernet addresses"));
+    }
+    Ok(macs)
+}
+
+/// The `fault` key: one of nine words, and `none` when unset.
 fn fault(section: &Section) -> Result<Fault, ConfigError> {
-    const WORDS: &str =
-        "must be one of none, stall, crash-loop, panic, no-wifi, drop-link, mute-probe";
+    const WORDS: &str = "must be one of none, stall, crash-loop, panic, no-wifi, drop-link, \
+                         mute-probe, trial_stall, trial_panic";
     match section.get("fault") {
         None => Ok(Fault::None),
         Some(Value::String(word)) => match word.as_str() {
@@ -684,6 +841,8 @@ fn fault(section: &Section) -> Result<Fault, ConfigError> {
             "no-wifi" => Ok(Fault::NoWifi),
             "drop-link" => Ok(Fault::DropLink),
             "mute-probe" => Ok(Fault::MuteProbe),
+            "trial_stall" => Ok(Fault::TrialStall),
+            "trial_panic" => Ok(Fault::TrialPanic),
             _ => Err(section.error("fault", WORDS)),
         },
         Some(_) => Err(section.error("fault", WORDS)),
@@ -952,6 +1111,97 @@ upstreams = ["9.9.9.9"]
         assert_eq!(parse(&both).unwrap_err().key, "wifi");
         let neither = example_with(PASSPHRASE_LINE, "");
         assert_eq!(parse(&neither).unwrap_err().key, "wifi");
+    }
+
+    #[test]
+    fn the_wifi_hint_is_a_short_list_of_channel_centres_and_defaults_to_none() {
+        assert!(parse(EXAMPLE).unwrap().wifi.hint_mhz.is_empty());
+        for (line, want) in [
+            ("hint_mhz = []", vec![]),
+            ("hint_mhz = [5180]", vec![5180]),
+            ("hint_mhz = [5180, 2437]", vec![5180, 2437]),
+            // Order is kept, and the ends of both bands are channels.
+            (
+                "hint_mhz = [2484, 2412, 5885, 5160]",
+                vec![2484, 2412, 5885, 5160],
+            ),
+            (
+                "hint_mhz = [2412, 2437, 2462, 5180]",
+                vec![2412, 2437, 2462, 5180],
+            ),
+        ] {
+            let text = example_with("country = \"US\"", &format!("country = \"US\"\n{line}"));
+            assert_eq!(parse(&text).unwrap().wifi.hint_mhz, want, "{line}");
+        }
+    }
+
+    #[test]
+    fn channel_centres_are_those_of_the_two_bands() {
+        let valid: Vec<u32> = (2412..=2472)
+            .step_by(5)
+            .chain([2484])
+            .chain((5160..=5340).step_by(20))
+            .chain((5480..=5720).step_by(20))
+            .chain((5745..=5885).step_by(20))
+            .collect();
+        for mhz in 0..7000 {
+            assert_eq!(is_channel_centre_mhz(mhz), valid.contains(&mhz), "{mhz}");
+        }
+        // The usual ones.
+        for mhz in [2412, 2437, 2462, 5180, 5200, 5240, 5500, 5745, 5825] {
+            assert!(is_channel_centre_mhz(mhz), "{mhz}");
+        }
+        // Between channels, the 6 GHz band, the 900 MHz band and nonsense.
+        for mhz in [
+            0,
+            2411,
+            2413,
+            2473,
+            2483,
+            2485,
+            5181,
+            5955,
+            6115,
+            915,
+            u32::MAX,
+        ] {
+            assert!(!is_channel_centre_mhz(mhz), "{mhz}");
+        }
+    }
+
+    #[test]
+    fn a_wifi_hint_that_breaks_a_rule_names_its_key_and_never_its_values() {
+        for (line, reason) in [
+            ("hint_mhz = 5180", "must be a list of whole numbers"),
+            ("hint_mhz = \"5180\"", "must be a list of whole numbers"),
+            ("hint_mhz = [\"5180\"]", "must be a list of whole numbers"),
+            ("hint_mhz = [5180.5]", "must be a list of whole numbers"),
+            ("hint_mhz = [-5180]", "must be a list of whole numbers"),
+            (
+                "hint_mhz = [99999999999]",
+                "must be a list of whole numbers",
+            ),
+            (
+                "hint_mhz = [5180, 5200, 5220, 5240, 5260]",
+                "must list at most 4 frequencies",
+            ),
+            ("hint_mhz = [5180, 5180]", "must not list a frequency twice"),
+            ("hint_mhz = [5181]", "must list channel centre frequencies"),
+            ("hint_mhz = [5955]", "must list channel centre frequencies"),
+            (
+                "hint_mhz = [2437, 2438]",
+                "must list channel centre frequencies",
+            ),
+        ] {
+            let text = example_with("country = \"US\"", &format!("country = \"US\"\n{line}"));
+            let error = parse(&text).unwrap_err();
+            assert_eq!(error.key, "wifi.hint_mhz", "{line}");
+            assert!(error.reason.starts_with(reason), "{line}: {}", error.reason);
+            let shown = error.to_string();
+            for value in ["5181", "5955", "2438", "99999999999", "5180.5", "5260"] {
+                assert!(!shown.contains(value), "{line}: {shown}");
+            }
+        }
     }
 
     #[test]
@@ -1581,7 +1831,7 @@ upstreams = ["9.9.9.9"]
     }
 
     #[test]
-    fn a_fault_is_one_of_seven_words_and_none_by_default() {
+    fn a_fault_is_one_of_nine_words_and_none_by_default() {
         assert_eq!(parse(EXAMPLE).unwrap().debug.fault, Fault::None);
         assert_eq!(parse(MINIMAL).unwrap().debug.fault, Fault::None);
         for (word, fault) in [
@@ -1592,6 +1842,8 @@ upstreams = ["9.9.9.9"]
             ("no-wifi", Fault::NoWifi),
             ("drop-link", Fault::DropLink),
             ("mute-probe", Fault::MuteProbe),
+            ("trial_stall", Fault::TrialStall),
+            ("trial_panic", Fault::TrialPanic),
         ] {
             let text = example_with("fault = \"none\"", &format!("fault = \"{word}\""));
             assert_eq!(parse(&text).unwrap().debug.fault, fault, "{word}");
@@ -1602,20 +1854,91 @@ upstreams = ["9.9.9.9"]
     }
 
     #[test]
-    fn a_fault_that_is_not_one_of_the_seven_words_is_refused_without_echoing_it() {
-        for bad in ["\"fire-drill\"", "\"Stall\"", "\"\"", "7654", "true"] {
+    fn a_fault_that_is_not_one_of_the_nine_words_is_refused_without_echoing_it() {
+        for bad in [
+            "\"fire-drill\"",
+            "\"Stall\"",
+            "\"\"",
+            "7654",
+            "true",
+            // The trial faults are spelled with underscores, and only so.
+            "\"trial-panic\"",
+            "\"trial\"",
+        ] {
             let text = example_with("fault = \"none\"", &format!("fault = {bad}"));
             let e = parse(&text).unwrap_err();
             assert_eq!(
                 (e.key.as_str(), e.reason.as_str()),
                 (
                     "debug.fault",
-                    "must be one of none, stall, crash-loop, panic, no-wifi, drop-link, mute-probe"
+                    "must be one of none, stall, crash-loop, panic, no-wifi, drop-link, \
+                     mute-probe, trial_stall, trial_panic"
                 ),
                 "{bad}"
             );
             assert!(!e.to_string().contains("fire-drill"), "{e}");
         }
+    }
+
+    #[test]
+    fn the_trial_switches_are_off_by_default_with_or_without_a_debug_table() {
+        for text in [
+            EXAMPLE.to_owned(),
+            MINIMAL.to_owned(),
+            format!("{MINIMAL}\n[debug]\none_shot = true\n"),
+        ] {
+            let debug = parse(&text).unwrap().debug;
+            assert_eq!((debug.trial_confirm_secs, debug.trial_offline), (0, false));
+        }
+    }
+
+    #[test]
+    fn the_trial_switches_are_read_when_they_are_set() {
+        let text = example_with("trial_offline = false", "trial_offline = true");
+        let text = text.replace("trial_confirm_secs = 0", "trial_confirm_secs = 5");
+        let debug = parse(&text).unwrap().debug;
+        assert_eq!((debug.trial_confirm_secs, debug.trial_offline), (5, true));
+        // Alone in a table of their own, they do not need the other switches.
+        let alone = format!("{MINIMAL}\n[debug]\ntrial_offline = true\n");
+        let debug = parse(&alone).unwrap().debug;
+        assert_eq!((debug.trial_confirm_secs, debug.trial_offline), (0, true));
+    }
+
+    #[test]
+    fn the_trial_confirm_time_is_zero_for_the_default_or_one_to_3600_seconds() {
+        for (value, secs) in [("0", 0), ("1", 1), ("120", 120), ("3600", 3600)] {
+            let text = example_with(
+                "trial_confirm_secs = 0",
+                &format!("trial_confirm_secs = {value}"),
+            );
+            assert_eq!(parse(&text).unwrap().debug.trial_confirm_secs, secs);
+        }
+        for bad in ["3601", "-1", "-7654", "2.5", "\"soon-ish\"", "true", "[]"] {
+            let text = example_with(
+                "trial_confirm_secs = 0",
+                &format!("trial_confirm_secs = {bad}"),
+            );
+            let e = parse(&text).unwrap_err();
+            assert_eq!(
+                (e.key.as_str(), e.reason.as_str()),
+                (
+                    "debug.trial_confirm_secs",
+                    "must be a whole number of seconds from 1 to 3600, or 0 for the default of 120"
+                ),
+                "{bad}"
+            );
+            assert!(!e.to_string().contains("7654"), "{e}");
+            assert!(!e.to_string().contains("soon-ish"), "{e}");
+        }
+        assert_eq!(TRIAL_CONFIRM_DEFAULT_SECS, 120);
+    }
+
+    #[test]
+    fn the_trial_offline_switch_must_be_a_boolean_and_is_not_echoed() {
+        let text = example_with("trial_offline = false", "trial_offline = \"maybe-so\"");
+        let e = parse(&text).unwrap_err();
+        assert_eq!(e.key, "debug.trial_offline");
+        assert!(!e.to_string().contains("maybe-so"), "{e}");
     }
 
     #[test]
@@ -1944,16 +2267,147 @@ upstreams = ["9.9.9.9"]
 
     #[test]
     fn the_commented_watch_section_of_the_example_is_a_valid_one() {
-        let block = "# [watch]\n# rebind_allow = [\"plex.direct\"]\n# quiet = []";
+        let block = "# [watch]\n# rebind_allow = [\"plex.direct\"]\n# quiet = []\n# exempt = [\"02:00:00:00:00:01\"]\n# exempt_default = false\n# block = [\"02:00:00:00:00:02\"]";
         assert!(
             EXAMPLE.contains(block),
             "the example has no commented [watch] block"
         );
         let on = EXAMPLE.replace(
             block,
-            "[watch]\nrebind_allow = [\"plex.direct\"]\nquiet = []",
+            "[watch]\nrebind_allow = [\"plex.direct\"]\nquiet = []\nexempt = [\"02:00:00:00:00:01\"]\nexempt_default = false\nblock = [\"02:00:00:00:00:02\"]",
         );
-        assert_eq!(parse(&on).unwrap().watch, WatchCfg::default());
+        assert_eq!(
+            parse(&on).unwrap().watch,
+            WatchCfg {
+                exempt: vec![Mac([2, 0, 0, 0, 0, 1])],
+                block: vec![Mac([2, 0, 0, 0, 0, 2])],
+                ..WatchCfg::default()
+            }
+        );
+    }
+
+    /// The list of devices `key` of the `[watch]` table of `text`.
+    fn device_list(text: &str, key: &str) -> Vec<Mac> {
+        let watch = parse(text).unwrap().watch;
+        match key {
+            "exempt" => watch.exempt,
+            "block" => watch.block,
+            _ => unreachable!("no list of devices is called {key}"),
+        }
+    }
+
+    #[test]
+    fn the_exempt_and_blocked_devices_are_read_in_either_spelling_once_each_and_sorted() {
+        for key in ["exempt", "block"] {
+            let text = format!(
+                "{MINIMAL}\n[watch]\n{key} = [\"02:00:00:00:00:0B\", \"02-00-00-00-00-01\", \"02:00:00:00:00:0b\"]\n"
+            );
+            assert_eq!(
+                device_list(&text, key),
+                [Mac([2, 0, 0, 0, 0, 1]), Mac([2, 0, 0, 0, 0, 0x0b])],
+                "{key}"
+            );
+            // Unset, and empty, it is no device.
+            assert!(device_list(MINIMAL, key).is_empty());
+            let empty = format!("{MINIMAL}\n[watch]\n{key} = []\n");
+            assert!(device_list(&empty, key).is_empty());
+            // 64 different ones are the most, however often each is written.
+            let list = |n: u16, times: usize| -> String {
+                let one: Vec<String> = (0..n)
+                    .map(|i| format!("\"{}\"", Mac([2, 0, 0, 0, (i >> 8) as u8, i as u8])))
+                    .collect();
+                vec![one.join(", "); times].join(", ")
+            };
+            let most = format!("{MINIMAL}\n[watch]\n{key} = [{}]\n", list(64, 2));
+            assert_eq!(device_list(&most, key).len(), 64);
+            let e = parse(&format!("{MINIMAL}\n[watch]\n{key} = [{}]\n", list(65, 1))).unwrap_err();
+            assert_eq!(
+                (e.key, e.reason.as_str()),
+                (
+                    format!("watch.{key}"),
+                    "must list at most 64 different Ethernet addresses"
+                )
+            );
+        }
+        // The two lists are apart: one does not fill the other.
+        let both = format!(
+            "{MINIMAL}\n[watch]\nexempt = [\"02:00:00:00:00:01\"]\nblock = [\"02:00:00:00:00:02\"]\n"
+        );
+        let watch = parse(&both).unwrap().watch;
+        assert_eq!(
+            (watch.exempt, watch.block),
+            (vec![Mac([2, 0, 0, 0, 0, 1])], vec![Mac([2, 0, 0, 0, 0, 2])])
+        );
+    }
+
+    #[test]
+    fn an_exempt_or_block_entry_that_is_no_device_address_is_refused_without_its_value() {
+        for key in ["exempt", "block"] {
+            for entry in [
+                "02:00:00:00:00",
+                "02:00:00:00:00:0g",
+                "02:00-00:00:00:01",
+                "020000000001",
+                " 02:00:00:00:00:01",
+                "",
+                // A multicast, the broadcast and the all-zero address are no one device's.
+                "03:00:00:00:00:01",
+                "01:00:5e:00:00:fb",
+                "ff:ff:ff:ff:ff:ff",
+                "00:00:00:00:00:00",
+            ] {
+                let text =
+                    format!("{MINIMAL}\n[watch]\n{key} = [\"02:00:00:00:00:02\", \"{entry}\"]\n");
+                let e = parse(&text).unwrap_err();
+                let want = format!("watch.{key}");
+                assert_eq!(
+                    (e.key.as_str(), e.reason.as_str()),
+                    (want.as_str(), DEVICE_ENTRY),
+                    "{key} {entry:?}"
+                );
+                assert!(!e.reason.contains("00:0"), "{e}");
+            }
+            let e = parse(&format!(
+                "{MINIMAL}\n[watch]\n{key} = \"02:00:00:00:00:01\"\n"
+            ))
+            .unwrap_err();
+            assert_eq!(
+                (e.key, e.reason.as_str()),
+                (format!("watch.{key}"), "must be a list of strings")
+            );
+        }
+    }
+
+    #[test]
+    fn exempt_default_is_a_true_or_false_and_false_when_unset() {
+        assert!(!parse(MINIMAL).unwrap().watch.exempt_default);
+        assert!(
+            !parse(&format!("{MINIMAL}\n[watch]\n"))
+                .unwrap()
+                .watch
+                .exempt_default
+        );
+        for (value, on) in [("true", true), ("false", false)] {
+            let text = format!("{MINIMAL}\n[watch]\nexempt_default = {value}\n");
+            assert_eq!(parse(&text).unwrap().watch.exempt_default, on, "{value}");
+        }
+        for value in ["\"true\"", "1", "[]", "\"yes\""] {
+            let text = format!("{MINIMAL}\n[watch]\nexempt_default = {value}\n");
+            let e = parse(&text).unwrap_err();
+            assert_eq!(
+                (e.key.as_str(), e.reason.as_str()),
+                ("watch.exempt_default", "must be true or false"),
+                "{value}"
+            );
+        }
+        // The mode and the block list are read together with the exempt list, which stays.
+        let text = format!(
+            "{MINIMAL}\n[watch]\nexempt_default = true\nblock = [\"02:00:00:00:00:02\"]\nexempt = [\"02:00:00:00:00:01\"]\n"
+        );
+        let watch = parse(&text).unwrap().watch;
+        assert!(watch.exempt_default);
+        assert_eq!(watch.block, [Mac([2, 0, 0, 0, 0, 2])]);
+        assert_eq!(watch.exempt, [Mac([2, 0, 0, 0, 0, 1])]);
     }
 
     /// A well-formed `password_hash` value that no password was derived from.

@@ -64,13 +64,17 @@ const REASON_HANDSHAKE_TIMEOUT: u16 = 15;
 /// The 802.11 reason code for an RSN element that is not the one the access point advertised.
 const REASON_INVALID_RSNE: u16 = 17;
 
-/// The network to join: its name, and the key its passphrase gives.
+/// The network to join: its name, the key its passphrase gives, and where to look for it first.
 #[derive(Debug, Clone)]
 pub struct JoinCfg {
     /// The network's name.
     pub ssid: Vec<u8>,
     /// The key the passphrase and the name give.
     pub pmk: Pmk,
+    /// The channel centre frequencies, in MHz, that the first scan of a join covers alone; empty for no
+    /// hint, and then every scan covers every channel. A hint changes which channels that scan looks at and
+    /// nothing else: see [`run`](super::run).
+    pub hint_mhz: Vec<u32>,
 }
 
 /// An association whose handshake is done.
@@ -306,12 +310,19 @@ fn hex(bytes: &[u8]) -> String {
 
 /// Scans for `ssid` and returns every access point the kernel found, of any name.
 ///
-/// A busy radio is asked again a second later, up to `SCAN_BUSY_TRIES` times in all.
-pub async fn scan<R: Radio>(radio: &mut R, ssid: &[u8]) -> Result<Vec<Bss>, JoinError> {
+/// The scan covers every channel when `freqs_mhz` is empty, and only the channels with these centre
+/// frequencies otherwise; either way the kernel drops the earlier results first. A busy radio is asked again
+/// a second later, up to `SCAN_BUSY_TRIES` times in all. A scan of channels the radio refuses is the
+/// error `Scan` with the radio's refusal.
+pub async fn scan<R: Radio>(
+    radio: &mut R,
+    ssid: &[u8],
+    freqs_mhz: &[u32],
+) -> Result<Vec<Bss>, JoinError> {
     let mut tries = 0;
     loop {
         tries += 1;
-        match radio.trigger_scan(ssid).await {
+        match radio.trigger_scan(ssid, freqs_mhz).await {
             Ok(()) => break,
             Err(RadioError::Busy) if tries < SCAN_BUSY_TRIES => sleep(SCAN_BUSY_WAIT).await,
             Err(error) => return Err(JoinError::Scan(error)),
@@ -1426,7 +1437,7 @@ mod tests {
             .trigger_errors
             .extend([RadioError::Busy, RadioError::Busy]);
         radio.script.push_back(nl(Event::ScanDone));
-        let found = scan(&mut radio, b"ThisIsASSID").await.unwrap();
+        let found = scan(&mut radio, b"ThisIsASSID", &[]).await.unwrap();
         assert_eq!(found, [bss()]);
         assert_eq!(
             radio.calls,
@@ -1442,29 +1453,51 @@ mod tests {
         radio
             .trigger_errors
             .extend((0..5).map(|_| RadioError::Busy));
-        let error = scan(&mut radio, b"ThisIsASSID").await.unwrap_err();
+        let error = scan(&mut radio, b"ThisIsASSID", &[]).await.unwrap_err();
         assert!(matches!(error, JoinError::Scan(RadioError::Busy)));
         assert_eq!(radio.commands(), vec![Call::TriggerScan; 5]);
 
         // Any other error is final at once.
         let mut radio = FakeRadio::new();
         radio.trigger_errors.push_back(RadioError::NoInterface);
-        let error = scan(&mut radio, b"ThisIsASSID").await.unwrap_err();
+        let error = scan(&mut radio, b"ThisIsASSID", &[]).await.unwrap_err();
         assert!(matches!(error, JoinError::Scan(RadioError::NoInterface)));
         assert_eq!(radio.commands(), [Call::TriggerScan]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_scan_is_limited_to_the_channels_it_is_given() {
+        let mut radio = FakeRadio::new();
+        radio.results = vec![
+            Bss {
+                freq_mhz: 5180,
+                ..bss()
+            },
+            Bss {
+                freq_mhz: 2437,
+                ..bss()
+            },
+        ];
+        radio.script.push_back(nl(Event::ScanDone));
+        let found = scan(&mut radio, b"ThisIsASSID", &[2437, 2412])
+            .await
+            .unwrap();
+        assert_eq!(radio.scan_freqs, [vec![2437, 2412]]);
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].freq_mhz, 2437);
     }
 
     #[tokio::test(start_paused = true)]
     async fn a_scan_that_is_aborted_or_never_ends_is_an_error() {
         let mut radio = FakeRadio::new();
         radio.script.push_back(nl(Event::ScanAborted));
-        let error = scan(&mut radio, b"ThisIsASSID").await.unwrap_err();
+        let error = scan(&mut radio, b"ThisIsASSID", &[]).await.unwrap_err();
         assert!(matches!(error, JoinError::ScanAborted));
 
         let started = tokio::time::Instant::now();
         let mut radio = FakeRadio::new();
         radio.script.push_back(Step::Silence);
-        let error = scan(&mut radio, b"ThisIsASSID").await.unwrap_err();
+        let error = scan(&mut radio, b"ThisIsASSID", &[]).await.unwrap_err();
         assert!(matches!(error, JoinError::ScanTimeout));
         assert_eq!(started.elapsed(), SCAN_TIMEOUT);
         assert_eq!(error.to_string(), "the scan did not finish within 15 s");
@@ -1478,7 +1511,10 @@ mod tests {
             Step::Event(RadioEvent::Overrun),
             nl(Event::ScanDone),
         ]);
-        assert_eq!(scan(&mut radio, b"ThisIsASSID").await.unwrap(), [bss()]);
+        assert_eq!(
+            scan(&mut radio, b"ThisIsASSID", &[]).await.unwrap(),
+            [bss()]
+        );
     }
 
     #[tokio::test(start_paused = true)]

@@ -232,6 +232,7 @@ mod tests {
             started: Instant::now(),
             link: Arc::new(crate::live::WifiStatus::default),
             board_c: Arc::new(|| None),
+            update: crate::update::UpdateCtl::off(),
         };
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
         let status_addr = listener.local_addr().unwrap();

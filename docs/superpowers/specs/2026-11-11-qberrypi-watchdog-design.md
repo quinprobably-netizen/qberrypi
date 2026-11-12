@@ -126,3 +126,66 @@ to be quiet on a normal household:
 - DoT against a local TLS test server.
 - QEMU scenarios where they can run without Wi-Fi (the analysis fed from loopback DNS).
 - The latency gate on the Pi for every track.
+
+## Exempt devices
+
+Added 2026-11-11, for when the whole network's DNS points at the Pi: a list of devices that are not
+ad-blocked.
+
+- **What it does.** A question from an exempt device skips the ads and tracker lists and the
+  configuration's `dns.deny` names: the name is answered from the cache or forwarded, and counted as
+  the cache hit or forward it was, never as a block. Everything else stays: the threat lists block
+  and raise their alert as for any device, and the DoH canary, rebinding screening and every other
+  alert apply unchanged. An answer that an exempt device's question put in the cache never reaches
+  another device, because for every other device the block check comes before the cache.
+- **Two lists, by Ethernet address.** The configuration's `[watch] exempt` (at most 64) and a list
+  that the desktop client pushes with `PUT /api/qbp/devices/exempt` (at most 64, `[]` clears it).
+  A device is exempt if its MAC is on either. The pushed list is held in memory only, like the known
+  list, so the desktop client pushes it again after the Pi restarts.
+- **From MAC to address.** The device watch already learns which IPv4 address each MAC claims, by
+  ARP and DHCP. An address is exempt while the device that claimed it last is an exempt one; when
+  another device claims it, it stops being exempt at once. A device on a list that has not been
+  heard since the start has no address yet, so the first questions of an exempt device after a
+  restart may still be blocked until its ARP or DHCP is heard. The router's address (`net.gateway`)
+  and the Pi's own are never exempt, whatever MAC claims them, so an exempt device that spoofs the
+  router cannot exempt every client whose DNS the router relays. Exemption has no part in the
+  new-device and ARP-spoof alerts, and does not depend on the known list.
+- **Hot path.** The device watch publishes the exempt addresses to a small set that the DNS side
+  reads before it locks the resolver; it never touches the inventory or its lock. With the set empty
+  the check is one relaxed atomic load; with addresses in it, one uncontended read lock and a binary
+  search. Neither allocates. `/api/v1/stats` tells `exempt_clients`, the number of addresses exempt
+  right now (in the exempt-by-default mode below: the number of IPv4 addresses that the device
+  watch knows and that are not fully blocked), and `exempt_default`, whether that mode is on.
+- **What a forged MAC buys.** A device that claims an exempt device's MAC, or that answers ARP for an
+  exempt address, only gains unblocked ads. It never gains unblocked threats, as the threat lists
+  apply to every device.
+
+### Exempt by default
+
+Added 2026-11-12: the same, turned around.
+
+- **What it does.** With `[watch] exempt_default = true`, or a pushed policy that says so, every
+  client is held to the threat lists alone except a **fully blocked** one: an IPv4 address (or
+  IPv4-mapped IPv6) that a device on a block list claimed last, and always the router's address,
+  the Pi's own and loopback. Unknown and never-heard devices and IPv6 clients are exempt; this
+  program's own lookups never are. While the mode is on the exempt lists have no effect, and while
+  it is off the block lists have none.
+- **Block lists.** `[watch] block` (at most 64, checked like `exempt`) and a pushed list:
+  `PUT /api/qbp/devices/policy` `{"exempt_default": bool, "block": [...]}`, both keys required, at
+  most 64 different addresses, answering `{"exempt_default", "block": n}`. A push replaces the
+  pushed mode and list; the pushed mode wins from the first push, the configuration's until then.
+  Memory only, pushed again after a restart. `GET devices` adds `exempt_default`, `block_macs` and
+  per device `blocked`, and `exempt` becomes the effective answer. A pushed policy logs one line
+  when its mode or blocked count changes, never a MAC or address.
+- **Hot path.** The watch keeps a second small set, the fully blocked addresses, in step in either
+  mode, and the mode is one atomic flag. The DNS side reads the flag (one relaxed load) and then one
+  set before it locks the resolver; no allocation.
+- **What it trades.** Every unnamed device, guests included, loses ad blocking; threat lists, the
+  DoH canary, rebinding screening and every alert still apply to all. A device whose MAC rotates
+  leaves its block behind.
+- **What a forged MAC or address buys.** Spoofing a blocked device's MAC only gains ad blocking
+  that the spoofer did not want. Claiming a blocked device's address under another MAC exempts that
+  address until the blocked device is heard claiming it again: less than the same ARP forgery
+  already allows against its traffic. Nothing forged unblocks a threat. The router's and the Pi's
+  addresses stay fully blocked whatever MAC claims them, so a forged router cannot exempt every
+  client the router relays. The router is known by IPv4 only; the DNS service listens on IPv4 only.

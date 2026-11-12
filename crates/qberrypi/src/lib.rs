@@ -23,6 +23,7 @@ pub mod netlink;
 pub mod panel;
 pub mod selftest;
 pub mod services;
+pub mod slots;
 pub mod sntp;
 pub mod stall;
 pub mod status;
@@ -31,6 +32,7 @@ pub mod sys;
 #[cfg(test)]
 pub(crate) mod testns;
 pub mod thermal;
+pub mod update;
 pub mod watch;
 pub mod wifi;
 pub mod wiring;

@@ -15,6 +15,10 @@
 //! runs on the supervisor's own clock and its deadline is a timer of the same loop as the tick, so
 //! a component that holds the thread delays the reason by that hold and no more.
 //!
+//! A component that the update machinery lends a channel to ([`Plan::restart`]) can end the run
+//! itself with [`Reason::Restart`], as an update's receiver does when the new slot is staged and
+//! the trial does when it gives up; the supervisor only carries the request out of the loop.
+//!
 //! A component that is [`Ended::Absent`] is not there to run, as the front panel on a board
 //! without its screen: it is said so once and never started again. One that [`Ended::Failed`], or
 //! panicked, is started again, unless it has failed [`FAILURES_TO_GIVE_UP`] times within
@@ -46,6 +50,7 @@ use tokio::time::{Instant, MissedTickBehavior, interval_at, sleep_until};
 use crate::led::LedState;
 use crate::link::{self, LinkStep, LinkWatch};
 use crate::services;
+use crate::update::Restart;
 use crate::wifi::WifiStatus;
 
 /// How often the tick hook is called: the watchdog is petted at least this often.
@@ -146,6 +151,10 @@ pub enum Reason {
     NoAssociation,
     /// The time that the configuration gives the board to run has passed.
     ReturnAfter,
+    /// A component asked for the restart through the update machinery
+    /// ([`UpdateCtl::request_restart`](crate::update::UpdateCtl::request_restart)): an update was
+    /// staged, or the trial gave up. The restart says how the board goes.
+    Restart(Restart),
 }
 
 impl fmt::Display for Reason {
@@ -157,6 +166,7 @@ impl fmt::Display for Reason {
             ),
             Self::NoAssociation => f.write_str("no Wi-Fi association for 90 s"),
             Self::ReturnAfter => f.write_str("the configured time has passed"),
+            Self::Restart(restart) => restart.fmt(f),
         }
     }
 }
@@ -172,6 +182,11 @@ pub struct Plan {
     /// for 90 seconds, counted from the start. A sender that is gone counts as not associated.
     /// With `None` the LED shows [`LedState::Serving`] and no such rule is armed.
     pub link: Option<watch::Receiver<WifiStatus>>,
+    /// Where a component asks for the board to restart, if any may: the update machinery's
+    /// channel ([`UpdateCtl::restart_receiver`](crate::update::UpdateCtl::restart_receiver)).
+    /// The first `Some` it holds ends [`run`] with [`Reason::Restart`]; one that is there when
+    /// `run` starts counts. A sender that is gone asks for nothing. With `None` no component can.
+    pub restart: Option<watch::Receiver<Option<Restart>>>,
 }
 
 /// What [`run`] calls on the board's behalf.
@@ -315,6 +330,22 @@ async fn link_changed(link: &mut Option<Link>) -> bool {
     }
 }
 
+/// Waits until a restart is asked for, for ever if none can be: no channel, or a sender that is
+/// gone. Cancel-safe: a request that is already there is found at once, however often it is asked.
+async fn restart_asked(restart: &mut Option<watch::Receiver<Option<Restart>>>) -> Restart {
+    let asked = match restart {
+        Some(receiver) => match receiver.wait_for(Option::is_some).await {
+            Ok(asked) => asked.clone(),
+            Err(_) => None,
+        },
+        None => None,
+    };
+    match asked {
+        Some(restart) => restart,
+        None => std::future::pending().await,
+    }
+}
+
 /// Acts on what a look at the link meant: shows a change on the LED, and says when the board has
 /// to restart.
 fn acted_on(step: LinkStep, led: &mut dyn FnMut(LedState)) -> Option<Reason> {
@@ -334,11 +365,14 @@ fn acted_on(step: LinkStep, led: &mut dyn FnMut(LedState)) -> Option<Reason> {
 /// [`TICK`] whatever else happens. Calls `led` with [`LedState::Serving`] once; with a link in the
 /// plan it calls it with [`LedState::Joining`] instead, and then with what each change of the
 /// link asks for, and ends with [`Reason::NoAssociation`] when the link has been down for 90 s.
+/// With a restart channel in the plan it ends with [`Reason::Restart`] as soon as a request is
+/// there, after a tick that is due.
 pub async fn run(plan: Plan, mut hooks: Hooks) -> Reason {
     let Plan {
         components,
         return_after,
         link,
+        mut restart,
     } = plan;
     let began = Instant::now();
     let return_at = return_after.map(|after| began + after);
@@ -405,6 +439,7 @@ pub async fn run(plan: Plan, mut hooks: Hooks) -> Reason {
                     return reason;
                 }
             }
+            restart = restart_asked(&mut restart) => return Reason::Restart(restart),
             Some(done) = running.join_next_with_id(), if !running.is_empty() => {
                 let (id, how) = match done {
                     Ok((id, how)) => (id, how),
@@ -434,6 +469,8 @@ mod tests {
     use std::time::Duration;
 
     use tokio::time::sleep;
+
+    use crate::update::Cause;
 
     const HOUR: Duration = Duration::from_secs(3600);
 
@@ -495,6 +532,7 @@ mod tests {
         Plan {
             components,
             return_after: None,
+            restart: None,
             link: None,
         }
     }
@@ -633,6 +671,103 @@ mod tests {
         p.return_after = Some(Duration::ZERO);
         let (reason, ticks, _) = watch(p, HOUR).await;
         assert_eq!((reason, ticks), (Some(Reason::ReturnAfter), 1));
+    }
+
+    /// A component that asks for a restart `after` its start, through `sender`, and never ends.
+    fn asking(
+        sender: watch::Sender<Option<Restart>>,
+        after: Duration,
+        restart: Restart,
+    ) -> Component {
+        Component::task("trial", false, move || {
+            let (sender, restart) = (sender.clone(), restart.clone());
+            async move {
+                sleep(after).await;
+                sender.send_replace(Some(restart));
+                std::future::pending().await
+            }
+        })
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_restart_that_a_component_asks_for_ends_the_run_with_it() {
+        let (tx, rx) = watch::channel(None);
+        let began = tokio::time::Instant::now();
+        let mut p = plan(vec![
+            forever("dns"),
+            asking(tx, Duration::from_secs(7), Restart::Tryboot),
+        ]);
+        p.restart = Some(rx);
+
+        let (reason, _, _) = watch(p, HOUR).await;
+
+        assert_eq!(reason, Some(Reason::Restart(Restart::Tryboot)));
+        // At once: not at the next tick, which is 5 s apart.
+        assert_eq!(began.elapsed(), Duration::from_secs(7));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_restart_that_is_there_when_the_run_starts_ends_it_after_the_first_tick() {
+        let (_tx, rx) = watch::channel(Some(Restart::Plain(Cause::Update)));
+        let mut p = plan(vec![forever("dns")]);
+        p.restart = Some(rx);
+
+        let (reason, ticks, _) = watch(p, HOUR).await;
+
+        assert_eq!(
+            (reason, ticks),
+            (Some(Reason::Restart(Restart::Plain(Cause::Update))), 1)
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_cause_of_a_restart_comes_out_of_the_run_as_it_went_in() {
+        let (tx, rx) = watch::channel(None);
+        let mut p = plan(vec![asking(
+            tx,
+            Duration::from_secs(1),
+            Restart::Plain(Cause::GaveUp("no Wi-Fi".into())),
+        )]);
+        p.restart = Some(rx);
+
+        let (reason, _, _) = watch(p, HOUR).await;
+
+        let reason = reason.unwrap();
+        assert_eq!(
+            reason,
+            Reason::Restart(Restart::Plain(Cause::GaveUp("no Wi-Fi".into())))
+        );
+        assert_eq!(reason.to_string(), "the trial gave up: no Wi-Fi");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn no_restart_is_asked_when_the_channel_is_idle_gone_or_absent() {
+        // Idle: the sender is there and says nothing.
+        let (_tx, rx) = watch::channel(None);
+        let mut idle = plan(vec![forever("dns")]);
+        idle.restart = Some(rx);
+        assert_eq!(watch(idle, Duration::from_secs(600)).await.0, None);
+        // Gone: a closed channel asks for nothing, and does not wake the loop again and again.
+        let (tx, rx) = watch::channel(None);
+        drop(tx);
+        let mut gone = plan(vec![forever("dns")]);
+        gone.restart = Some(rx);
+        assert_eq!(watch(gone, Duration::from_secs(600)).await.0, None);
+        // Absent: no component can ask.
+        let absent = plan(vec![forever("dns")]);
+        assert_eq!(watch(absent, Duration::from_secs(600)).await.0, None);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_tick_that_is_due_comes_before_a_restart_that_is_asked_for_at_the_same_moment() {
+        let (tx, rx) = watch::channel(None);
+        let mut p = plan(vec![asking(tx, TICK, Restart::Tryboot)]);
+        p.restart = Some(rx);
+
+        let (reason, ticks, _) = watch(p, HOUR).await;
+
+        assert_eq!(reason, Some(Reason::Restart(Restart::Tryboot)));
+        assert_eq!(ticks, 2);
     }
 
     #[tokio::test(start_paused = true)]

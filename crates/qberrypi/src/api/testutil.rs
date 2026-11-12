@@ -111,7 +111,12 @@ pub(crate) struct Answer {
 }
 
 /// How long a client waits for the server before it takes the server to be stuck.
-const CLIENT_WAIT: Duration = Duration::from_secs(10);
+///
+/// Generous on purpose: a test that sends an update waits for a server that writes eleven files to a
+/// disk and syncs each one, and on a loaded machine one sync takes seconds, so a reply can be late
+/// by far more than a stuck server would be. A server that is stuck is a test that fails a minute
+/// late, which costs nothing; a client that gives up early is a flake.
+const CLIENT_WAIT: Duration = Duration::from_secs(60);
 
 /// One TLS connection to the API, and the requests and replies on it.
 pub(crate) struct Connection {
@@ -151,45 +156,50 @@ impl Connection {
     /// Reads one reply; `UnexpectedEof` when the server has closed the connection, with a close
     /// notice or without, and `TimedOut` when it said nothing for `CLIENT_WAIT`.
     pub fn receive(&mut self) -> io::Result<Answer> {
-        let mut head = Vec::new();
-        loop {
-            let mut line = Vec::new();
-            let got = self
-                .stream
-                .read_until(b'\n', &mut line)
-                .map_err(timed_out)?;
-            if got == 0 {
-                return Err(io::ErrorKind::UnexpectedEof.into());
+        read_reply(&mut self.stream)
+    }
+
+    /// Sends `pieces`, one after the other, as the rest of a request, and reads the reply.
+    ///
+    /// A server that refuses a request from its head answers and closes with the body unread, and
+    /// the client's writes then fail partway (a reset, or a broken pipe) while its connection
+    /// still holds the reply, which arrived first. So a write that fails ends the sending and is
+    /// no failure of the test: the reply is read all the same, by [`Connection::receive_unflushed`],
+    /// which does not try to write what the failed write left queued. Only a reply that is not
+    /// there is an error, and it names the write that failed as well.
+    pub fn send_pieces_and_receive<'a>(
+        &mut self,
+        pieces: impl IntoIterator<Item = &'a [u8]>,
+    ) -> io::Result<Answer> {
+        for piece in pieces {
+            if let Err(written) = self.send_raw(piece) {
+                return self.receive_unflushed().map_err(|read| {
+                    io::Error::new(
+                        read.kind(),
+                        format!("{read}, after a write failed with {written}"),
+                    )
+                });
             }
-            if line == b"\r\n" {
-                break;
-            }
-            head.extend_from_slice(&line);
         }
-        let head = String::from_utf8(head).unwrap();
-        let mut lines = head.lines();
-        let status = lines
-            .next()
-            .and_then(|line| line.split(' ').nth(1))
-            .and_then(|status| status.parse().ok())
-            .expect("a status line");
-        let header = |name: &str| {
-            lines.clone().find_map(|line| {
-                let (key, value) = line.split_once(':')?;
-                key.eq_ignore_ascii_case(name)
-                    .then(|| value.trim().to_owned())
-            })
-        };
-        let length: usize = header("content-length").map_or(0, |n| n.parse().unwrap());
-        let close = header("connection").is_some_and(|value| value.eq_ignore_ascii_case("close"));
-        let mut body = vec![0u8; length];
-        self.stream.read_exact(&mut body).map_err(timed_out)?;
-        let json = serde_json::from_slice(&body).unwrap_or(Value::Null);
-        Ok(Answer {
-            status,
-            close,
-            json,
-        })
+        self.receive()
+    }
+
+    /// Reads one reply from what the server sent, and never writes: unlike a read of the TLS
+    /// stream, it does not first try to flush what an earlier write left queued, which fails when
+    /// the server has closed and hides the reply that is there to read.
+    ///
+    /// Nothing may have been read from this connection before.
+    pub fn receive_unflushed(&mut self) -> io::Result<Answer> {
+        assert!(
+            self.stream.buffer().is_empty(),
+            "a reply is half read already"
+        );
+        let tls = self.stream.get_mut();
+        let mut reader = BufReader::new(Unflushed {
+            conn: &mut tls.conn,
+            sock: &mut tls.sock,
+        });
+        read_reply(&mut reader)
     }
 
     /// How long it takes the server to close the connection, if it does within `within`: what the
@@ -212,6 +222,75 @@ impl Connection {
             _ => Some(began.elapsed()),
         }
     }
+}
+
+/// The plaintext that arrives on a client's TLS connection, read from the socket and decrypted
+/// and never more: `read` does not write, whatever the connection has queued to send.
+struct Unflushed<'a> {
+    conn: &'a mut ClientConnection,
+    sock: &'a mut TcpStream,
+}
+
+impl Read for Unflushed<'_> {
+    /// Decrypted bytes if any are there; else reads more of the socket. End of stream is `Ok(0)`
+    /// after a close notice and `UnexpectedEof` without one; a reset that comes when no plaintext
+    /// is left is its own error, and `TimedOut` is a socket that said nothing for `CLIENT_WAIT`.
+    fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
+        let mut ended = false;
+        loop {
+            match self.conn.reader().read(out) {
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    if ended {
+                        return Err(io::ErrorKind::UnexpectedEof.into());
+                    }
+                }
+                done => return done,
+            }
+            ended = self.conn.read_tls(self.sock).map_err(timed_out)? == 0;
+            self.conn.process_new_packets().map_err(io::Error::other)?;
+        }
+    }
+}
+
+/// Reads one reply from `reader`: the head to its blank line, then the body that
+/// `Content-Length` says.
+fn read_reply(reader: &mut impl BufRead) -> io::Result<Answer> {
+    let mut head = Vec::new();
+    loop {
+        let mut line = Vec::new();
+        let got = reader.read_until(b'\n', &mut line).map_err(timed_out)?;
+        if got == 0 {
+            return Err(io::ErrorKind::UnexpectedEof.into());
+        }
+        if line == b"\r\n" {
+            break;
+        }
+        head.extend_from_slice(&line);
+    }
+    let head = String::from_utf8(head).unwrap();
+    let mut lines = head.lines();
+    let status = lines
+        .next()
+        .and_then(|line| line.split(' ').nth(1))
+        .and_then(|status| status.parse().ok())
+        .expect("a status line");
+    let header = |name: &str| {
+        lines.clone().find_map(|line| {
+            let (key, value) = line.split_once(':')?;
+            key.eq_ignore_ascii_case(name)
+                .then(|| value.trim().to_owned())
+        })
+    };
+    let length: usize = header("content-length").map_or(0, |n| n.parse().unwrap());
+    let close = header("connection").is_some_and(|value| value.eq_ignore_ascii_case("close"));
+    let mut body = vec![0u8; length];
+    reader.read_exact(&mut body).map_err(timed_out)?;
+    let json = serde_json::from_slice(&body).unwrap_or(Value::Null);
+    Ok(Answer {
+        status,
+        close,
+        json,
+    })
 }
 
 /// A read that the socket's timeout cut short says so.

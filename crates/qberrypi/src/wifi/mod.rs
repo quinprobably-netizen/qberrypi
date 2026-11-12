@@ -28,6 +28,16 @@ pub mod radio;
 /// access point goes to the back of the line, and the wait before the next attempt grows.
 pub const STABLE_LINK: Duration = Duration::from_secs(30);
 
+/// How long a pass waits before it asks a 5 GHz access point that refused the association once more
+/// (see `retries_on_5ghz`).
+///
+/// An access point that still holds the station from before a fast restart refuses it (status 16 has
+/// been seen) until it lets go of the old association. Going to the 2.4 GHz access point of the same
+/// network instead was seen to cost more than this: the kernel moved the station back to 5 GHz within
+/// 0.2 s, which lost the link, and the pass after it joined 5 GHz about 5 s later than a first join
+/// would have. A second is short against that, and the wait happens once per pass at most.
+pub const RETRY_5GHZ_AFTER: Duration = Duration::from_secs(1);
+
 /// Where the Wi-Fi stands, for whoever shows it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WifiStatus {
@@ -59,11 +69,12 @@ pub fn derive_pmk(wifi: &config::Wifi) -> Result<Pmk, PmkError> {
     }
 }
 
-/// What `run` needs of the configuration: the network's name and its key.
+/// What `run` needs of the configuration: the network's name, its key and the channels to scan first.
 pub fn join_cfg(wifi: &config::Wifi) -> Result<JoinCfg, PmkError> {
     Ok(JoinCfg {
         ssid: wifi.ssid.as_bytes().to_vec(),
         pmk: derive_pmk(wifi)?,
+        hint_mhz: wifi.hint_mhz.clone(),
     })
 }
 
@@ -80,8 +91,21 @@ enum Outcome {
 /// Every pass rescans. The access points that failed since the last stable link are tried after the others,
 /// and when every one in sight has failed the list starts over. A pass that ended without a link of
 /// `STABLE_LINK` is a failure: the first after a success is retried at once, the ones after it wait 1, 2, 4,
-/// 8 and 16 s, then 30 s each. `report` hears every change of status. A link whose radio stops answering
-/// is lost like any other, within a minute: `hold` probes the radio while it holds.
+/// 8 and 16 s, then 30 s each. Within a pass, a 5 GHz access point that refuses the association is asked
+/// once more, `RETRY_5GHZ_AFTER` later, when the attempt after it would not be on 5 GHz (`retries_on_5ghz`);
+/// only a second refusal makes it a failure. `report` hears every change of status. A link whose radio
+/// stops answering is lost like any other, within a minute: `hold` probes the radio while it holds.
+///
+/// # The hint
+///
+/// With `cfg.hint_mhz` set, the first scan of a join covers only those channels, which is a much shorter
+/// scan than one of every channel; the pass is otherwise the one below. The first pass after the start, and
+/// the pass after a link that held for `STABLE_LINK`, scan the hinted channels first. Any pass that follows a
+/// failure, or a link that dropped early, scans every channel as it always did, and so does a pass whose
+/// hinted scan fails, finds no access point to try, or finds none on 5 GHz first (see `pass`). So a hint
+/// that is wrong costs one short scan, and no join is ever made on another footing than a full scan gives:
+/// the survey, the RSN checks, the order of the candidates (5 GHz first) and the handshake are the same. The
+/// hint is for the 5 GHz channel: a hint that names only 2.4 GHz channels never saves a scan.
 pub async fn run<R: radio::Radio>(
     radio: &mut R,
     cfg: &JoinCfg,
@@ -89,18 +113,22 @@ pub async fn run<R: radio::Radio>(
 ) -> Infallible {
     let mut backoff = Backoff::default();
     let mut failed: Vec<MacAddr> = Vec::new();
+    // Whether the pass that is next may scan the hinted channels first.
+    let mut hinted = true;
     loop {
-        match pass(radio, cfg, &mut failed, report).await {
+        match pass(radio, cfg, &mut failed, hinted, report).await {
             Outcome::Lost { held, .. } if held >= STABLE_LINK => {
                 backoff.succeeded();
                 failed.clear();
+                hinted = true;
             }
             Outcome::Lost { bssid, .. } | Outcome::Failed { tried: Some(bssid) } => {
                 if !failed.contains(&bssid) {
                     failed.push(bssid);
                 }
+                hinted = false;
             }
-            Outcome::Failed { tried: None } => {}
+            Outcome::Failed { tried: None } => hinted = false,
         }
         let wait = backoff.failed();
         if !wait.is_zero() {
@@ -113,19 +141,18 @@ pub async fn run<R: radio::Radio>(
     }
 }
 
-/// One scan, and the join and hold that follow it if the scan finds an access point to try.
-async fn pass<R: radio::Radio>(
+/// One scan of `freqs_mhz` (every channel if it is empty) and what it found, sorted for the join, with the
+/// lines the log tells of it. An error is the scan's own.
+///
+/// This is the whole of what a scan means to the pass, hinted or not: the survey and its checks are the
+/// same for any channels.
+async fn survey_scan<R: radio::Radio>(
     radio: &mut R,
     cfg: &JoinCfg,
     failed: &mut Vec<MacAddr>,
-    report: &mut (dyn FnMut(WifiStatus) + Send),
-) -> Outcome {
-    let began = Instant::now();
-    report(WifiStatus::Scanning);
-    let results = match scan(radio, &cfg.ssid).await {
-        Ok(results) => results,
-        Err(error) => return failure(&error, None),
-    };
+    freqs_mhz: &[u32],
+) -> Result<choose::Survey, JoinError> {
+    let results = scan(radio, &cfg.ssid, freqs_mhz).await?;
     let found = choose::survey(&results, &cfg.ssid, failed);
     // With every candidate failed the order among them is the one a fresh list gives: no second survey.
     if !found.candidates.is_empty() && found.candidates.iter().all(|c| failed.contains(&c.bssid)) {
@@ -147,6 +174,59 @@ async fn pass<R: radio::Radio>(
     for (bssid, freq_mhz, reason) in &found.skipped {
         log::info!("wifi: skipping {} {freq_mhz} MHz: {reason}", mac(bssid));
     }
+    Ok(found)
+}
+
+/// Whether the access point that a survey puts first is on the 5 GHz band: the one that the pass would
+/// join, ranked as every survey ranks, is on the band that is preferred to any other.
+fn best_is_5ghz(found: &choose::Survey) -> bool {
+    found
+        .candidates
+        .first()
+        .is_some_and(|candidate| choose::band(candidate.freq_mhz) == choose::Band::Ghz5)
+}
+
+/// One scan, and the join and hold that follow it if the scan finds an access point to try.
+///
+/// With `hinted` and a hint in `cfg`, the scan is first one of the hinted channels alone. When that scan
+/// fails, or leaves no candidate (none seen, or all of them out of scope), or leaves a first candidate that
+/// is not on 5 GHz (the hint cannot make a 2.4 GHz access point win over a 5 GHz one that it does not
+/// cover: a full scan would prefer that one), the pass goes on at once with the scan of every channel, which
+/// is then the pass's scan, and a failure of that one is the pass's failure. A hinted scan that leaves a
+/// 5 GHz candidate first is the pass's scan: the join of that candidate fails like any other, and the next
+/// pass scans every channel (see `run`). The status `Scanning` is reported once.
+async fn pass<R: radio::Radio>(
+    radio: &mut R,
+    cfg: &JoinCfg,
+    failed: &mut Vec<MacAddr>,
+    hinted: bool,
+    report: &mut (dyn FnMut(WifiStatus) + Send),
+) -> Outcome {
+    let began = Instant::now();
+    report(WifiStatus::Scanning);
+    let mut first = None;
+    if hinted && !cfg.hint_mhz.is_empty() {
+        // How many channels, and not which: the configuration's values stay out of the log.
+        log::info!(
+            "wifi: scanning {} hinted channel(s) first",
+            cfg.hint_mhz.len()
+        );
+        match survey_scan(radio, cfg, failed, &cfg.hint_mhz).await {
+            Ok(found) if best_is_5ghz(&found) => first = Some(found),
+            Ok(found) if !found.candidates.is_empty() => log::info!(
+                "wifi: the hinted channels held no access point on 5 GHz to try; the 5 GHz band is preferred, so every channel is scanned"
+            ),
+            Ok(_) => log::info!("wifi: the hinted channels held no access point to try"),
+            Err(error) => log::warn!("wifi: the scan of the hinted channels failed: {error}"),
+        }
+    }
+    let found = match first {
+        Some(found) => found,
+        None => match survey_scan(radio, cfg, failed, &[]).await {
+            Ok(found) => found,
+            Err(error) => return failure(&error, None),
+        },
+    };
     let Some(candidate) = found.candidates.first() else {
         return failure(
             &JoinError::NoCandidate {
@@ -162,6 +242,19 @@ async fn pass<R: radio::Radio>(
     });
     let mut link = match join(radio, cfg, candidate).await {
         Ok(link) => link,
+        Err(error) if retries_on_5ghz(&error, &found) => {
+            log::warn!("wifi: attempt failed: {error}");
+            log::info!(
+                "wifi: asking {} on 5 GHz once more in {} s",
+                mac(&candidate.bssid),
+                RETRY_5GHZ_AFTER.as_secs()
+            );
+            sleep(RETRY_5GHZ_AFTER).await;
+            match join(radio, cfg, candidate).await {
+                Ok(link) => link,
+                Err(error) => return failure(&error, Some(candidate.bssid)),
+            }
+        }
         Err(error) => return failure(&error, Some(candidate.bssid)),
     };
     report(WifiStatus::Joined {
@@ -183,6 +276,28 @@ async fn pass<R: radio::Radio>(
         bssid: link.bssid,
         held: joined.elapsed(),
     }
+}
+
+/// Whether the pass asks its first candidate once more, after `RETRY_5GHZ_AFTER`, when the join of it
+/// failed with `error`: the access point is on 5 GHz and refused the association (any status; not one
+/// that went unanswered, and not a failure of the handshake or of a key, which are what they were), and
+/// the attempt after this one would not be on 5 GHz. That is when the survey's next candidate is on
+/// another band, or when the survey has no other: a hinted scan sees only the hinted channels, and the
+/// full scan of the pass after it would put the refused access point last, behind one on 2.4 GHz. With
+/// another 5 GHz access point next, the pass ends as it always did and that one is tried. The retry is a
+/// second join of the same candidate, with its own checks, and its failure ends the pass as any failure
+/// does, so it comes once per pass.
+fn retries_on_5ghz(error: &JoinError, found: &choose::Survey) -> bool {
+    let on_5ghz =
+        |candidate: &choose::Candidate| choose::band(candidate.freq_mhz) == choose::Band::Ghz5;
+    matches!(
+        error,
+        JoinError::AssocRefused {
+            timed_out: false,
+            ..
+        }
+    ) && found.candidates.first().is_some_and(on_5ghz)
+        && !found.candidates.get(1).is_some_and(on_5ghz)
 }
 
 /// Logs a failed attempt, with the passphrase as a suspect when the handshake points at it.
@@ -595,19 +710,22 @@ allow = []
             bss(AA, 2437, b"ThisIsASSID", &RSNE),
             bss(better, 5180, b"ThisIsASSID", &RSNE),
         ]);
-        radio.script.extend([scan_done(), refused()]);
+        // Each refusal is a pair: the 5 GHz one is asked once more a second after it refused.
+        radio.script.extend([scan_done(), refused(), refused()]);
         radio.script.extend(join_script());
         radio
             .script
             .push_back(Step::After(Duration::from_secs(40), ap_disconnects(4)));
-        radio.script.extend([scan_done(), refused(), scan_done()]);
+        radio
+            .script
+            .extend([scan_done(), refused(), refused(), scan_done()]);
         let (radio, _) = drive(radio, &cfg(), Duration::from_secs(45)).await;
-        // The refusal of the better one sends the next attempt to the other, which holds for 40 s. That
+        // The refusals of the better one send the next attempt to the other, which holds for 40 s. That
         // forgets the refusal and the failures, so the better one is first again. The loss of the link was
-        // the first failure of a new run and the refusal after it is the second, so one second passes before
-        // the attempt that goes to the other again: it was 1 + 2 s, had the earlier failures counted.
-        assert_eq!(connects(&radio), [better, AA, better, AA]);
-        assert_eq!(scan_times(&radio), [0, 0, 40, 41]);
+        // the first failure of a new run and the refusals after it are the second, so one second passes
+        // before the attempt that goes to the other again: it was 1 + 2 s, had the earlier failures counted.
+        assert_eq!(connects(&radio), [better, better, AA, better, better, AA]);
+        assert_eq!(scan_times(&radio), [0, 1, 41, 43]);
     }
 
     #[tokio::test(start_paused = true)]
@@ -618,15 +736,17 @@ allow = []
             bss(a, 5180, b"ThisIsASSID", &RSNE),
             bss(b, 2437, b"ThisIsASSID", &RSNE),
         ]);
-        for _ in 0..4 {
+        // A, on 5 GHz, refuses twice each time: it is asked once more a second after it refused.
+        for _ in 0..2 {
+            radio.script.extend([scan_done(), refused(), refused()]);
             radio.script.extend([scan_done(), refused()]);
         }
-        let (radio, _) = drive(radio, &cfg(), Duration::from_secs(5)).await;
-        // The attempts fall at 0, 0, 1 and 3 s. A is first on 5 GHz; B goes ahead of the failed A; with both
+        let (radio, _) = drive(radio, &cfg(), Duration::from_secs(6)).await;
+        // The passes begin at 0, 1, 2 and 5 s. A is first on 5 GHz; B goes ahead of the failed A; with both
         // failed the list is cleared and the order is by band again, so A is first; then only A has failed
         // since the clearing, and B goes ahead of it. Without the clearing the third and fourth would both be A.
-        assert_eq!(connects(&radio), [a, b, a, b]);
-        assert_eq!(scan_times(&radio), [0, 0, 1, 3]);
+        assert_eq!(connects(&radio), [a, a, b, a, a, b]);
+        assert_eq!(scan_times(&radio), [0, 1, 2, 5]);
     }
 
     // Review Focus 3.
@@ -681,6 +801,372 @@ allow = []
         assert!(log.contains("wifi: the passphrase may be wrong"), "{log}");
     }
 
+    /// The configuration of the reference network with a hint of these channels.
+    fn hinted(hint_mhz: &[u32]) -> JoinCfg {
+        JoinCfg {
+            hint_mhz: hint_mhz.to_vec(),
+            ..cfg()
+        }
+    }
+
+    /// The other access point of the network, on 2.4 GHz.
+    const OTHER: MacAddr = [0xb0, 0xb1, 0xb2, 0xb3, 0xb4, 0xb5];
+
+    #[tokio::test(start_paused = true)]
+    async fn without_a_hint_every_scan_covers_every_channel() {
+        let mut radio = radio_seeing(vec![reference_bss()]);
+        radio.script.extend(join_script());
+        radio
+            .script
+            .push_back(Step::After(Duration::from_secs(40), ap_disconnects(4)));
+        radio.script.extend(join_script());
+        let (radio, _) = drive(radio, &cfg(), Duration::from_secs(60)).await;
+        assert_eq!(radio.scan_freqs, [Vec::<u32>::new(), Vec::new()]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_first_scan_covers_only_the_hinted_channels_and_the_join_is_the_usual_one() {
+        logging();
+        // Both access points are in range; the hint names the 5 GHz channel, which the scan alone looks at.
+        let mut radio = radio_seeing(vec![
+            bss(OTHER, 2437, b"ThisIsASSID", &RSNE),
+            reference_bss(),
+        ]);
+        radio.script.extend(join_script());
+        let (radio, statuses) = drive(radio, &hinted(&[5180]), Duration::from_secs(5)).await;
+        assert_eq!(radio.scan_freqs, [[5180]]);
+        // One scan, then the join of the reference handshake, as without a hint.
+        let mut expected = vec![Call::TriggerScan, Call::ScanResults];
+        expected.extend(joined_calls());
+        assert_eq!(radio.commands(), expected);
+        assert_eq!(
+            statuses,
+            [WifiStatus::Scanning, joining(AA, 5180), joined(AA, 5180)]
+        );
+        let log = log_text();
+        assert!(
+            log.contains("wifi: scanning 1 hinted channel(s) first"),
+            "{log}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_hint_whose_best_access_point_is_on_2_4_ghz_does_not_override_the_5_ghz_preference() {
+        logging();
+        // Both access points are in range, and the hint names the 2.4 GHz channel of the other one: the
+        // hinted scan finds only an access point that a full scan would put second, so it is not taken.
+        let mut radio = radio_seeing(vec![
+            bss(OTHER, 2437, b"ThisIsASSID", &RSNE),
+            reference_bss(),
+        ]);
+        radio.script.extend([
+            scan_done(),
+            scan_done(),
+            connected(),
+            from_ap(&M1),
+            from_ap(&M3),
+        ]);
+        let (radio, statuses) = drive(radio, &hinted(&[2437]), Duration::from_secs(5)).await;
+        // The hinted scan, then the scan of every channel, and the join is on the 5 GHz access point.
+        assert_eq!(radio.scan_freqs, [vec![2437], vec![]]);
+        assert_eq!(connects(&radio), [AA]);
+        assert_eq!(
+            statuses,
+            [WifiStatus::Scanning, joining(AA, 5180), joined(AA, 5180)]
+        );
+        // The two scans are one pass, with no wait between them.
+        assert_eq!(scan_times(&radio), [0, 0]);
+        let log = log_text();
+        assert!(
+            log.contains("wifi: the hinted channels held no access point on 5 GHz to try"),
+            "{log}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_hint_that_names_both_bands_takes_the_5_ghz_access_point_of_its_one_scan() {
+        logging();
+        let mut radio = radio_seeing(vec![
+            bss(OTHER, 2437, b"ThisIsASSID", &RSNE),
+            reference_bss(),
+        ]);
+        radio.script.extend(join_script());
+        let (radio, statuses) = drive(radio, &hinted(&[2437, 5180]), Duration::from_secs(5)).await;
+        // One scan of the two channels, whose best candidate is the 5 GHz one, and its join.
+        assert_eq!(radio.scan_freqs, [vec![2437, 5180]]);
+        assert_eq!(connects(&radio), [AA]);
+        assert_eq!(
+            statuses,
+            [WifiStatus::Scanning, joining(AA, 5180), joined(AA, 5180)]
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_hint_keeps_the_log_free_of_its_frequencies() {
+        logging();
+        // A channel of its own, so that the lines of the other tests are told from these.
+        let mut radio = radio_seeing(vec![bss(AA, 5765, b"ThisIsASSID", &RSNE)]);
+        radio.script.extend(join_script());
+        drive(radio, &hinted(&[5765, 5745]), Duration::from_secs(5)).await;
+        let log = log_text();
+        assert!(
+            log.contains("wifi: scanning 2 hinted channel(s) first"),
+            "{log}"
+        );
+        // The scan's own findings name the frequency of what was seen; the hint's list is not printed.
+        assert!(!log.contains("5745"), "{log}");
+        assert!(!log.contains("5765, 5745"), "{log}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_hint_that_finds_nothing_falls_back_to_the_scan_of_every_channel() {
+        logging();
+        // The access point is on 5180, which the hint does not name.
+        let mut radio = radio_seeing(vec![reference_bss()]);
+        radio.script.extend([
+            scan_done(),
+            scan_done(),
+            connected(),
+            from_ap(&M1),
+            from_ap(&M3),
+        ]);
+        let (radio, statuses) = drive(radio, &hinted(&[5200]), Duration::from_secs(5)).await;
+        assert_eq!(radio.scan_freqs, [vec![5200], vec![]]);
+        assert_eq!(connects(&radio), [AA]);
+        // The two scans are one pass, with no wait between them.
+        assert_eq!(
+            statuses,
+            [WifiStatus::Scanning, joining(AA, 5180), joined(AA, 5180)]
+        );
+        assert_eq!(scan_times(&radio), [0, 0]);
+        let log = log_text();
+        assert!(
+            log.contains("wifi: the hinted channels held no access point to try"),
+            "{log}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_hinted_access_point_that_fails_the_checks_is_not_tried() {
+        // The access point on the hinted channel is a mixed WPA/WPA2 network, which is out of scope on any
+        // scan: the hint changes no check, so the pass goes on to the scan of every channel and its choice.
+        let mixed = hex!("30180100000fac020200000fac04000fac020100000fac020000");
+        let mut radio = radio_seeing(vec![
+            bss(OTHER, 5180, b"ThisIsASSID", &mixed),
+            bss(AA, 2437, b"ThisIsASSID", &RSNE),
+        ]);
+        radio.script.extend([
+            scan_done(),
+            scan_done(),
+            connected(),
+            from_ap(&M1),
+            from_ap(&M3),
+        ]);
+        let (radio, _) = drive(radio, &hinted(&[5180]), Duration::from_secs(5)).await;
+        assert_eq!(radio.scan_freqs, [vec![5180], vec![]]);
+        assert_eq!(connects(&radio), [AA]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_hinted_scan_the_radio_refuses_falls_back_to_the_scan_of_every_channel() {
+        logging();
+        let mut radio = radio_seeing(vec![reference_bss()]);
+        // The kernel refuses the request, as it does for a channel its radio does not have.
+        radio
+            .trigger_errors
+            .push_back(radio::RadioError::NoInterface);
+        radio.script.extend(join_script());
+        let (radio, statuses) = drive(radio, &hinted(&[5700]), Duration::from_secs(5)).await;
+        assert_eq!(radio.scan_freqs, [vec![5700], vec![]]);
+        assert_eq!(connects(&radio), [AA]);
+        assert_eq!(
+            statuses,
+            [WifiStatus::Scanning, joining(AA, 5180), joined(AA, 5180)]
+        );
+        let log = log_text();
+        assert!(
+            log.contains(
+                "wifi: the scan of the hinted channels failed: the scan failed: the wireless interface is gone"
+            ),
+            "{log}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_failed_join_on_the_hinted_channel_makes_the_next_scan_a_full_one() {
+        // The hinted access point refuses, and refuses again when it is asked once more; the scan of every
+        // channel that follows tries the other one first, as it always has for an access point that failed.
+        let mut radio = radio_seeing(vec![
+            bss(AA, 5180, b"ThisIsASSID", &RSNE),
+            bss(OTHER, 2437, b"ThisIsASSID", &RSNE),
+        ]);
+        radio
+            .script
+            .extend([scan_done(), refused(), refused(), scan_done()]);
+        let (radio, _) = drive(radio, &hinted(&[5180]), Duration::from_secs(5)).await;
+        assert_eq!(radio.scan_freqs, [vec![5180], vec![]]);
+        // The first two connects are to the hinted AA. The third is to the other access point, though the
+        // 5 GHz one is preferred: AA is the one that failed.
+        assert_eq!(connects(&radio), [AA, AA, OTHER]);
+        assert_eq!(scan_times(&radio), [0, 1]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_link_that_held_is_rejoined_with_the_hint_and_one_that_dropped_early_is_not() {
+        let mut radio = radio_seeing(vec![reference_bss()]);
+        // Held for 40 s, then dropped: the rejoin is hinted. Joined again, dropped after 5 s: the rescan is
+        // of every channel.
+        radio.script.extend(join_script());
+        radio
+            .script
+            .push_back(Step::After(Duration::from_secs(40), ap_disconnects(4)));
+        radio.script.extend(join_script());
+        radio
+            .script
+            .push_back(Step::After(Duration::from_secs(5), ap_disconnects(4)));
+        radio.script.extend(join_script());
+        let (radio, _) = drive(radio, &hinted(&[5180]), Duration::from_secs(60)).await;
+        assert_eq!(radio.scan_freqs, [vec![5180], vec![5180], vec![]]);
+        // The loss at 40 s is the first failure of a new run (no wait), the one at 45 s the second (1 s).
+        assert_eq!(scan_times(&radio), [0, 40, 46]);
+    }
+
+    // A 5 GHz access point that refuses the association is asked once more before the 2.4 GHz one.
+
+    /// The milliseconds, on the test's clock, at which a connect was asked for.
+    fn connect_times(radio: &FakeRadio) -> Vec<u128> {
+        radio
+            .calls
+            .iter()
+            .filter(|(_, call)| matches!(call, Call::Connect { .. }))
+            .map(|(at, _)| at.as_millis())
+            .collect()
+    }
+
+    /// The reference access point on 5 GHz and the other one of the network on 2.4 GHz, heard louder,
+    /// as a station near the router hears them.
+    fn both_bands() -> FakeRadio {
+        radio_seeing(vec![
+            Bss {
+                signal_mbm: -4300,
+                ..bss(OTHER, 2437, b"ThisIsASSID", &RSNE)
+            },
+            reference_bss(),
+        ])
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_5_ghz_access_point_that_refuses_once_is_asked_again_and_joined() {
+        logging();
+        let mut radio = both_bands();
+        radio.script.extend([
+            scan_done(),
+            refused(),
+            connected(),
+            from_ap(&M1),
+            from_ap(&M3),
+        ]);
+        let (radio, statuses) = drive(radio, &cfg(), Duration::from_secs(5)).await;
+        // One scan, and the second connect to the same access point a second after the first.
+        assert_eq!(connects(&radio), [AA, AA]);
+        assert_eq!(connect_times(&radio), [0, 1000]);
+        assert_eq!(scan_times(&radio), [0]);
+        assert_eq!(
+            statuses,
+            [WifiStatus::Scanning, joining(AA, 5180), joined(AA, 5180)]
+        );
+        let log = log_text();
+        for line in [
+            "WARN  wifi: attempt failed: the access point refused the association, status 16\n",
+            "wifi: asking a0:a1:a1:a3:a4:a5 on 5 GHz once more in 1 s\n",
+            "wifi: joined a0:a1:a1:a3:a4:a5 on 5180 MHz at -56 dBm, 1000 ms after the scan began\n",
+        ] {
+            assert!(log.contains(line), "missing {line:?} in\n{log}");
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_5_ghz_access_point_that_refuses_twice_leaves_the_next_pass_to_2_4_ghz() {
+        let mut radio = both_bands();
+        radio
+            .script
+            .extend([scan_done(), refused(), refused(), scan_done()]);
+        let (radio, statuses) = drive(radio, &cfg(), Duration::from_secs(5)).await;
+        // The retry is once per pass: the second refusal ends it, and the next pass goes to 2.4 GHz
+        // at once, as it always did for an access point that failed.
+        assert_eq!(connects(&radio), [AA, AA, OTHER]);
+        assert_eq!(connect_times(&radio), [0, 1000, 1000]);
+        assert_eq!(scan_times(&radio), [0, 1]);
+        assert_eq!(statuses.last(), Some(&joining(OTHER, 2437)));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_refusal_on_the_hinted_channel_is_asked_again_before_the_full_scan() {
+        // The case seen after a fast restart: the hinted scan sees only the 5 GHz access point, which
+        // still holds the station from before and refuses it once.
+        let mut radio = both_bands();
+        radio.script.extend([
+            scan_done(),
+            refused(),
+            connected(),
+            from_ap(&M1),
+            from_ap(&M3),
+        ]);
+        let (radio, statuses) = drive(radio, &hinted(&[5180]), Duration::from_secs(5)).await;
+        assert_eq!(radio.scan_freqs, [[5180]]);
+        assert_eq!(connects(&radio), [AA, AA]);
+        assert_eq!(statuses.last(), Some(&joined(AA, 5180)));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_failed_handshake_on_5_ghz_is_not_asked_again() {
+        let mut radio = both_bands();
+        // Associated, message 1 came, and the access point ended the link in the handshake.
+        radio
+            .script
+            .extend([scan_done(), connected(), from_ap(&M1)]);
+        radio.script.push_back(nl(Event::Disconnected {
+            reason: 15,
+            by_ap: true,
+        }));
+        radio.script.push_back(scan_done());
+        let (radio, _) = drive(radio, &cfg(), Duration::from_secs(5)).await;
+        // No second connect to the same access point, and no wait: the next pass goes to 2.4 GHz.
+        assert_eq!(connects(&radio), [AA, OTHER]);
+        assert_eq!(scan_times(&radio), [0, 0]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_association_that_went_unanswered_is_not_asked_again() {
+        let mut radio = both_bands();
+        radio.script.extend([
+            scan_done(),
+            nl(Event::ConnectFailed {
+                status: 1,
+                timed_out: true,
+            }),
+            scan_done(),
+        ]);
+        let (radio, _) = drive(radio, &cfg(), Duration::from_secs(5)).await;
+        assert_eq!(connects(&radio), [AA, OTHER]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_refusal_with_another_5_ghz_access_point_next_goes_to_that_one() {
+        let other_5ghz = [0xb0, 0xb1, 0xb2, 0xb3, 0xb4, 0xb7];
+        let mut radio = radio_seeing(vec![
+            reference_bss(),
+            Bss {
+                signal_mbm: -7000,
+                ..bss(other_5ghz, 5500, b"ThisIsASSID", &RSNE)
+            },
+            bss(OTHER, 2437, b"ThisIsASSID", &RSNE),
+        ]);
+        radio.script.extend([scan_done(), refused(), scan_done()]);
+        let (radio, _) = drive(radio, &cfg(), Duration::from_secs(5)).await;
+        assert_eq!(connects(&radio), [AA, other_5ghz]);
+    }
+
     /// A fake radio behind the mute switch, as the kernel radio is: a probe asks the switch first, and
     /// is not sent to the radio when the switch fails it; a connect tells the switch that the hold
     /// before it is over. The fake itself is as it was.
@@ -698,8 +1184,12 @@ allow = []
             self.radio.nonce()
         }
 
-        async fn trigger_scan(&mut self, ssid: &[u8]) -> Result<(), radio::RadioError> {
-            self.radio.trigger_scan(ssid).await
+        async fn trigger_scan(
+            &mut self,
+            ssid: &[u8],
+            freqs_mhz: &[u32],
+        ) -> Result<(), radio::RadioError> {
+            self.radio.trigger_scan(ssid, freqs_mhz).await
         }
 
         async fn scan_results(&mut self) -> Result<Vec<Bss>, radio::RadioError> {

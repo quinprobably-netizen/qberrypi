@@ -17,7 +17,7 @@ pub mod stats;
 pub(crate) mod testutil;
 
 pub use blockset::{BlockSet, BlockSetBuilder, InvalidName, ListClass};
-pub use decide::{Action, Pending, Resolver, ThreatHit, UpstreamOutcome};
+pub use decide::{Action, Filter, Pending, Resolver, ThreatHit, UpstreamOutcome};
 pub use parse::{ListStats, RuleKind};
 pub use stats::{Counts, HistoryBucket, LastBlocked, LogEntry, Outcome, Stats};
 

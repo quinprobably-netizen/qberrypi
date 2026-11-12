@@ -103,6 +103,14 @@ const LOCAL_SUFFIX: &[u8] = b".local";
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct Mac(pub [u8; 6]);
 
+impl Mac {
+    /// Whether this can be the address of one device: not all zeros, and not a broadcast or
+    /// multicast address (the low bit of the first byte clear).
+    pub fn can_be_a_device(self) -> bool {
+        self.0 != [0; 6] && self.0[0] & 1 == 0
+    }
+}
+
 impl fmt::Display for Mac {
     fn fmt(&self, out: &mut fmt::Formatter<'_>) -> fmt::Result {
         let [a, b, c, d, e, f] = self.0;

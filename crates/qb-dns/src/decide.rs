@@ -27,6 +27,17 @@ pub struct ThreatHit {
     pub name: Box<str>,
 }
 
+/// Which lists a client's query is held to. The caller says, for each query, from who asked.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Filter {
+    /// Every list: the ads and tracker lists, the configuration's deny names and the threat lists.
+    All,
+    /// The threat lists alone, for a client that is exempt from ad blocking: a name that only an
+    /// ads list or a deny entry blocks is answered as if it were on no list, from the cache or an
+    /// upstream. The DoH canary, the local answers and a pause apply as for any client.
+    ThreatsOnly,
+}
+
 /// What the caller is to do with one client packet.
 #[derive(Debug)]
 pub enum Action {
@@ -215,7 +226,9 @@ impl Resolver {
     ///    here, not as blocked, so a deny entry for it changes nothing.
     /// 4. A blocked name gets the blocked reply, unless blocking is paused. If the block is of
     ///    a threat list, the packet's [`ThreatHit`] comes back with it, and the query is also
-    ///    counted in [`Counts::blocked_threat`](crate::Counts::blocked_threat).
+    ///    counted in [`Counts::blocked_threat`](crate::Counts::blocked_threat). For a client held
+    ///    to [`Filter::ThreatsOnly`] ([`handle_query_filtered`](Self::handle_query_filtered)) only
+    ///    a block of a threat list applies, and any other name goes on to step 5.
     /// 5. A cached answer is sent, every TTL being the lifetime it has left.
     /// 6. A stale one is sent with short TTLs, and an upstream is asked to renew it unless one
     ///    was asked within the last seconds.
@@ -234,6 +247,25 @@ impl Resolver {
         transport: Transport,
         now: Now,
     ) -> (Action, Option<ThreatHit>) {
+        self.handle_query_filtered(packet, transport, now, Filter::All)
+    }
+
+    /// Decides one packet from a client that is held to the lists of `filter`, as
+    /// [`handle_query_threat`](Self::handle_query_threat) does, which is this with
+    /// [`Filter::All`]. Never panics, whatever the bytes.
+    ///
+    /// With [`Filter::ThreatsOnly`] a name that only an ads list or a deny entry blocks is not
+    /// blocked: it is answered from the cache or forwarded, and counted as the cache hit or the
+    /// forward that it was. A threat is blocked and reported as for any client. What such a query
+    /// stores in the cache is never served to a client held to every list, as the block check
+    /// comes before the cache for that client.
+    pub fn handle_query_filtered(
+        &mut self,
+        packet: &[u8],
+        transport: Transport,
+        now: Now,
+        filter: Filter,
+    ) -> (Action, Option<ThreatHit>) {
         let question = match parse_query(packet, transport) {
             Parsed::Ok(question) => question,
             Parsed::Refuse(question, rcode) => {
@@ -242,7 +274,7 @@ impl Resolver {
             Parsed::HeaderOnly(header) => return (Action::Reply(header.to_vec()), None),
             Parsed::Drop => return (Action::Drop, None),
         };
-        let (outcome, decision, threat) = self.decide(&question, now);
+        let (outcome, decision, threat) = self.decide(&question, now, filter);
         self.stats
             .record(question.name(), question.qtype(), outcome, now);
         let hit = threat.then(|| {
@@ -370,10 +402,15 @@ impl Resolver {
         self.cache.len()
     }
 
-    /// Steps 2 to 7 of [`Resolver::handle_query_threat`], and whether the block of step 4 was of
-    /// a threat. The canary and block checks come before the cache, so a blocked name is never
-    /// answered from it and never touches it.
-    fn decide(&mut self, question: &Question, now: Now) -> (Outcome, Decision, bool) {
+    /// Steps 2 to 7 of [`Resolver::handle_query_threat`] for a client held to `filter`, and
+    /// whether the block of step 4 was of a threat. The canary and block checks come before the
+    /// cache, so a blocked name is never answered from it and never touches it.
+    fn decide(
+        &mut self,
+        question: &Question,
+        now: Now,
+        filter: Filter,
+    ) -> (Outcome, Decision, bool) {
         if let Some(reply) = local(question) {
             return (Outcome::Local, Decision::Reply(reply), false);
         }
@@ -381,7 +418,7 @@ impl Resolver {
             let reply = error(question, ResponseCode::NXDomain);
             return (Outcome::Local, Decision::Reply(reply), false);
         }
-        if let Some(class) = self.block_class(question, now) {
+        if let Some(class) = self.block_class(question, now, filter) {
             let threat = class == ListClass::Threat;
             return (Outcome::Blocked, Decision::Reply(blocked(question)), threat);
         }
@@ -391,14 +428,17 @@ impl Resolver {
         (outcome, decision, false)
     }
 
-    /// The class of the block that `question` is to get at `now`, or `None` if it is to get
-    /// none: blocking is paused, or the name is not one the block set could hold, or does not
-    /// block.
-    fn block_class(&self, question: &Question, now: Now) -> Option<ListClass> {
+    /// The class of the block that `question` is to get at `now` for a client held to `filter`,
+    /// or `None` if it is to get none: blocking is paused, or the name is not one the block set
+    /// could hold, or does not block, or blocks only as an ad and the client is held to threats
+    /// only.
+    fn block_class(&self, question: &Question, now: Now, filter: Filter) -> Option<ListClass> {
         if self.paused_until(now).is_some() {
             return None;
         }
-        self.blockset.verdict(question.block_key()?)
+        self.blockset
+            .verdict(question.block_key()?)
+            .filter(|&class| filter == Filter::All || class == ListClass::Threat)
     }
 
     /// The reply to `question` from the cache, or `None` on a miss. A stored answer that cannot
@@ -705,6 +745,158 @@ mod tests {
         assert!(matches!(action, Action::Drop));
         assert_eq!(hit, None);
         assert_eq!(r.stats().total().blocked_threat, 0);
+    }
+
+    /// What `r` decides for `name` of `qtype` at `mono`, for a client held to `filter`, and the
+    /// threat it reports.
+    fn ask_as(
+        r: &mut Resolver,
+        filter: Filter,
+        name: &str,
+        qtype: u16,
+        mono: u64,
+    ) -> (Action, Option<ThreatHit>) {
+        r.handle_query_filtered(&query(7, name, qtype), Transport::Udp, at(mono), filter)
+    }
+
+    #[test]
+    fn a_client_held_to_threats_only_gets_an_ads_name_from_an_upstream() {
+        let mut r = threat_resolver();
+        let (action, hit) = ask_as(&mut r, Filter::ThreatsOnly, "ads.example.com", 1, 100);
+        let Action::Forward(p) = action else {
+            panic!("not forwarded: {action:?}")
+        };
+        assert_eq!(
+            (p.name(), p.qtype(), p.is_refresh()),
+            ("ads.example.com", 1, false)
+        );
+        assert_eq!(hit, None);
+        // It is counted as what it was, a forwarded query, and never as a block.
+        let forwarded = Counts {
+            queries: 1,
+            forwarded: 1,
+            ..Counts::default()
+        };
+        assert_eq!(r.stats().today(at(100)), forwarded);
+        assert_eq!(r.stats().total(), forwarded);
+        assert!(r.stats().last_blocked(at(100)).is_none());
+        let entry = r.stats().recent(1).next().unwrap();
+        assert_eq!(
+            (&*entry.name, entry.outcome),
+            ("ads.example.com", Outcome::Forwarded)
+        );
+        // `All` is what `handle_query` does: the same name is blocked.
+        let (action, hit) = ask_as(&mut r, Filter::All, "ads.example.com", 1, 101);
+        assert!(is_blocked_reply(&reply(action)));
+        assert_eq!(hit, None);
+        assert_eq!(r.stats().total().blocked, 1);
+    }
+
+    #[test]
+    fn a_client_held_to_threats_only_still_has_its_threats_blocked_and_reported() {
+        let mut r = threat_resolver();
+        let (action, hit) = ask_as(&mut r, Filter::ThreatsOnly, "X.Bad.example.NET", 28, 100);
+        let blocked = decode(&reply(action));
+        assert_eq!(blocked.answers.len(), 1);
+        assert_eq!(
+            (blocked.answers[0].ttl, blocked.answers[0].data.to_string()),
+            (2, "::".to_owned())
+        );
+        assert_eq!(
+            hit,
+            Some(ThreatHit {
+                name: "x.bad.example.net".into()
+            })
+        );
+        assert_eq!(r.stats().total(), blocked_counts(1, 1));
+        let (action, _) = ask_as(&mut r, Filter::ThreatsOnly, "bad.example.net", 1, 101);
+        assert!(is_blocked_reply(&reply(action)));
+        assert_eq!(r.stats().total(), blocked_counts(2, 2));
+    }
+
+    #[test]
+    fn a_deny_entry_does_not_block_a_client_held_to_threats_only() {
+        let mut b = BlockSetBuilder::new();
+        b.deny("tracker.example.org").unwrap();
+        b.add_list_as(b"||bad.example.net^\n", ListClass::Threat);
+        let mut r = Resolver::new(b.build());
+        let (action, hit) = ask_as(&mut r, Filter::ThreatsOnly, "x.tracker.example.org", 1, 1);
+        assert!(matches!(action, Action::Forward(_)));
+        assert_eq!(hit, None);
+        let (action, _) = ask_as(&mut r, Filter::All, "x.tracker.example.org", 1, 1);
+        assert!(is_blocked_reply(&reply(action)));
+    }
+
+    #[test]
+    fn a_client_held_to_threats_only_keeps_the_canary_and_the_local_answers() {
+        let mut b = BlockSetBuilder::new();
+        b.deny(DOH_CANARY).unwrap();
+        let mut r = Resolver::new(b.build());
+        let (action, hit) = ask_as(&mut r, Filter::ThreatsOnly, DOH_CANARY, 1, 1);
+        let b = reply(action);
+        assert_eq!((b[3] & 0x0f, decode(&b).answers.len(), hit), (3, 0, None));
+        let (action, _) = ask_as(&mut r, Filter::ThreatsOnly, "localhost", 1, 1);
+        assert_eq!(
+            decode(&reply(action)).answers[0].data.to_string(),
+            "127.0.0.1"
+        );
+        assert_eq!(r.stats().total().blocked, 0);
+        assert_eq!(r.stats().recent(1).next().unwrap().outcome, Outcome::Local);
+        // With the canary off it is an ordinary name, and only an ads block, which is skipped.
+        r.set_doh_canary(false);
+        let (action, _) = ask_as(&mut r, Filter::ThreatsOnly, DOH_CANARY, 1, 2);
+        assert!(matches!(action, Action::Forward(_)));
+    }
+
+    #[test]
+    fn a_pause_forwards_a_threat_for_a_client_held_to_threats_only_as_for_any_other() {
+        let mut r = threat_resolver();
+        r.pause_until(1300);
+        let (action, hit) = ask_as(&mut r, Filter::ThreatsOnly, "x.bad.example.net", 1, 1299);
+        assert!(matches!(action, Action::Forward(_)));
+        assert_eq!(hit, None);
+        let (_, hit) = ask_as(&mut r, Filter::ThreatsOnly, "x.bad.example.net", 1, 1300);
+        assert!(hit.is_some());
+    }
+
+    // The block check comes before the cache for every client that is held to every list, so an
+    // answer that a client held to threats only had stored is never served to one of them.
+    #[test]
+    fn an_ads_answer_cached_for_a_client_held_to_threats_only_never_reaches_any_other() {
+        let mut r = resolver();
+        let (action, _) = ask_as(&mut r, Filter::ThreatsOnly, "ads.example.com", 1, 1000);
+        let Action::Forward(p) = action else {
+            panic!("not forwarded: {action:?}")
+        };
+        let answer = answer_for(&p, 1).to_vec().unwrap();
+        relayed(r.handle_upstream(&p, &answer, Transport::Udp, at(1000)));
+        assert_eq!(r.cache_len(), 1);
+
+        // The same client asks again: the answer it stored, as a cache hit.
+        let (action, _) = ask_as(&mut r, Filter::ThreatsOnly, "ads.example.com", 1, 1001);
+        assert_eq!(decode(&reply(action)).answers.len(), 2);
+        // A client held to every list asks next: blocked, whatever the cache holds.
+        assert!(is_blocked_reply(&reply(ask(
+            &mut r,
+            "ads.example.com",
+            1,
+            1002
+        ))));
+        let (action, _) = ask_as(&mut r, Filter::All, "ads.example.com", 1, 1003);
+        assert!(is_blocked_reply(&reply(action)));
+        // The blocks did not touch the stored answer: the first client still gets it.
+        let (action, _) = ask_as(&mut r, Filter::ThreatsOnly, "ads.example.com", 1, 1004);
+        assert_eq!(decode(&reply(action)).answers.len(), 2);
+        assert_eq!(
+            r.stats().total(),
+            Counts {
+                queries: 5,
+                blocked: 2,
+                blocked_threat: 0,
+                cache_hits: 2,
+                forwarded: 1
+            }
+        );
     }
 
     #[test]

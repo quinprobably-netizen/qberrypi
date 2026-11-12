@@ -5,6 +5,18 @@ timezone = "UTC0"          # a POSIX TZ rule; yours is the last line of your zon
 ssid = "example-network"
 passphrase = "example-passphrase"   # or: pmk = "<64 hex digits>"
 country = "US"
+# Optional: where the access point is. The first scan after a start (and after a link that held) then
+# covers only these channels, as a directed probe for the network's name: a much shorter scan than one
+# of every channel. The hint is meant for the 5 GHz channel, which the Pi prefers to 2.4 GHz: a hinted
+# scan whose best access point is on 2.4 GHz is not taken, and the scan covers every channel after all,
+# so a hint of 2.4 GHz channels alone only costs a short scan. Channel centre frequencies in MHz of the
+# 2.4 or the 5 GHz band, at most 4, none repeated; put the 5 GHz one first if there are two. Every check
+# of the join is unchanged: when the hinted channels hold no usable access point on 5 GHz, or the join
+# on one fails, the scan covers every channel as it does with no hint. `cargo xtask update` writes the
+# frequency the Pi is on into the copy it uploads when that is a 5 GHz one, `cargo xtask image` takes
+# --wifi-hint MHZ (and refuses a list of 2.4 GHz channels alone); the Pi's /api/v1/stats shows the
+# channel it is on as wifi.freq_mhz.
+# hint_mhz = [5180]
 
 [net]
 address = "192.0.2.53/24"
@@ -45,6 +57,14 @@ log_to_sd = false         # append the log to qberrypi/log.txt
 return_after_secs = 0     # restart after this long; 0 means never
 calibrate_touch = false   # show four crosses to tap and log the touch calibration
 fault = "none"            # development only: provoke a failure to watch the recovery
+# Development switches for the trial boot of a network update (a card with two slots). Both do
+# nothing on a boot that is not on trial, and a build that is to stay refuses all of them, as it
+# refuses the switches above: `cargo xtask deploy --permanent`, `image` and `update`.
+trial_confirm_secs = 0    # development only: seconds after start that a trial may confirm; 0 is 120
+trial_offline = false     # development only: a trial confirms with no Wi-Fi, clock or upstream
+# fault = "trial_panic" and "trial_stall" provoke a failure only on a trial boot, to watch the
+# rollback to the slot it came from: the first panics 3 s after the supervisor starts, the second
+# stalls the supervisor as "stall" does.
 
 # The touch screen's calibration, here at its defaults. A boot with
 # calibrate_touch = true prints these lines for your own screen.
@@ -55,7 +75,7 @@ fault = "none"            # development only: provoke a failure to watch the rec
 # touch_bottom = 3900
 # touch_swap_xy = false
 
-# What the watchdog is told to leave alone. Both keys are optional, and a file without this
+# What the watchdog is told to leave alone. Every key is optional, and a file without this
 # section behaves as the values below say.
 #   rebind_allow  names that may answer a private address (10/8, 172.16/12, 192.168/16, fc00::/7,
 #                 loopback, link-local) without being blocked: a media server's names, say. Any
@@ -63,14 +83,33 @@ fault = "none"            # development only: provoke a failure to watch the rec
 #                 for itself and everything below it. [] allows none; plex.direct is Plex's.
 #   quiet         names that the behaviour alerts (random names, tunnelling, beaconing, bursts)
 #                 do not count a question for, because they are noisy on purpose.
+#   exempt        devices, by Ethernet address (: or -, any case), that are not ad-blocked: the
+#                 ads lists and dns.deny do not apply to them, the threat lists and every alert
+#                 still do. At most 64. A device is known by the address it last claimed by ARP or
+#                 DHCP, so one that has not been heard since the start is blocked until it is.
+#                 The desktop client can push a list of its own beside this one. Unset is none.
+#                 It applies to IPv4 clients only, and a phone set to rotate its private Wi-Fi
+#                 address drops off the list each time it takes a new one.
+#   exempt_default  true turns it around: every device is not ad-blocked (threats still are)
+#                 but those on block, the router and the Pi itself, and that includes devices
+#                 never seen before and IPv6 clients. exempt has no effect while it is on, and
+#                 block none while it is off. The desktop client can push the mode and a block
+#                 list of its own, and the pushed mode wins until the Pi restarts. Unset is false.
+#   block         devices, by Ethernet address, that stay fully blocked when exempt_default is
+#                 on. At most 64. A device is known by the address it last claimed, so one that
+#                 has not been heard since the start is not ad-blocked until it is.
 # [watch]
 # rebind_allow = ["plex.direct"]
 # quiet = []
+# exempt = ["02:00:00:00:00:01"]
+# exempt_default = false
+# block = ["02:00:00:00:00:02"]
 
 # The Pi-hole API that qnet and other Pi-hole clients use, served over TLS on port 443. Without
 # this section there is none. password_hash is made from the password that opens it: pipe the
 # password into `cargo xtask hash-password` (so that it is never shown) and paste the line it
 # prints. The line below is for the password "example" and a salt of zeros, so make your own.
-# Run `cargo xtask make-cert` once before deploying with [api] set.
+# Run `cargo xtask make-cert` once before deploying with [api] set. A card made with
+# `cargo xtask image` needs this section: it is how `cargo xtask update` reaches the Pi.
 # [api]
 # password_hash = "$pbkdf2-sha256$i=100000$00000000000000000000000000000000$fc75aed9ead867673337593df6b35ff94cdddeece7b4ef4a446497942ac0fbf9"

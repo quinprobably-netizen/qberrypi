@@ -9,7 +9,9 @@
 //! - a request that frames its body any other way (`Transfer-Encoding`) is refused.
 //!
 //! [`read_request`] takes from the reader exactly one request, head and body, and not a byte
-//! more, so a connection kept alive carries the next request unharmed. A request is answered by
+//! more, so a connection kept alive carries the next request unharmed. It is [`read_request_head`]
+//! and [`read_request_body`] one after the other, which the connection calls apart: the one route
+//! whose body is streamed (the update's) is told from its head, and its body is never read here. A request is answered by
 //! [`write_reply`]. Nothing here panics on what it reads, and nothing logs. A [`Request`] holds
 //! secrets (the session id, the body of a login), so its `Debug` output hides both.
 
@@ -101,7 +103,52 @@ pub enum ReadError {
 /// or the body is `Malformed("cut short")`. Any `Transfer-Encoding` is `Malformed("no chunked
 /// requests")`. A `Content-Length` is one or more digits; several are fine if they are equal.
 /// An interrupted read is retried, and any other failure is [`ReadError::Io`].
+///
+/// This is [`read_request_head`] and [`read_request_body`] one after the other, which a caller
+/// that must decide what to do with the body from the head alone calls separately.
 pub fn read_request(r: &mut impl BufRead) -> Result<Request, ReadError> {
+    let head = read_request_head(r)?;
+    read_request_body(r, head)
+}
+
+/// A request's head, parsed: everything of the request but its body, which has not been read.
+#[derive(PartialEq)]
+pub struct Head {
+    /// The method, as sent: `GET`, `POST` and so on.
+    pub method: String,
+    /// The request target, as sent, a query string included.
+    pub target: String,
+    /// The value of the `X-FTL-SID` header, as [`Request::sid`] has it.
+    pub sid: Option<String>,
+    /// The body's length as `Content-Length` says, 0 when there is none; not checked against any
+    /// cap (a length too large for a `u64` is `u64::MAX`), which is for the caller to do.
+    pub length: u64,
+    /// Whether the connection ends after the reply, as [`Request::close`] has it.
+    pub close: bool,
+}
+
+impl fmt::Debug for Head {
+    /// Shows the method, the target's path, the length and `close`; never the query of the
+    /// target or the session id.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Head")
+            .field("method", &self.method)
+            .field("target", &path_only(&self.target))
+            .field("sid", &self.sid.as_ref().map(|_| Redacted))
+            .field("length", &self.length)
+            .field("close", &self.close)
+            .finish()
+    }
+}
+
+/// Reads the head of one request from `r`, through its closing empty line, and not a byte of
+/// the body.
+///
+/// The same bounds and the same errors as [`read_request`]'s head: at most [`MAX_HEAD`] bytes and
+/// [`MAX_HEADERS`] headers, `Closed` for a stream that ends before any byte, `Malformed` for what
+/// is not a head or frames its body with `Transfer-Encoding` or a bad or conflicting
+/// `Content-Length`. A length over [`MAX_BODY`] is not an error here.
+pub fn read_request_head(r: &mut impl BufRead) -> Result<Head, ReadError> {
     let head = read_head(r)?;
     let mut headers = [httparse::EMPTY_HEADER; MAX_HEADERS];
     let mut parsed = httparse::Request::new(&mut headers);
@@ -116,15 +163,31 @@ pub fn read_request(r: &mut impl BufRead) -> Result<Request, ReadError> {
         return Err(ReadError::Malformed("incomplete head"));
     };
     let headers = &*parsed.headers;
-    let length = body_length(headers)?;
-    let request = Request {
+    Ok(Head {
         method: method.to_owned(),
         target: target.to_owned(),
         sid: session_id(headers),
-        body: read_body(r, length)?,
+        length: body_length(headers)?,
         close: wants_close(parsed.version, headers),
-    };
-    Ok(request)
+    })
+}
+
+/// Reads the body that `head` announces from `r` and makes the request.
+///
+/// A length over [`MAX_BODY`] is [`ReadError::TooLarge`] and nothing is read; a stream that ends
+/// inside the body is `Malformed("cut short")`; any other failure is [`ReadError::Io`].
+pub fn read_request_body(r: &mut impl BufRead, head: Head) -> Result<Request, ReadError> {
+    let length = usize::try_from(head.length)
+        .ok()
+        .filter(|&length| length <= MAX_BODY)
+        .ok_or(ReadError::TooLarge)?;
+    Ok(Request {
+        method: head.method,
+        target: head.target,
+        sid: head.sid,
+        body: read_body(r, length)?,
+        close: head.close,
+    })
 }
 
 /// Takes the head from `r`: the bytes up to and including the first `\r\n\r\n`, and not one
@@ -205,9 +268,10 @@ fn named<'h, 'b>(
 /// The length of the body, from `Content-Length`: 0 when there is none.
 ///
 /// Any `Transfer-Encoding` is refused first. Each `Content-Length` must be digits and nothing
-/// else, and all must have the same value (`02` and `2` do). A length over [`MAX_BODY`] is
-/// [`ReadError::TooLarge`], however many digits it takes.
-fn body_length(headers: &[httparse::Header<'_>]) -> Result<usize, ReadError> {
+/// else, and all must have the same value (`02` and `2` do). The length is not capped here: one
+/// too large for a `u64` is `u64::MAX`, however many digits it takes, and [`read_request_body`]
+/// holds it to [`MAX_BODY`].
+fn body_length(headers: &[httparse::Header<'_>]) -> Result<u64, ReadError> {
     if named(headers, "transfer-encoding").next().is_some() {
         return Err(ReadError::Malformed("no chunked requests"));
     }
@@ -228,14 +292,10 @@ fn body_length(headers: &[httparse::Header<'_>]) -> Result<usize, ReadError> {
         }
         seen = Some(significant);
     }
-    let length = seen.unwrap_or_default().iter().fold(0usize, |sum, &digit| {
+    Ok(seen.unwrap_or_default().iter().fold(0u64, |sum, &digit| {
         sum.saturating_mul(10)
-            .saturating_add(usize::from(digit.saturating_sub(b'0')))
-    });
-    if length > MAX_BODY {
-        return Err(ReadError::TooLarge);
-    }
-    Ok(length)
+            .saturating_add(u64::from(digit.saturating_sub(b'0')))
+    }))
 }
 
 /// Takes exactly `length` bytes from `r`.
@@ -317,7 +377,9 @@ fn reason(status: u16) -> &'static str {
         401 => "Unauthorized",
         404 => "Not Found",
         405 => "Method Not Allowed",
+        409 => "Conflict",
         413 => "Content Too Large",
+        422 => "Unprocessable Content",
         429 => "Too Many Requests",
         500 => "Internal Server Error",
         _ => "Unknown",
@@ -728,6 +790,62 @@ mod tests {
     }
 
     #[test]
+    fn the_head_alone_is_read_with_its_length_and_no_byte_of_the_body_is_taken() {
+        let text = "POST /api/qbp/update HTTP/1.1\r\nX-FTL-SID: 0123abcd\r\nContent-Length: 2147483648\r\nConnection: close\r\n\r\nabc";
+        let mut r = Cursor::new(text);
+        let head = read_request_head(&mut r).unwrap();
+        assert_eq!(
+            (head.method.as_str(), head.target.as_str(), head.length),
+            ("POST", "/api/qbp/update", 2_147_483_648)
+        );
+        assert_eq!(head.sid.as_deref(), Some("0123abcd"));
+        assert!(head.close);
+        // Not a byte of the body was consumed, and a length over the cap is no error yet.
+        assert_eq!(text.len() - r.position() as usize, 3);
+        // Taken as a whole request it is too large, as it was.
+        assert_eq!(read_request_body(&mut r, head), Err(ReadError::TooLarge));
+    }
+
+    #[test]
+    fn a_head_with_no_length_has_length_zero_and_a_huge_one_saturates() {
+        let none = read_request_head(&mut Cursor::new("GET / HTTP/1.1\r\n\r\n")).unwrap();
+        assert_eq!(none.length, 0);
+        let huge = "POST / HTTP/1.1\r\nContent-Length: 99999999999999999999999999\r\n\r\n";
+        assert_eq!(
+            read_request_head(&mut Cursor::new(huge)).unwrap().length,
+            u64::MAX
+        );
+        // The head's own refusals are the request's.
+        for bad in [
+            "POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n",
+            "POST / HTTP/1.1\r\nContent-Length: 2\r\nContent-Length: 3\r\n\r\n",
+        ] {
+            assert!(matches!(
+                read_request_head(&mut Cursor::new(bad)),
+                Err(ReadError::Malformed(_))
+            ));
+        }
+        assert_eq!(
+            read_request_head(&mut Cursor::new("")),
+            Err(ReadError::Closed)
+        );
+    }
+
+    #[test]
+    fn a_head_shows_neither_its_session_nor_its_query_in_debug() {
+        let head = read_request_head(&mut Cursor::new(
+            "POST /a?sid=topsecret HTTP/1.1\r\nX-FTL-SID: hunter2\r\n\r\n",
+        ))
+        .unwrap();
+        let shown = format!("{head:?}");
+        assert!(shown.contains("/a?<redacted>"), "{shown}");
+        assert!(
+            !shown.contains("topsecret") && !shown.contains("hunter2"),
+            "{shown}"
+        );
+    }
+
+    #[test]
     fn a_body_that_ends_early_is_cut_short() {
         let req = "POST / HTTP/1.1\r\nContent-Length: 10\r\n\r\nabc";
         assert_eq!(read_str(req), Err(ReadError::Malformed("cut short")));
@@ -986,7 +1104,9 @@ mod tests {
             (401, "Unauthorized"),
             (404, "Not Found"),
             (405, "Method Not Allowed"),
+            (409, "Conflict"),
             (413, "Content Too Large"),
+            (422, "Unprocessable Content"),
             (429, "Too Many Requests"),
             (500, "Internal Server Error"),
             (418, "Unknown"),

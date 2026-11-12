@@ -5,7 +5,8 @@
 //! blocks. (The Wi-Fi component's netlink sockets each have one more thread beside these, which
 //! does nothing but send what the socket hands it: see `netlink::socket`.) [`prepare`] gives the DNS service, the zone's offset, the clock, the status server,
 //! the list refresh, the watchdog's analysis and device watch and, when the configuration has an
-//! `[api]` section, the Pi-hole API on port 443 as components for the supervisor to run. What they
+//! `[api]` section, the Pi-hole API on port 443 as components for the supervisor to run, and, on a boot
+//! that is on trial of an update, the trial ([`crate::update::trial`]). What they
 //! share (the resolver with its cache and counts, the lists, the clock's channel, the panel's slot,
 //! the watchdog's alerts and device inventory) is made once, by
 //! whichever of them starts first, so the supervisor starts the other components beside the
@@ -51,6 +52,9 @@ use crate::status::{self, Status};
 use crate::supervisor::{Component, Ended};
 use crate::sys;
 use crate::thermal::{self, BOARD_TEMP};
+use crate::update::UpdateCtl;
+use crate::update::receive;
+use crate::update::trial::{self, BoardHealth};
 use crate::watch::behaviour::Behaviour;
 use crate::watch::devices::Devices;
 use crate::watch::rebind::RebindPolicy;
@@ -97,6 +101,10 @@ pub struct Context {
     /// The API's TLS key and certificate as the card holds them (`init::tls_pem`): `None` if there
     /// is no such file. It holds a secret, which no line of the log or error shows.
     pub tls_pem: Option<&'static [u8]>,
+    /// The slot this boot runs, how an update stands and the card's use for it: init makes it in
+    /// its first step and the boot rules fill it. The statistics read it; the update receiver
+    /// and the trial are made from it.
+    pub update: Arc<UpdateCtl>,
 }
 
 /// The one runtime: the current thread, with I/O and time, and a blocking pool of
@@ -261,7 +269,11 @@ impl Lazy {
                 .with_watch(Arc::new(QbpWatch {
                     alerts: shared.alerts.clone(),
                     devices: shared.devices.clone(),
-                }));
+                }))
+                .with_update(receive::Receiver::new(
+                    self.ctx.update.clone(),
+                    crate::BUILD_EPOCH,
+                ));
                 Ok(ApiParts {
                     api: Arc::new(api),
                     tls,
@@ -282,6 +294,7 @@ impl Lazy {
             wifi,
             signal,
             tls_pem: _,
+            update,
         } = &self.ctx;
 
         // The set that blocks at the start is the snapshot's rules and the configuration's own
@@ -324,6 +337,7 @@ impl Lazy {
             started: *started,
             link: link_reader(wifi.clone(), signal.clone()),
             board_c: Arc::new(|| thermal::read_c(Path::new(BOARD_TEMP))),
+            update: update.clone(),
         };
         let client = Arc::new(Client::new(client_config(mozilla_roots()), dns.clone()));
         Shared {
@@ -393,6 +407,10 @@ async fn start_tls_when_synced(dns: Arc<Dns>, mut synced: watch::Receiver<bool>)
 /// The store and the inventory read time from the resolver's clock: (monotonic seconds, unix
 /// seconds). The resolver holds the store, and the store's clock holds the resolver: a cycle that
 /// lives as long as the board does.
+///
+/// The inventory is given the configuration's exempt list, its block list and its mode, and the
+/// Pi's own address, which with the gateway's is never exempt and always fully blocked, and keeps
+/// the resolver's exemption ([`Dns::exempt`]) in step with the lists and with what it hears.
 fn make_watch(cfg: &Config, dns: &Arc<Dns>) -> WatchState {
     let clock: Arc<dyn Fn() -> (u64, u64) + Send + Sync> = {
         let dns = dns.clone();
@@ -409,7 +427,12 @@ fn make_watch(cfg: &Config, dns: &Arc<Dns>) -> WatchState {
         sink: alerts.clone(),
     });
     let behaviour = Behaviour::new(cfg.watch.quiet.clone());
-    let devices = Devices::new(None, cfg.net.gateway, clock);
+    let mut devices = Devices::new(None, cfg.net.gateway, clock)
+        .with_exemption(dns.exempt().clone())
+        .with_own_ip(cfg.net.address.addr);
+    devices.set_exempt_config(cfg.watch.exempt.clone());
+    devices.set_block_config(cfg.watch.block.clone());
+    devices.set_exempt_default_config(cfg.watch.exempt_default);
     WatchState {
         alerts,
         devices: Arc::new(Mutex::new(devices)),
@@ -441,7 +464,7 @@ type MakeService = fn(&Arc<Lazy>) -> Option<Component>;
 /// Every service that the board starts, in the order that it starts them: the DNS service that
 /// answers the household, the zone's offset from UTC, the clock, the status server that tells
 /// both, and the refresh that waits for the clock; then the watchdog's analysis and device watch
-/// and, with an `[api]` section, the API.
+/// and, with an `[api]` section, the API; last, on a boot that is on trial of an update, the trial.
 ///
 /// **This table is where a service is added**: write its `fn <name>_component(lazy: &Arc<Lazy>) ->
 /// Option<Component>` and put it here, in the place in the order where it starts. A function gives
@@ -456,6 +479,7 @@ const SERVICES: &[MakeService] = &[
     analysis_component,
     devices_component,
     api_component,
+    trial_component,
 ];
 
 /// Gives the services as components, those of [`SERVICES`], in the order that the board starts
@@ -581,6 +605,32 @@ fn devices_component(lazy: &Arc<Lazy>) -> Option<Component> {
                 wiring::INTERFACE,
             )
             .await
+        }
+    }))
+}
+
+/// The trial of an update, which is essential, on a boot that is on trial: confirms the build when
+/// the Wi-Fi, the clock and an upstream have proved it healthy, or gives up and restarts to the slot
+/// it came from (see [`trial`]). `None` on any other boot, and then nothing is logged about it.
+///
+/// It is a service because what it looks at is the shared state's: each start waits for that, which
+/// the first service made, and takes the clock's flag and the resolver from it. The trial's time
+/// counts from when init started, so the wait costs it nothing it would not have lost anyway.
+fn trial_component(lazy: &Arc<Lazy>) -> Option<Component> {
+    let settings = trial::Settings::from_debug(&lazy.ctx.cfg.debug);
+    let ctl = lazy.ctx.update.clone();
+    ctl.trial()?;
+    let lazy = lazy.clone();
+    Some(Component::task("trial", true, move || {
+        let (lazy, ctl) = (lazy.clone(), ctl.clone());
+        async move {
+            let shared = lazy.get().await;
+            let health = BoardHealth::new(
+                lazy.ctx.wifi.clone(),
+                shared.synced.clone(),
+                shared.dns.clone(),
+            );
+            trial::run(ctl, Arc::new(health), settings).await
         }
     }))
 }
@@ -1104,6 +1154,7 @@ mod tests {
             wifi,
             signal: SignalCache::new(),
             tls_pem,
+            update: UpdateCtl::off(),
         };
         (ctx, slot, sender)
     }
@@ -1362,6 +1413,59 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_started_api_takes_updates_through_the_update_state_the_board_made() {
+        use crate::api::testutil::{certificate, https, pinned_client};
+
+        let pem = leaked_pem();
+        let held = UpdateCtl::new(
+            Some(crate::slots::Slot::A),
+            None,
+            Arc::new(crate::update::NoCard),
+        );
+        let guard = held.begin_receive().unwrap();
+        // The old layout has no slots; a slot card whose machinery is taken is busy: the API's
+        // receiver answers from the very state that the context carries.
+        for (update, key) in [
+            (UpdateCtl::off(), "no_slots"),
+            (held.clone(), "update_busy"),
+        ] {
+            let (mut ctx, _slot, _sender) = context_with(&api_section(), Some(pem));
+            ctx.update = update;
+            let lazy = Arc::new(Lazy::new(ctx, "/nonexistent/blocklist.zst".into()));
+            let addr = free_address();
+            let running = tokio::spawn({
+                let lazy = lazy.clone();
+                async move { api_start(&lazy, addr).await }
+            });
+            let waited = Instant::now();
+            while std::net::TcpStream::connect(addr).is_err() {
+                assert!(waited.elapsed() < Duration::from_secs(20), "never bound");
+                sleep(Duration::from_millis(10)).await;
+            }
+            let client = pinned_client(&certificate(std::str::from_utf8(pem).unwrap()));
+            let login = https(
+                addr,
+                client.clone(),
+                &[r#"POST /api/auth|{"password":"right"}"#],
+            )
+            .await;
+            let sid = login[0].1["session"]["sid"].as_str().unwrap().to_owned();
+
+            let answered = https(
+                addr,
+                client,
+                &[&format!("POST /api/qbp/update|sid={sid}|{{}}")],
+            )
+            .await;
+
+            assert_eq!(answered[0].0, 409, "{key}");
+            assert_eq!(answered[0].1["error"]["key"], key);
+            running.abort();
+        }
+        drop(guard);
+    }
+
+    #[tokio::test]
     async fn an_api_whose_port_is_taken_fails_with_the_reason() {
         let (ctx, _slot, _sender) = context_with(&api_section(), Some(leaked_pem()));
         let lazy = Arc::new(Lazy::new(ctx, "/nonexistent/blocklist.zst".into()));
@@ -1602,6 +1706,126 @@ mod tests {
         assert!(Arc::ptr_eq(&a.dns, &again.dns));
     }
 
+    /// A card with two slots that is a directory: it selects slot a and holds the marker of a
+    /// trial of slot b, as init has left it, and is lent to the update machinery as it is.
+    struct TrialCard(tempfile::TempDir);
+
+    impl TrialCard {
+        fn new() -> Arc<Self> {
+            use crate::slots::{Marker, Mode, Slot as BootSlot};
+
+            let dir = tempfile::tempdir().unwrap();
+            for slot in [BootSlot::A, BootSlot::B] {
+                let folder = dir.path().join(slot.dir());
+                fs::create_dir(&folder).unwrap();
+                let config = format!("arm_64bit=1\nos_prefix={}\n", slot.os_prefix());
+                fs::write(folder.join("config.txt"), &config).unwrap();
+                if slot == BootSlot::A {
+                    fs::write(dir.path().join("config.txt"), config).unwrap();
+                }
+            }
+            let marker = Marker {
+                slot: BootSlot::B,
+                from: BootSlot::A,
+                build: 1_794_470_002,
+                mode: Mode::Tryboot,
+                started: true,
+                failed: None,
+            };
+            crate::slots::write_marker(dir.path(), &marker).unwrap();
+            Arc::new(Self(dir))
+        }
+
+        /// The state of an update that is on trial, with this card to lend.
+        fn on_trial(self: &Arc<Self>) -> Arc<UpdateCtl> {
+            let ctl = UpdateCtl::new(
+                Some(crate::slots::Slot::B),
+                None,
+                Arc::new(Lent(self.clone())),
+            );
+            let marker = crate::slots::read_marker(self.0.path())
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            ctl.begin_trial(marker, tokio::time::Instant::now());
+            ctl
+        }
+    }
+
+    /// Lends a [`TrialCard`] as init lends the real one.
+    struct Lent(Arc<TrialCard>);
+
+    impl crate::update::BootCard for Lent {
+        fn with_boot(
+            &self,
+            _: crate::update::CardAccess,
+            work: &mut dyn FnMut(&Path),
+        ) -> io::Result<()> {
+            work(self.0.0.path());
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn the_trial_is_a_service_of_a_boot_that_is_on_trial_and_of_no_other() {
+        let card = TrialCard::new();
+        for (update, expected) in [
+            (card.on_trial(), true),
+            (UpdateCtl::off(), false),
+            // A slot card that runs no trial.
+            (
+                UpdateCtl::new(
+                    Some(crate::slots::Slot::A),
+                    None,
+                    Arc::new(Lent(card.clone())),
+                ),
+                false,
+            ),
+        ] {
+            let (mut ctx, _slot, _sender) = context();
+            ctx.update = update;
+            let components = prepare_from(ctx, "/nonexistent/blocklist.zst".into());
+            let found = components.iter().find(|c| c.name == "trial");
+            assert_eq!(found.is_some(), expected);
+            // It starts after the other services, and a trial that cannot run restarts the board.
+            if let Some(trial) = found {
+                assert!(trial.essential);
+                assert_eq!(components.last().unwrap().name, "trial");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn the_trial_service_confirms_from_the_shared_state_and_the_card() {
+        let card = TrialCard::new();
+        let (mut ctx, _slot, _sender) = context_edited(|cfg| {
+            cfg.debug.trial_offline = true;
+            cfg.debug.trial_confirm_secs = 1;
+        });
+        ctx.update = card.on_trial();
+        let update = ctx.update.clone();
+        let mut components = prepare_from(ctx, "/nonexistent/blocklist.zst".into());
+        let mut trial = components.pop().unwrap();
+        assert_eq!(trial.name, "trial");
+        let task = tokio::spawn((trial.start)());
+
+        // It confirms a second after init started, on the pool, and says so.
+        let waited = Instant::now();
+        while update.view().last.is_none() {
+            assert!(waited.elapsed() < Duration::from_secs(20), "no confirm");
+            sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(update.view().state, "idle");
+        let config = fs::read(card.0.path().join("config.txt")).unwrap();
+        assert_eq!(
+            crate::slots::selected_slot(&config),
+            Ok(crate::slots::Slot::B)
+        );
+        assert_eq!(crate::slots::read_marker(card.0.path()).unwrap(), None);
+        assert!(!task.is_finished());
+        task.abort();
+    }
+
     #[tokio::test]
     async fn the_wifi_and_the_panel_start_while_the_snapshot_is_loading() {
         use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1625,6 +1849,7 @@ mod tests {
         let plan = Plan {
             components: vec![utc_offset, wifi],
             return_after: None,
+            restart: None,
             link: None,
         };
         let hooks = Hooks {
@@ -1885,6 +2110,86 @@ mod tests {
             .dns
             .observe(client, &nxdomain_reply("two.example.org"));
         assert_eq!(shared.dns.watch_events_dropped(), 1);
+    }
+
+    #[tokio::test]
+    async fn the_configurations_exempt_devices_are_exempt_for_the_dns_service_once_heard() {
+        use crate::watch::devices::with_devices;
+        use crate::watch::frames::{Arp, Mac};
+
+        let exempt = Mac([2, 0, 0, 0, 0, 5]);
+        let (ctx, _slot, _sender) = context_edited(|cfg| cfg.watch.exempt = vec![exempt]);
+        let lazy = Lazy::new(ctx, "/nonexistent/blocklist.zst".into());
+        let shared = lazy.get().await;
+        let addr = Ipv4Addr::new(192, 0, 2, 30);
+        // Not heard yet: no address is exempt.
+        assert!(shared.dns.exempt().listed().is_empty());
+        assert_eq!(shared.status.stats()["exempt_clients"], 0);
+        assert_eq!(shared.status.stats()["exempt_default"], false);
+
+        let heard = |mac: Mac| Arp {
+            op: 1,
+            sender_mac: mac,
+            sender_ip: addr,
+            target_ip: Ipv4Addr::new(192, 0, 2, 1),
+        };
+        with_devices(&shared.devices, &*shared.alerts, |devices| {
+            devices.on_arp(&heard(exempt));
+        });
+        assert!(shared.dns.exempt().is_exempt(addr.into()));
+        assert_eq!(shared.status.stats()["exempt_clients"], 1);
+        // Another device takes the address over: it is no longer exempt.
+        with_devices(&shared.devices, &*shared.alerts, |devices| {
+            devices.on_arp(&heard(Mac([2, 0, 0, 0, 0, 6])));
+        });
+        assert!(shared.dns.exempt().listed().is_empty());
+        assert_eq!(shared.status.stats()["exempt_clients"], 0);
+    }
+
+    #[tokio::test]
+    async fn exempt_by_default_in_the_configuration_exempts_all_but_the_block_list_and_the_router()
+    {
+        use crate::watch::devices::with_devices;
+        use crate::watch::frames::{Arp, Mac};
+
+        let blocked = Mac([2, 0, 0, 0, 0, 5]);
+        let (ctx, _slot, _sender) = context_edited(|cfg| {
+            cfg.watch.exempt_default = true;
+            cfg.watch.block = vec![blocked];
+            // The exempt list has no effect in this mode.
+            cfg.watch.exempt = vec![Mac([2, 0, 0, 0, 0, 7])];
+        });
+        let lazy = Lazy::new(ctx, "/nonexistent/blocklist.zst".into());
+        let shared = lazy.get().await;
+        let exempt = shared.dns.exempt();
+        let (gateway, own) = (shared.cfg.net.gateway, shared.cfg.net.address.addr);
+        let addr = Ipv4Addr::new(192, 0, 2, 30);
+        let stats = || shared.status.stats();
+        assert_eq!(stats()["exempt_default"], true);
+        // Nothing heard: every client is exempt but the router and the Pi, and none is counted.
+        assert!(exempt.is_exempt(addr.into()));
+        assert!(!exempt.is_exempt(gateway.into()) && !exempt.is_exempt(own.into()));
+        assert_eq!(stats()["exempt_clients"], 0);
+
+        let heard = |mac: Mac, ip: Ipv4Addr| Arp {
+            op: 1,
+            sender_mac: mac,
+            sender_ip: ip,
+            target_ip: gateway,
+        };
+        // A device that is not on the block list counts; the router that it heard does not.
+        with_devices(&shared.devices, &*shared.alerts, |devices| {
+            devices.on_arp(&heard(Mac([2, 0, 0, 0, 0, 6]), addr));
+            devices.on_arp(&heard(Mac([2, 0, 0, 0, 0, 1]), gateway));
+        });
+        assert!(exempt.is_exempt(addr.into()));
+        assert_eq!(stats()["exempt_clients"], 1);
+        // The blocked device takes the address over: it is fully blocked at once.
+        with_devices(&shared.devices, &*shared.alerts, |devices| {
+            devices.on_arp(&heard(blocked, addr));
+        });
+        assert!(!exempt.is_exempt(addr.into()));
+        assert_eq!(stats()["exempt_clients"], 0);
     }
 
     #[tokio::test]

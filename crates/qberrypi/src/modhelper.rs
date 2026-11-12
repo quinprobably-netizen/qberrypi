@@ -2,6 +2,11 @@
 //!
 //! The kernel runs its module helper as `<path> -q -- <name>`. qberrypi
 //! registers itself as that helper, so this takes the place of `modprobe`.
+//!
+//! Bluetooth is absent from qberrypi by design: the image holds no Bluetooth module and no
+//! Bluetooth firmware, and the helper refuses every request in the name family of Bluetooth
+//! ([`is_bluetooth_request`]) before it looks at the module table, so that nothing could load
+//! one even if a file appeared.
 
 use std::io::{self, Write};
 
@@ -24,6 +29,18 @@ pub fn parse_args(args: &[String]) -> Vec<String> {
         }
     }
     names
+}
+
+/// Whether `name`, a module the kernel asks for, is in the name family of Bluetooth: `bluetooth`, any
+/// `bt*`, any `hci_*`, `bnep`, `rfcomm`, `hidp`, and the aliases the kernel asks for when something
+/// opens a Bluetooth socket: `net-pf-31` (`PF_BLUETOOTH`, with anything after another `-`) and
+/// `bt-proto-*`. A `-` and a `_` are the same, and so are capitals and small letters.
+pub fn is_bluetooth_request(name: &str) -> bool {
+    let name = name.to_ascii_lowercase().replace('_', "-");
+    ["bluetooth", "bnep", "rfcomm", "hidp", "net-pf-31"].contains(&name.as_str())
+        || name.starts_with("bt")
+        || name.starts_with("hci-")
+        || name.starts_with("net-pf-31-")
 }
 
 /// Runs the helper on the module table as it was read, or not, from the initramfs.
@@ -51,6 +68,11 @@ pub fn run_with_table(
 /// `args` is without the program name. Each name gets one line on `kmsg`:
 /// `qberrypi-modhelper: {name}: loaded`, `not in table` or `failed: {error}`.
 /// The status is 0 only if a module was named and every one named loaded.
+///
+/// A name in the family of Bluetooth ([`is_bluetooth_request`]) is refused outright, whatever the
+/// table says: the one line it gets is at the kernel's debug level (`<7>`), reading `refused: Bluetooth
+/// is absent by design`, nothing is looked up or loaded for it, and it fails the status like a module
+/// that is not in the table.
 pub fn run(args: &[String], table_text: &str, insert: Insert, kmsg: &mut dyn Write) -> i32 {
     let names = parse_args(args);
     if names.is_empty() {
@@ -65,6 +87,14 @@ pub fn run(args: &[String], table_text: &str, insert: Insert, kmsg: &mut dyn Wri
     };
     let mut status = 0;
     for name in &names {
+        if is_bluetooth_request(name) {
+            report_debug(
+                kmsg,
+                &format!("{name}: refused, Bluetooth is absent by design"),
+            );
+            status = 1;
+            continue;
+        }
         // Asked of the table first: a module file that is missing is also
         // "not found", and that is a failed load, not an unknown module.
         let outcome = if table.load_order(name).is_none() {
@@ -83,6 +113,12 @@ pub fn run(args: &[String], table_text: &str, insert: Insert, kmsg: &mut dyn Wri
         }
     }
     status
+}
+
+/// Writes one line to the kernel log at its debug level, which the console's `loglevel` keeps off the
+/// screen.
+fn report_debug(kmsg: &mut dyn Write, message: &str) {
+    let _ = kmsg.write_all(format!("<7>qberrypi-modhelper: {message}\n").as_bytes());
 }
 
 /// Writes one line to the kernel log.
@@ -198,6 +234,107 @@ mod tests {
         let status = run_with_table(Ok(String::new()), &requested, &mut |_, _| Ok(()), &mut out);
         assert_eq!(status, 1);
         assert_eq!(out.0, ["qberrypi-modhelper: rfkill: not in table\n"]);
+    }
+
+    #[test]
+    fn the_names_of_the_family_of_bluetooth_are_told_from_the_others() {
+        for name in [
+            "bluetooth",
+            "Bluetooth",
+            "btbcm",
+            "btusb",
+            "btsdio",
+            "btintel",
+            "btrtl",
+            "bt878",
+            "hci_uart",
+            "hci-uart",
+            "hci_vhci",
+            "bnep",
+            "rfcomm",
+            "hidp",
+            "net-pf-31",
+            "net_pf_31",
+            "net-pf-31-proto-2",
+            "net-pf-31-proto-2-type-1",
+            "bt-proto-2",
+            "bt_proto_0",
+        ] {
+            assert!(is_bluetooth_request(name), "{name}");
+        }
+        for name in [
+            "rfkill",
+            "cfg80211",
+            "brcmfmac",
+            "brcmfmac-cyw",
+            "net-pf-10",
+            "net-pf-3",
+            "net-pf-310",
+            "net-pf-1",
+            "fbtft",
+            "spi-bcm2835",
+            "hid",
+            "hidraw",
+            "rfcomm2",
+            "ads7846",
+            "",
+        ] {
+            assert!(!is_bluetooth_request(name), "{name:?}");
+        }
+    }
+
+    #[test]
+    fn a_bluetooth_request_is_refused_with_one_debug_line_and_nothing_is_looked_up_or_loaded() {
+        // Even a table that lists the module, and a loader that would load anything.
+        let table = "bluetooth\tbluetooth.ko\t\nbtusb\tbtusb.ko\tbluetooth\n";
+        let mut insert = |_: &Path, _: &str| panic!("a Bluetooth module is never loaded");
+        let mut out = Records::default();
+        let requested = args(&["-q", "--", "btusb", "net-pf-31", "hci_uart"]);
+        assert_eq!(run(&requested, table, &mut insert, &mut out), 1);
+        assert_eq!(
+            out.0,
+            [
+                "<7>qberrypi-modhelper: btusb: refused, Bluetooth is absent by design\n",
+                "<7>qberrypi-modhelper: net-pf-31: refused, Bluetooth is absent by design\n",
+                "<7>qberrypi-modhelper: hci_uart: refused, Bluetooth is absent by design\n",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_bluetooth_request_among_others_changes_nothing_for_the_others() {
+        let mut calls: Vec<PathBuf> = vec![];
+        let mut insert = |p: &Path, _: &str| {
+            calls.push(p.to_owned());
+            Ok(())
+        };
+        let mut out = Records::default();
+        let requested = args(&["--", "rfkill", "bnep", "brcmutil"]);
+        // The status fails, as for a module that is not in the table; the others load.
+        assert_eq!(run(&requested, TABLE, &mut insert, &mut out), 1);
+        assert_eq!(
+            out.0,
+            [
+                "qberrypi-modhelper: rfkill: loaded\n",
+                "<7>qberrypi-modhelper: bnep: refused, Bluetooth is absent by design\n",
+                "qberrypi-modhelper: brcmutil: loaded\n",
+            ]
+        );
+        assert_eq!(
+            calls,
+            [
+                Path::new("/lib/modules/rfkill.ko"),
+                Path::new("/lib/modules/brcmutil.ko"),
+            ]
+        );
+    }
+
+    #[test]
+    fn the_default_table_names_no_module_the_helper_refuses() {
+        let table = ModuleTable::parse(TABLE).unwrap();
+        for entry in table.entries() {
+            assert!(!is_bluetooth_request(&entry.name), "{}", entry.name);
+        }
     }
 
     #[test]

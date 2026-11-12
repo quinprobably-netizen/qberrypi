@@ -8,6 +8,16 @@
 //! starting qberrypi over and over. It saves the log to the card then too, and
 //! also on a permanent system that keeps its log there.
 //!
+//! On a card with two slots (`qberrypi.slot=a|b` on the kernel command line, which step 1 reads
+//! once; see [`crate::slots`]) init reads its configuration, key and log from its own slot's
+//! folder, never restores Raspberry Pi OS (not in step 4, not in `fatal`), and applies the boot
+//! rules in step 3, before the configuration is parsed and before the watchdog is armed: with no
+//! trial marker on the card the boot writes nothing; with one it appends `started`, deletes
+//! the marker after a rollback, or restarts at once, as the rules say. A restart that a component
+//! asks for through [`crate::update::UpdateCtl`] ends the supervisor, and init restarts the board
+//! as the request says (`0 tryboot` for an update staged for the firmware's trial). A boot with no
+//! `qberrypi.slot=` argument is the old layout and does none of this.
+//!
 //! A boot that keeps its log on the card saves it more than once: with the
 //! first write to the card, before the watchdog runs or a driver is loaded,
 //! again once the kernel's log has been copied, every 30 seconds while there is
@@ -21,11 +31,13 @@
 //! supervisor runs on it. Whatever the board does there waits on a timer or a
 //! socket, so the tick that pets the watchdog is never held for long. The
 //! components are the services (DNS, the zone's offset, the clock, status,
-//! lists and, with an `[api]` section, the Pi-hole API on port 443:
+//! lists and, with an `[api]` section, the Pi-hole API on port 443 and, on a boot that is on
+//! trial of an update, the trial that confirms it or gives up:
 //! `services::prepare` gives them, and the first of them to start makes
 //! the state they share), the Wi-Fi with what follows a join, the front panel,
 //! which blocks a thread of the pool for good, and, only when `debug.fault`
-//! asks for one, a provoked failure; the supervisor starts them in that order,
+//! asks for one, a provoked failure (`trial_panic` and `trial_stall` count only on a trial boot,
+//! `fault::effective`); the supervisor starts them in that order,
 //! starts a failed one again, and ends when the board has to restart. What else
 //! must block runs on the pool of five threads, the log's saves to the card
 //! among it, and a thread of it may fail as the main one may. The card is used
@@ -37,7 +49,7 @@ use std::cell::Cell;
 use std::convert::Infallible;
 use std::fs::File;
 use std::future::Future;
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::mem;
 use std::net::{Ipv6Addr, UdpSocket};
 use std::path::Path;
@@ -50,7 +62,7 @@ use std::time::{Duration, Instant};
 use log::Level;
 use tokio::sync::watch;
 
-use crate::bootpart::{self, BOOT_DEV, MOUNT_POINT, Restore};
+use crate::bootpart::{self, ACTIVE_CONFIG, BOOT_DEV, MOUNT_POINT, OWN_DIR, Restore};
 use crate::config::{self, Config, Fault};
 use crate::cpu;
 use crate::fault;
@@ -63,8 +75,10 @@ use crate::netlink::Route;
 use crate::netlink::nl80211::Nl80211;
 use crate::panel::{self, Deps, PanelEnd};
 use crate::services::{self, Context};
+use crate::slots::{self, BootAction, Marker, Select, Slot as BootSlot};
 use crate::supervisor::{self, Component, Ended, Hooks, Plan, Reason};
 use crate::sys::{self, Watchdog};
+use crate::update::{self, BootCard, CardAccess, Cause, Outcome, Restart, UpdateCtl};
 use crate::wifi::kernel::KernelRadio;
 use crate::wifi::{self, WifiStatus};
 use crate::wiring::{SignalCache, Slot};
@@ -198,9 +212,70 @@ pub fn banner() -> String {
 /// Whether a fatal error puts Raspberry Pi OS's `config.txt` back before the restart.
 ///
 /// True in one-shot mode, and when the configuration never got read: a bad
-/// file must not strand the Pi in qberrypi.
+/// file must not strand the Pi in qberrypi. Never on a slot card, where Raspberry Pi OS is not
+/// and nothing is restored (`Layout::restores_pios`).
 pub fn restore_on_fatal(cfg: Option<&Config>) -> bool {
-    cfg.is_none_or(|cfg| cfg.debug.one_shot)
+    restore_on_fatal_in(layout(), cfg)
+}
+
+/// [`restore_on_fatal`] on the card laid out as `layout`.
+fn restore_on_fatal_in(layout: Layout, cfg: Option<&Config>) -> bool {
+    layout.restores_pios() && cfg.is_none_or(|cfg| cfg.debug.one_shot)
+}
+
+/// How the card is laid out, as the kernel command line says.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Layout {
+    /// No `qberrypi.slot=` argument: qberrypi's folder `qberrypi/` lies beside Raspberry Pi OS,
+    /// and everything works as it did before slots.
+    Old,
+    /// A card with two slots, and this is the one that runs.
+    Slot(BootSlot),
+    /// The `qberrypi.slot=` argument is there and is not usable, so the layout is not known. Only
+    /// the fatal error that this is ends up in: it restores nothing and writes nothing.
+    Unusable,
+}
+
+impl Layout {
+    /// The folder on the boot partition that holds this boot's configuration, key and log.
+    fn dir(self) -> &'static str {
+        match self {
+            Layout::Slot(slot) => slot.dir(),
+            Layout::Old | Layout::Unusable => OWN_DIR,
+        }
+    }
+
+    /// Whether a restart may put Raspberry Pi OS's `config.txt` back: only on the old layout,
+    /// which has Raspberry Pi OS and its saved configuration on the card.
+    fn restores_pios(self) -> bool {
+        self == Layout::Old
+    }
+
+    /// The slot that runs, if the card has slots.
+    fn slot(self) -> Option<BootSlot> {
+        match self {
+            Layout::Slot(slot) => Some(slot),
+            Layout::Old | Layout::Unusable => None,
+        }
+    }
+}
+
+/// The layout, from step 1 on. Until it is set, and in every test, the card is the old layout.
+static LAYOUT: OnceLock<Layout> = OnceLock::new();
+
+/// The layout of this boot (see `LAYOUT`).
+fn layout() -> Layout {
+    LAYOUT.get().copied().unwrap_or(Layout::Old)
+}
+
+/// The layout that a kernel command line names: no `qberrypi.slot=` argument is the old layout,
+/// one `a` or `b` is that slot. Anything else (the argument twice, or with another value) is an
+/// error whose text names the problem and quotes nothing of the line.
+fn layout_of(cmdline: &str) -> Result<Layout, String> {
+    Ok(match BootSlot::from_cmdline(cmdline)? {
+        Some(slot) => Layout::Slot(slot),
+        None => Layout::Old,
+    })
 }
 
 /// Boots the system and keeps it running. Only PID 1 may call this.
@@ -210,8 +285,10 @@ pub fn run() -> ! {
     install_panic_hook();
     let log = start_logging(kernel_uptime); // 1
     raise_open_files(); // 1, once the log exists
+    let layout = read_layout(); // 1, once /proc is mounted
+    let update = make_update(layout); // 1
     keep_clock_after_build(); // 2
-    let cfg = read_config(); // 3
+    let cfg = read_config(layout, &update, started); // 3
     restore_and_save_log(cfg, &mut SdCard, log); // 4
     open_watchdog(); // 5
     load_wifi_driver(cfg); // 6
@@ -221,7 +298,7 @@ pub fn run() -> ! {
     let (kernel_log, wlan_present) = report_wifi(); // 8
     save_log_if_asked(cfg, &mut SdCard, log); // 9
     let runtime = start_runtime(cfg); // 10
-    runtime.block_on(serve(cfg, log, started, kernel_log, wlan_present))
+    runtime.block_on(serve(cfg, log, started, kernel_log, wlan_present, update))
 }
 
 /// Step 1: mounts the kernel's filesystems and starts the log on the console.
@@ -277,6 +354,63 @@ fn open_files_report(raised: &Result<u64, String>) -> (Level, String) {
     }
 }
 
+/// Step 1, once `/proc` is mounted: reads the kernel command line, once, for the layout of the card.
+///
+/// A command line that cannot be read is a warning and the old layout, which does not need it.
+/// A `qberrypi.slot=` argument that is not usable is fatal: nothing says which folder is this
+/// boot's, so nothing is read from the card or written to it (`Layout::Unusable`).
+fn read_layout() -> Layout {
+    let found = match sys::kernel_cmdline() {
+        Ok(cmdline) => layout_of(&cmdline),
+        Err(error) => {
+            log::warn!("kernel command line: {error}; taking the card to have no slots");
+            Ok(Layout::Old)
+        }
+    };
+    match found {
+        Ok(layout) => *LAYOUT.get_or_init(|| layout),
+        Err(message) => {
+            let _ = LAYOUT.set(Layout::Unusable);
+            fatal(&format!("kernel command line: {message}"))
+        }
+    }
+}
+
+/// Step 1, with the layout known: makes the state that every part of an update shares.
+///
+/// On a slot card it holds the slot and the digest of the build's boot files, which the build
+/// packed into the initramfs (a missing or damaged file is a warning, and the digest is then
+/// unknown), and it lends the card (`InitCard`). On the old layout it holds nothing.
+fn make_update(layout: Layout) -> Arc<UpdateCtl> {
+    let Layout::Slot(slot) = layout else {
+        return UpdateCtl::off();
+    };
+    let boot_files = update::read_boot_files(Path::new(update::BOOT_FILES_PATH));
+    if boot_files.is_none() {
+        log::warn!(
+            "update: {} is missing or damaged; this build cannot tell its boot files",
+            update::BOOT_FILES_PATH
+        );
+    }
+    UpdateCtl::new(Some(slot), boot_files, Arc::new(InitCard))
+}
+
+/// The boot partition of the SD card as init lends it to the other components
+/// ([`BootCard`]): each use is a claim on `BOARD`, a mount, the work, a sync after a writable
+/// mount and an unmount, exactly as `with_card` does for the boot sequence. It blocks its
+/// thread, so a component calls it from the blocking pool.
+struct InitCard;
+
+impl BootCard for InitCard {
+    fn with_boot(&self, access: CardAccess, work: &mut dyn FnMut(&Path)) -> io::Result<()> {
+        let access = match access {
+            CardAccess::ReadOnly => Access::ReadOnly,
+            CardAccess::Writable => Access::Writable,
+        };
+        with_card(&mut SdCard, access, |boot| work(boot))
+    }
+}
+
 /// Step 2: makes sure the clock does not show a time before this build.
 fn keep_clock_after_build() {
     match sys::clock_at_least(BUILD_EPOCH) {
@@ -287,11 +421,25 @@ fn keep_clock_after_build() {
 }
 
 /// Step 3: waits for the card and reads the configuration from it, and the API's TLS file beside it.
-fn read_config() -> &'static Config {
+///
+/// On a slot card the files are the slot's, and the boot rules are applied first, before the
+/// configuration is parsed (`load_slot_config`).
+fn read_config(layout: Layout, update: &UpdateCtl, started: Instant) -> &'static Config {
     if !wait_for_card(&SdCard, BOOT_DEV_WAIT, &mut pet_watchdog) {
         fatal(&format!("boot partition {BOOT_DEV} did not appear"));
     }
-    match load_config(&mut SdCard) {
+    let loaded = match layout.slot() {
+        Some(slot) => load_slot_config(
+            &mut SdCard,
+            &BOARD,
+            slot,
+            &TLS_PEM,
+            update,
+            tokio::time::Instant::from_std(started),
+        ),
+        None => load_config(&mut SdCard),
+    };
+    match loaded {
         Ok(cfg) => CONFIG.get_or_init(|| cfg),
         Err(message) => fatal(&message),
     }
@@ -315,9 +463,22 @@ fn load_config_into(
     tls: &OnceLock<Option<Vec<u8>>>,
 ) -> Result<Config, String> {
     let (text, pem) = with_card(card, Access::ReadOnly, |boot| {
-        (bootpart::read_config_text(boot), bootpart::read_tls(boot))
+        (
+            bootpart::read_config_text(boot, OWN_DIR),
+            bootpart::read_tls(boot, OWN_DIR),
+        )
     })
     .map_err(|error| format!("mounting {BOOT_DEV}: {error}"))?;
+    finish_config(text, pem, tls)
+}
+
+/// Parses what was read of the configuration, and keeps the TLS file in `tls` once the
+/// configuration has loaded (see `load_config_into`).
+fn finish_config(
+    text: io::Result<String>,
+    pem: io::Result<Option<Vec<u8>>>,
+    tls: &OnceLock<Option<Vec<u8>>>,
+) -> Result<Config, String> {
     let text = text.map_err(|error| format!("qberrypi.toml: {error}"))?;
     // The parser's errors name the file themselves.
     let cfg = config::parse(&text).map_err(|error| error.to_string())?;
@@ -328,6 +489,336 @@ fn load_config_into(
     // Whichever is first stays; there is only ever one load of the card.
     let _ = tls.set(pem);
     Ok(cfg)
+}
+
+/// The most bytes of the root `config.txt` that are read to find which slot it selects.
+const ROOT_CONFIG_CAP: u64 = 64 * 1024;
+
+/// Reads the root `config.txt` of the boot partition at `boot` and says which slot it selects.
+///
+/// At most `ROOT_CONFIG_CAP` and one byte of it are read. An error says what is wrong with the
+/// file in words that quote nothing from it.
+fn read_selected_slot(boot: &Path) -> Result<BootSlot, String> {
+    let file = File::open(boot.join(ACTIVE_CONFIG))
+        .map_err(|error| format!("{ACTIVE_CONFIG}: {error}"))?;
+    let mut bytes = Vec::new();
+    file.take(ROOT_CONFIG_CAP + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| format!("{ACTIVE_CONFIG}: {error}"))?;
+    if bytes.len() as u64 > ROOT_CONFIG_CAP {
+        return Err(format!(
+            "{ACTIVE_CONFIG} is larger than {ROOT_CONFIG_CAP} bytes"
+        ));
+    }
+    slots::selected_slot(&bytes).map_err(str::to_owned)
+}
+
+/// Step 3 on a slot card: reads the slot's configuration and key, the root `config.txt` and the
+/// trial marker in one read-only mount, applies the boot rules, and only then parses the
+/// configuration.
+///
+/// The rules come before the parse so that a trial build with a configuration that does not load
+/// has still appended `started` before it restarts, and a rollback says what really happened. A
+/// plain restart at once (`SecondTrialBoot`) is made here, before anything else runs. The rules
+/// write to the card only when they call for it (`apply_boot_rules`): with no marker, nothing is
+/// written. `began` is when init started. The card goes by `board`, which is `BOARD` on the
+/// board.
+fn load_slot_config(
+    card: &mut dyn Card,
+    board: &Mutex<Board>,
+    me: BootSlot,
+    tls: &OnceLock<Option<Vec<u8>>>,
+    update: &UpdateCtl,
+    began: tokio::time::Instant,
+) -> Result<Config, String> {
+    let dir = me.dir();
+    let (text, pem, selected, marker) = with_card_on(board, card, Access::ReadOnly, |boot| {
+        (
+            bootpart::read_config_text(boot, dir),
+            bootpart::read_tls(boot, dir),
+            read_selected_slot(boot),
+            slots::read_marker(boot),
+        )
+    })
+    .map_err(|error| format!("mounting {BOOT_DEV}: {error}"))?;
+    let applied = apply_boot_rules(card, board, me, selected, marker, update, began);
+    for (level, line) in &applied.lines {
+        log::log!(*level, "{line}");
+    }
+    if applied.restart_now {
+        sys::reboot();
+    }
+    finish_config(text, pem, tls)
+}
+
+/// What the boot rules did in step 3, for the caller to log and to act on.
+#[derive(Debug, PartialEq)]
+struct Applied {
+    /// What to log, in order. No line holds the contents of a file or a value of the configuration.
+    lines: Vec<(Level, String)>,
+    /// Whether the board restarts plainly at once, before anything else runs.
+    restart_now: bool,
+}
+
+/// What a rolled-back trial's log line says happened, in words that are fixed: the reason a trial
+/// build wrote itself is for the statistics, and the build's own log has it.
+fn rollback_case(marker: &Marker) -> &'static str {
+    match (&marker.failed, marker.started) {
+        (Some(_), _) => "the trial build gave up",
+        (None, false) => "the trial build never started",
+        (None, true) => "the trial build restarted before it confirmed",
+    }
+}
+
+/// Deletes the trial marker in one writable mount of the card; what goes wrong is a line for `lines`.
+fn delete_marker(card: &mut dyn Card, board: &Mutex<Board>, lines: &mut Vec<(Level, String)>) {
+    match with_card_on(board, card, Access::Writable, slots::remove_marker) {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => lines.push((
+            Level::Error,
+            format!("update: deleting the trial marker failed: {error}"),
+        )),
+        Err(error) => lines.push((
+            Level::Error,
+            format!("update: mounting {BOOT_DEV}: {error}; the trial marker stays"),
+        )),
+    }
+}
+
+/// Overwrites `tryboot.txt` with slot `from`'s `config.txt` in one writable mount of the card, so
+/// that a restart boots `from` even when the firmware keeps choosing `tryboot.txt`; what goes wrong
+/// is a line for `lines`.
+///
+/// This is for the boot that finds a trial begun twice (`SecondTrialBoot`): the firmware read
+/// `tryboot.txt` although nothing asked for `tryboot` this time, so a plain restart may be answered
+/// with the same file, and the same slot, for ever. With the file holding `from`'s configuration,
+/// that answer is `from`, the slot the trial came from. Nothing else is written, and the restart
+/// that follows does not wait on it: a file that cannot be written leaves what a plain restart does.
+fn point_tryboot_at(
+    card: &mut dyn Card,
+    board: &Mutex<Board>,
+    from: BootSlot,
+    lines: &mut Vec<(Level, String)>,
+) {
+    match with_card_on(board, card, Access::Writable, |boot| {
+        slots::stage_tryboot(boot, from)
+    }) {
+        Ok(Ok(Select::Selected | Select::AlreadySelected)) => {}
+        Ok(Ok(Select::Refused(reason))) => lines.push((
+            Level::Error,
+            format!("update: tryboot.txt could not be pointed at slot {from} ({reason})"),
+        )),
+        Ok(Err(error)) => lines.push((
+            Level::Error,
+            format!("update: tryboot.txt could not be pointed at slot {from}: {error}"),
+        )),
+        Err(error) => lines.push((
+            Level::Error,
+            format!(
+                "update: mounting {BOOT_DEV}: {error}; tryboot.txt could not be pointed at slot {from}"
+            ),
+        )),
+    }
+}
+
+/// Applies the boot rules of the design to slot `me`, given what step 3 read: the slot that the
+/// root `config.txt` selects (or why it could not be told), and the marker (or why it could not
+/// be read). `update` is filled with what the rules found out.
+///
+/// The card is written, in one writable mount through the claim on `BOARD`, only for an action
+/// that calls for it, and for none that has nothing to write: no marker, no write. A `config.txt`
+/// that selects no slot is an error line, and the slot is taken to be the selected one, which is
+/// what repairs it (the software trial selects its `from` slot) and does the least harm
+/// otherwise. A marker that is read but is no marker (not text, over its cap, or not what the updater
+/// writes) is an error, and it is deleted: it says nothing that could be acted on.
+///
+/// A marker that cannot be read at all (an I/O error opening or reading it, which says nothing of
+/// its content) is an error, and it stays: nothing is deleted, written or started, and the boot runs
+/// with no trial. What the boot ought to do depends on the content, which cannot be told. It may be
+/// a software trial's marker, whose slot `config.txt` already selects, and deleting it would make
+/// that unconfirmed build permanent; it may be a firmware trial's, or the record of a rollback,
+/// which a selection of the other slot (a guess at a software trial) would send back to the build
+/// that failed. A restart to read it again is no better: an error that lasts would restart the
+/// board for ever, with no DNS. So the marker is left for the first boot that can read it, which
+/// applies the rules as usual (a software trial then selects the slot it came from at last). The
+/// cost is that, while the error lasts, a trial is not watched (it neither confirms nor gives up)
+/// and a software trial's build has no way back; each boot that cannot read the marker says so.
+///
+/// A second boot of a trial (`SecondTrialBoot`) writes `tryboot.txt`, as a copy of the `config.txt`
+/// of the slot the trial came from, before it asks for its plain restart (see `point_tryboot_at`).
+///
+/// A software trial that cannot select its `from` slot again does not append `started`, so that
+/// a restart does not look like a confirm that was cut off. Failures of the card are error lines;
+/// the boot goes on whatever they are, as the rules' point is to run. Nothing is logged with a
+/// file's text: slot letters, build times and fixed words only (and the reason a marker could not
+/// be parsed, which `slots` words without quoting it).
+fn apply_boot_rules(
+    card: &mut dyn Card,
+    board: &Mutex<Board>,
+    me: BootSlot,
+    selected: Result<BootSlot, String>,
+    marker: io::Result<Option<Result<Marker, String>>>,
+    update: &UpdateCtl,
+    began: tokio::time::Instant,
+) -> Applied {
+    let mut lines = Vec::new();
+    let selected = selected.unwrap_or_else(|reason| {
+        lines.push((
+            Level::Error,
+            format!("update: {reason}; taking slot {me} to be the selected one"),
+        ));
+        me
+    });
+    let marker = match marker {
+        Ok(marker) => marker,
+        Err(error) => {
+            lines.push((
+                Level::Error,
+                format!(
+                    "update: {} could not be read: {error}; it stays on the card and this boot runs with no trial, so a trial that is under way is not watched until a boot reads the marker",
+                    slots::MARKER_FILE
+                ),
+            ));
+            return Applied {
+                lines,
+                restart_now: false,
+            };
+        }
+    };
+    // The action says what to do, and not always about which build; the marker that was read does.
+    let seen = marker
+        .as_ref()
+        .and_then(|marker| marker.as_ref().ok())
+        .cloned();
+    let action = slots::decide(me, selected, marker);
+    let mut restart_now = false;
+    match action {
+        BootAction::Normal => lines.push((
+            Level::Info,
+            format!("update: slot {me} is running, with no trial under way"),
+        )),
+        BootAction::NormalWarnTryboot => lines.push((
+            Level::Warn,
+            format!(
+                "update: slot {me} was started although config.txt selects the other slot, and no trial is recorded"
+            ),
+        )),
+        BootAction::Trial {
+            marker,
+            select_from_first,
+        } => {
+            lines.push((
+                Level::Info,
+                format!(
+                    "update: slot {me} is on trial: build {}, from slot {}",
+                    marker.build, marker.from
+                ),
+            ));
+            let written = with_card_on(board, card, Access::Writable, |boot| {
+                let reselected = select_from_first.then(|| slots::select(boot, marker.from));
+                let safe = match &reselected {
+                    None | Some(Ok(Select::Selected | Select::AlreadySelected)) => true,
+                    Some(Ok(Select::Refused(_))) | Some(Err(_)) => false,
+                };
+                let started = safe.then(|| slots::append_line(boot, slots::STARTED));
+                (reselected, started)
+            });
+            let mut started_ok = false;
+            match written {
+                Ok((reselected, started)) => {
+                    match reselected {
+                        None => {}
+                        Some(Ok(Select::Selected | Select::AlreadySelected)) => lines.push((
+                            Level::Info,
+                            format!(
+                                "update: software trial: config.txt selects slot {} again until the trial confirms",
+                                marker.from
+                            ),
+                        )),
+                        Some(Ok(Select::Refused(reason))) => lines.push((
+                            Level::Error,
+                            format!(
+                                "update: slot {} could not be selected again ({reason}); the trial runs with no way back",
+                                marker.from
+                            ),
+                        )),
+                        Some(Err(error)) => lines.push((
+                            Level::Error,
+                            format!(
+                                "update: selecting slot {} again failed: {error}; the trial runs with no way back",
+                                marker.from
+                            ),
+                        )),
+                    }
+                    match started {
+                        Some(Ok(())) => started_ok = true,
+                        Some(Err(error)) => lines.push((
+                            Level::Error,
+                            format!("update: the trial marker could not be marked as started: {error}"),
+                        )),
+                        None => {}
+                    }
+                }
+                Err(error) => lines.push((
+                    Level::Error,
+                    format!("update: mounting {BOOT_DEV}: {error}; the trial runs unmarked"),
+                )),
+            }
+            update.begin_trial(
+                Marker {
+                    started: started_ok || marker.started,
+                    ..marker
+                },
+                began,
+            );
+        }
+        BootAction::ConfirmInterrupted => {
+            lines.push((
+                Level::Info,
+                format!(
+                    "update: slot {me} was selected and its trial marker was left behind by a confirm that was cut off: the marker is deleted and slot {me} stays"
+                ),
+            ));
+            delete_marker(card, board, &mut lines);
+            if let Some(marker) = seen {
+                update.finish(Outcome::confirmed(marker.build));
+            }
+        }
+        BootAction::SecondTrialBoot => {
+            lines.push((
+                Level::Error,
+                format!(
+                    "update: the trial of slot {me} began once and begins again, so the firmware chose tryboot.txt again; restarting at once to boot the slot it came from"
+                ),
+            ));
+            // A marker that was read is what makes this action, so `seen` holds it.
+            if let Some(marker) = &seen {
+                point_tryboot_at(card, board, marker.from, &mut lines);
+            }
+            restart_now = true;
+        }
+        BootAction::RolledBack { marker } => {
+            lines.push((
+                Level::Warn,
+                format!(
+                    "update: the trial of build {} on slot {} was rolled back: {}; slot {me} is running again",
+                    marker.build,
+                    marker.slot,
+                    rollback_case(&marker)
+                ),
+            ));
+            delete_marker(card, board, &mut lines);
+            update.finish(Outcome::rolled_back(marker.build, marker.rollback_detail()));
+        }
+        BootAction::BadMarker(reason) => {
+            lines.push((
+                Level::Error,
+                format!("update: the trial marker is unusable ({reason}); it is deleted"),
+            ));
+            delete_marker(card, board, &mut lines);
+        }
+    }
+    Applied { lines, restart_now }
 }
 
 /// The API's key and certificate as `load_config` found them, from step 3 on: `None` if the card
@@ -354,7 +845,18 @@ fn tls_pem_of(slot: &OnceLock<Option<Vec<u8>>>) -> Option<&[u8]> {
 /// from the same backup, so it would fail the same way and only restart into
 /// qberrypi sooner, over and over. Going on at least leaves a system to look at.
 fn restore_and_save_log(cfg: &Config, card: &mut dyn Card, log: &Mutex<LogBuf>) {
-    let (restore, save) = (cfg.debug.one_shot, cfg.debug.log_to_sd);
+    restore_and_save_log_in(layout(), cfg, card, log);
+}
+
+/// [`restore_and_save_log`] on the card laid out as `layout`.
+///
+/// On a slot card nothing is restored, whatever `debug.one_shot` says: there is no Raspberry Pi OS
+/// to return to. The log, if it is kept on the card, is saved in the slot's folder.
+fn restore_and_save_log_in(layout: Layout, cfg: &Config, card: &mut dyn Card, log: &Mutex<LogBuf>) {
+    let (restore, save) = (
+        cfg.debug.one_shot && layout.restores_pios(),
+        cfg.debug.log_to_sd,
+    );
     if !restore && !save {
         return;
     }
@@ -363,7 +865,11 @@ fn restore_and_save_log(cfg: &Config, card: &mut dyn Card, log: &Mutex<LogBuf>) 
         if restore {
             log_restore(&bootpart::restore_pios_config(boot));
         }
-        if save { save_log(boot, log) } else { Ok(()) }
+        if save {
+            save_log_in(boot, layout.dir(), log)
+        } else {
+            Ok(())
+        }
     });
     match written {
         Ok(Ok(())) => {}
@@ -728,8 +1234,13 @@ fn save_failure(error: &io::Error) -> (Level, String) {
 /// The lines are taken only here, with the card mounted, so that a card
 /// that does not mount leaves them for the next save.
 fn save_log(boot: &Path, log: &Mutex<LogBuf>) -> io::Result<()> {
+    save_log_in(boot, layout().dir(), log)
+}
+
+/// [`save_log`] into `dir`, qberrypi's folder on the boot partition (`Layout::dir`).
+fn save_log_in(boot: &Path, dir: &str, log: &Mutex<LogBuf>) -> io::Result<()> {
     let entry = log_entry(&mut lock(log));
-    bootpart::append_log(boot, &entry)
+    bootpart::append_log(boot, dir, &entry)
 }
 
 /// Takes the lines not yet saved and lays them out for the file on the card.
@@ -790,6 +1301,9 @@ struct BoardParts {
     signal: Arc<SignalCache>,
     /// The front panel's slot, which the first service to start fills.
     slot: Arc<Slot>,
+    /// The slot this boot runs and how an update stands: whether this boot is on trial decides
+    /// what the two trial faults do.
+    update: Arc<UpdateCtl>,
 }
 
 /// The board's own components, after the services and in the order that the board starts them:
@@ -826,9 +1340,13 @@ fn signal_component(parts: &BoardParts) -> Option<Component> {
     ))
 }
 
-/// The provoked failure that `debug.fault` asks for, if it is a component (`fault::component`).
+/// The provoked failure that `debug.fault` asks for, if it is a component (`fault::component`):
+/// the trial faults count only on a boot that is on trial (`fault::effective`).
 fn fault_component(parts: &BoardParts) -> Option<Component> {
-    fault::component(parts.cfg.debug.fault)
+    fault::component(fault::effective(
+        parts.cfg.debug.fault,
+        parts.update.trial().is_some(),
+    ))
 }
 
 /// Step 10: brings the network up as far as `start_network` does, runs every component under the
@@ -860,6 +1378,7 @@ async fn serve(
     started: Instant,
     kernel_log: Option<kmsg::Reader>,
     wlan_present: bool,
+    update: Arc<UpdateCtl>,
 ) -> ! {
     let slot = Slot::new();
     let signal = SignalCache::new();
@@ -875,6 +1394,8 @@ async fn serve(
     // Nothing here waits: the services make what they share when the supervisor starts the first
     // of them, and the Wi-Fi and the panel start beside that.
     let saves = LogSaves::new();
+    // The two trial faults act on a boot that is on trial, and are no fault on any other.
+    let fault = fault::effective(cfg.debug.fault, update.trial().is_some());
     let components = components(
         Context {
             cfg,
@@ -885,6 +1406,7 @@ async fn serve(
             signal: signal.clone(),
             // The card's `tls.pem`, which `cfg.api` says whether to serve with.
             tls_pem: tls_pem(),
+            update: update.clone(),
         },
         &BoardParts {
             cfg,
@@ -895,6 +1417,7 @@ async fn serve(
             status: status.clone(),
             signal,
             slot,
+            update: update.clone(),
         },
     );
 
@@ -902,12 +1425,15 @@ async fn serve(
         components,
         return_after: return_after(cfg.debug.return_after_secs, started.elapsed()),
         // The Wi-Fi task's own statuses, or what the provoked fault puts in their place.
-        link: Some(fault::link(cfg.debug.fault).unwrap_or_else(|| status.clone())),
+        link: Some(fault::link(fault).unwrap_or_else(|| status.clone())),
+        // What a component asks for through the update machinery: a restart.
+        restart: Some(update.restart_receiver()),
     };
     let hooks = Hooks {
         // The stall fault counts from here, where the supervisor starts: the panel is up by then.
         tick: Box::new(tick(
             cfg,
+            fault,
             log,
             kernel_log,
             status,
@@ -920,7 +1446,7 @@ async fn serve(
     let reason = supervisor::run(plan, hooks).await;
     // On `Restart` the card stays claimed, from `leave` to the restart.
     match leave(cfg, &mut SdCard, log, &reason, &saves, &BOARD) {
-        Leaving::Restart => sys::reboot(),
+        Leaving::Restart => restart_board(&reason),
         Leaving::Park => loop {
             thread::park();
         },
@@ -937,10 +1463,12 @@ fn return_after(return_after_secs: u64, elapsed: Duration) -> Option<Duration> {
 /// copies the kernel's new log lines, and starts a save of the log if one is due.
 ///
 /// Nothing here waits: the save runs on the pool. The one exception is the provoked stall
-/// (`debug.fault = "stall"`): once `began`, when the supervisor started, is `fault::FAULT_AFTER`
-/// ago, the tick does not pet and does not return (see `stall`).
+/// (`fault` is [`Fault::Stall`], which `debug.fault = "stall"` gives, and `"trial_stall"` on a boot
+/// that is on trial): once `began`, when the supervisor started, is `fault::FAULT_AFTER` ago, the
+/// tick does not pet and does not return (see `stall`).
 fn tick(
     cfg: &'static Config,
+    fault: Fault,
     log: &'static Mutex<LogBuf>,
     mut kernel_log: Option<kmsg::Reader>,
     status: watch::Receiver<WifiStatus>,
@@ -950,7 +1478,7 @@ fn tick(
     move || {
         // Before the pet: a stalled supervisor must leave the watchdog its whole time to run out.
         // The clock is read only for the one fault that asks for it.
-        if cfg.debug.fault == Fault::Stall && fault::stall_due(Fault::Stall, began.elapsed()) {
+        if fault::stall_due(fault, began.elapsed()) {
             stall(cfg, log, &saves);
         }
         pet_watchdog();
@@ -1412,12 +1940,35 @@ enum Leaving {
 
 /// The level and the line that `reason` is logged with when the board leaves.
 ///
-/// The configured time passing is the board's plan and the line the QEMU scenarios look for;
-/// anything else is an error that restarts the board.
+/// The configured time passing is the board's plan and the line the QEMU scenarios look for, and
+/// so is the restart that an update stages (INFO); a trial that gives up, and anything else, is an
+/// error that restarts the board.
 fn leaving_line(reason: &Reason) -> (Level, String) {
     match reason {
         Reason::ReturnAfter => (Level::Info, "returning".to_owned()),
+        Reason::Restart(restart @ (Restart::Tryboot | Restart::Plain(Cause::Update))) => {
+            (Level::Info, format!("update: restarting: {restart}"))
+        }
+        Reason::Restart(restart @ Restart::Plain(Cause::GaveUp(_))) => {
+            (Level::Error, format!("update: restarting: {restart}"))
+        }
         other => (Level::Error, format!("supervisor: restarting: {other}")),
+    }
+}
+
+/// Whether the restart for `reason` is made with `0 tryboot`, so that the firmware reads
+/// `tryboot.txt` at the next start: only an update that was staged for the firmware's trial.
+fn restarts_with_tryboot(reason: &Reason) -> bool {
+    matches!(reason, Reason::Restart(Restart::Tryboot))
+}
+
+/// Restarts the board as `reason` asks: with `0 tryboot` for an update staged for the firmware's
+/// trial, plainly for every other. The card is claimed and everything is synced before either.
+fn restart_board(reason: &Reason) -> ! {
+    if restarts_with_tryboot(reason) {
+        sys::reboot_tryboot()
+    } else {
+        sys::reboot()
     }
 }
 
@@ -1644,7 +2195,7 @@ fn fatal(message: &str) -> ! {
 struct Rescue {
     /// Put Raspberry Pi OS's `config.txt` back.
     restore_config: bool,
-    /// Append the log to `qberrypi/log.txt`.
+    /// Append the log to `log.txt` in qberrypi's folder (`Layout::dir`).
     save_log: bool,
 }
 
@@ -1654,7 +2205,13 @@ struct Rescue {
 /// saved then too, and also whenever the configuration keeps the log on the
 /// card: that switch is there so that a boot that failed can be read back.
 fn rescue_plan(cfg: Option<&Config>) -> Rescue {
-    let restore_config = restore_on_fatal(cfg);
+    rescue_plan_in(layout(), cfg)
+}
+
+/// [`rescue_plan`] on the card laid out as `layout`: on a slot card nothing is restored, and the
+/// log is saved only where the configuration keeps it on the card.
+fn rescue_plan_in(layout: Layout, cfg: Option<&Config>) -> Rescue {
+    let restore_config = restore_on_fatal_in(layout, cfg);
     Rescue {
         restore_config,
         save_log: restore_config || cfg.is_some_and(|cfg| cfg.debug.log_to_sd),
@@ -1675,7 +2232,18 @@ fn rescue(
     wait: Duration,
     pet: &mut dyn FnMut(),
 ) {
-    let plan = rescue_plan(cfg);
+    rescue_with(rescue_plan(cfg), layout().dir(), card, log, wait, pet);
+}
+
+/// [`rescue`] with the plan made and the folder named by the caller (`Layout::dir`).
+fn rescue_with(
+    plan: Rescue,
+    dir: &str,
+    card: &mut dyn Card,
+    log: Option<&Mutex<LogBuf>>,
+    wait: Duration,
+    pet: &mut dyn FnMut(),
+) {
     let log_to_save = log.filter(|_| plan.save_log);
     if !plan.restore_config && log_to_save.is_none() {
         return;
@@ -1697,7 +2265,7 @@ fn rescue(
         if let Some(mut buf) = log_to_save.and_then(|log| lock_within(log, LOG_LOCK_WAIT)) {
             let entry = log_entry(&mut buf);
             drop(buf);
-            let _ = bootpart::append_log(boot, &entry);
+            let _ = bootpart::append_log(boot, dir, &entry);
         }
     });
 }
@@ -1973,7 +2541,18 @@ fn with_card<T>(
     access: Access,
     work: impl FnOnce(&Path) -> T,
 ) -> io::Result<T> {
-    let (done, unmounted) = on_card(card, access, work)?;
+    with_card_on(&BOARD, card, access, work)
+}
+
+/// `with_card` on the board `board` that the card goes by.
+fn with_card_on<T>(
+    board: &Mutex<Board>,
+    card: &mut dyn Card,
+    access: Access,
+    work: impl FnOnce(&Path) -> T,
+) -> io::Result<T> {
+    let (done, unmounted) =
+        on_card_within(card, access, board, CARD_LOCK_WAIT, &first_fatal, work)?;
     log_unmount(unmounted);
     Ok(done)
 }
@@ -4014,30 +4593,34 @@ mod tests {
                 .checked_sub(Duration::from_secs(secs))
                 .expect("the machine has been up that long")
         };
-        let ticking = |fault: &str, began: Instant| {
+        let ticking = |fault: &str, on_trial: bool, began: Instant| {
             let text = EXAMPLE.replace("fault = \"none\"", &format!("fault = \"{fault}\""));
             let cfg: &'static Config = Box::leak(Box::new(config::parse(&text).unwrap()));
             let log: &'static Mutex<LogBuf> = Box::leak(Box::new(log_holding(&[])));
             let (_sender, status) = watch::channel(WifiStatus::Starting);
-            tick(cfg, log, None, status, LogSaves::new(), began)
+            let fault = fault::effective(cfg.debug.fault, on_trial);
+            tick(cfg, fault, log, None, status, LogSaves::new(), began)
         };
 
-        // A stall that is not due yet, and any other fault however late: the tick comes back.
-        ticking("stall", ago(9))();
-        ticking("crash-loop", ago(3600))();
-        ticking("none", ago(3600))();
+        // A stall that is not due yet, and any other fault however late: the tick comes back. So
+        // does the trial stall on a boot that is not on trial, however late.
+        ticking("stall", false, ago(9))();
+        ticking("crash-loop", false, ago(3600))();
+        ticking("none", false, ago(3600))();
+        ticking("trial_stall", false, ago(3600))();
+        ticking("trial_stall", true, ago(9))();
+        ticking("trial_panic", true, ago(3600))();
         assert_eq!(CAPTURE.lines(), [""; 0]);
 
-        // One that is due says so, and the supervisor's thread is held for good.
-        let stalled = thread::spawn(move || ticking("stall", ago(11))());
-        thread::sleep(Duration::from_millis(400));
-        assert!(!stalled.is_finished());
-        assert_eq!(
-            CAPTURE.lines(),
-            [
-                "WARN fault: stalling the supervisor; the watchdog must restart the board within 15 s"
-            ]
-        );
+        // One that is due says so, and the supervisor's thread is held for good. The trial stall
+        // does the same on a boot that is on trial.
+        let stalled = thread::spawn(move || ticking("stall", false, ago(11))());
+        let trial_stalled = thread::spawn(move || ticking("trial_stall", true, ago(11))());
+        thread::sleep(Duration::from_millis(600));
+        assert!(!stalled.is_finished() && !trial_stalled.is_finished());
+        let stalling =
+            "WARN fault: stalling the supervisor; the watchdog must restart the board within 15 s";
+        assert_eq!(CAPTURE.lines(), [stalling, stalling]);
     }
 
     #[test]
@@ -5075,6 +5658,15 @@ mod tests {
     /// supervisor starts them, for the example configuration with `extra` added and `fault` as the
     /// debug fault. Nothing in it starts.
     fn components_started(extra: &str, fault: &str) -> Vec<(&'static str, bool)> {
+        components_started_on(extra, fault, UpdateCtl::off())
+    }
+
+    /// [`components_started`] on a boot whose update machinery is `update`.
+    fn components_started_on(
+        extra: &str,
+        fault: &str,
+        update: Arc<UpdateCtl>,
+    ) -> Vec<(&'static str, bool)> {
         let text = EXAMPLE.replace("fault = \"none\"", &format!("fault = \"{fault}\""));
         let cfg: &'static Config = Box::leak(Box::new(
             config::parse(&format!("{text}\n{extra}")).unwrap(),
@@ -5092,6 +5684,7 @@ mod tests {
                 wifi: status.clone(),
                 signal: signal.clone(),
                 tls_pem: None,
+                update: update.clone(),
             },
             &BoardParts {
                 cfg,
@@ -5102,6 +5695,7 @@ mod tests {
                 status,
                 signal,
                 slot,
+                update,
             },
         );
         components.iter().map(|c| (c.name, c.essential)).collect()
@@ -5147,5 +5741,832 @@ mod tests {
                 ("fault", true),
             ]
         );
+    }
+
+    /// The state of an update that is the first boot of a trial of slot b, as step 3 leaves it.
+    fn on_trial() -> Arc<UpdateCtl> {
+        let ctl = ctl_on(BootSlot::B);
+        ctl.begin_trial(
+            Marker {
+                slot: BootSlot::B,
+                from: BootSlot::A,
+                build: BUILD_OF_THE_TRIAL,
+                mode: slots::Mode::Tryboot,
+                started: true,
+                failed: None,
+            },
+            tokio::time::Instant::now(),
+        );
+        ctl
+    }
+
+    // A boot that is on trial has one more service, the trial, after the others; any other has
+    // none, and the two trial faults count only on a boot that is on trial.
+    #[tokio::test]
+    async fn a_boot_on_trial_runs_the_trial_after_the_services_and_only_then() {
+        let services = [
+            ("dns", true),
+            ("utc offset", true),
+            ("clock", true),
+            ("status", true),
+            ("lists", true),
+            ("analysis", false),
+            ("devices", false),
+        ];
+        let board = [("wifi", true), ("signal", true), ("panel", false)];
+        let started = |trial: bool, fault: &str| {
+            let update = if trial {
+                on_trial()
+            } else {
+                ctl_on(BootSlot::B)
+            };
+            components_started_on("", fault, update)
+        };
+        let expected = |trial: bool, fault: bool| {
+            let mut all = services.to_vec();
+            all.extend(trial.then_some(("trial", true)));
+            all.extend(board);
+            all.extend(fault.then_some(("fault", true)));
+            all
+        };
+
+        assert_eq!(started(true, "none"), expected(true, false));
+        assert_eq!(started(false, "none"), expected(false, false));
+        // The trial panic is a component on a trial boot, and none on any other.
+        assert_eq!(started(true, "trial_panic"), expected(true, true));
+        assert_eq!(started(false, "trial_panic"), expected(false, false));
+        // The trial stall is the tick's, never a component.
+        assert_eq!(started(true, "trial_stall"), expected(true, false));
+        assert_eq!(started(false, "trial_stall"), expected(false, false));
+        // The old layout has no trial at all, whatever the faults say.
+        assert_eq!(
+            components_started_on("", "trial_panic", UpdateCtl::off()),
+            expected(false, false)
+        );
+    }
+
+    // The cards with two slots.
+
+    /// The configuration of the first slot, as a card with slots holds it.
+    const BUILD_OF_THE_TRIAL: u64 = 1_794_470_000;
+
+    /// A `config.txt` as a slot's folder and the root hold it: selecting `slot`.
+    fn slot_config(slot: BootSlot) -> String {
+        format!(
+            "# slot\narm_64bit=1\nos_prefix={}\nkernel=kernel8.img\n",
+            slot.os_prefix()
+        )
+    }
+
+    /// What a slot's own `qberrypi.toml` says of the name, so that a read from the wrong folder shows.
+    fn toml_of(slot: BootSlot) -> String {
+        EXAMPLE.replace(
+            "hostname = \"qberrypi\"",
+            &format!("hostname = \"slot-{}\"", slot.letter()),
+        )
+    }
+
+    impl FakeCard {
+        /// A card with two slots, as `cargo xtask image` makes it, whose root `config.txt` selects
+        /// `selected`. Each slot's folder holds its own `config.txt` and `qberrypi.toml`.
+        fn slotted(selected: BootSlot) -> Self {
+            let dir = tempfile::tempdir().unwrap();
+            for slot in [BootSlot::A, BootSlot::B] {
+                let folder = dir.path().join(slot.dir());
+                fs::create_dir(&folder).unwrap();
+                fs::write(folder.join("config.txt"), slot_config(slot)).unwrap();
+                fs::write(folder.join("qberrypi.toml"), toml_of(slot)).unwrap();
+                fs::write(folder.join("tls.pem"), format!("pem of {}", slot.letter())).unwrap();
+            }
+            fs::write(dir.path().join("config.txt"), slot_config(selected)).unwrap();
+            Self {
+                dir,
+                ops: Vec::new(),
+                mounted: false,
+                mount_fails: false,
+                unmount_fails: false,
+                absent_for: Cell::new(0),
+            }
+        }
+
+        /// Writes the marker of a trial of `slot` as the updater leaves it.
+        fn mark_trial(&self, slot: BootSlot, mode: slots::Mode, started: bool) {
+            let marker = Marker {
+                slot,
+                from: slot.other(),
+                build: BUILD_OF_THE_TRIAL,
+                mode,
+                started,
+                failed: None,
+            };
+            slots::write_marker(self.dir.path(), &marker).unwrap();
+        }
+
+        /// Every file under the partition with its bytes, for a comparison before and after.
+        fn contents(&self) -> Vec<(String, Vec<u8>)> {
+            fn walk(base: &Path, at: &Path, out: &mut Vec<(String, Vec<u8>)>) {
+                let mut names: Vec<_> = fs::read_dir(at)
+                    .unwrap()
+                    .map(|e| e.unwrap().path())
+                    .collect();
+                names.sort();
+                for path in names {
+                    if path.is_dir() {
+                        walk(base, &path, out);
+                    } else {
+                        let name = path
+                            .strip_prefix(base)
+                            .unwrap()
+                            .to_string_lossy()
+                            .into_owned();
+                        out.push((name, fs::read(&path).unwrap()));
+                    }
+                }
+            }
+            let mut out = Vec::new();
+            walk(self.dir.path(), self.dir.path(), &mut out);
+            out
+        }
+    }
+
+    /// The state of an update on `slot`, with no card to lend.
+    fn ctl_on(slot: BootSlot) -> Arc<UpdateCtl> {
+        UpdateCtl::new(Some(slot), None, Arc::new(crate::update::NoCard))
+    }
+
+    /// Step 3 on `card`, as a boot of `me`, with a fresh place to keep the TLS file.
+    fn step_3(
+        card: &mut FakeCard,
+        me: BootSlot,
+        ctl: &UpdateCtl,
+    ) -> Result<(Config, Option<Vec<u8>>), String> {
+        let tls = OnceLock::new();
+        let cfg = load_slot_config(
+            card,
+            &Mutex::new(Board::new()),
+            me,
+            &tls,
+            ctl,
+            tokio::time::Instant::now(),
+        )?;
+        Ok((cfg, tls.get().cloned().flatten()))
+    }
+
+    /// The rules for `me` on `card`, from what step 3 would have read of it.
+    fn rules(card: &mut FakeCard, me: BootSlot, ctl: &UpdateCtl) -> Applied {
+        let selected = read_selected_slot(card.dir.path());
+        let marker = slots::read_marker(card.dir.path());
+        // A board of its own: the tests of the rules do not queue behind the others for the card.
+        let board = Mutex::new(Board::new());
+        apply_boot_rules(
+            card,
+            &board,
+            me,
+            selected,
+            marker,
+            ctl,
+            tokio::time::Instant::now(),
+        )
+    }
+
+    fn level_of(applied: &Applied, containing: &str) -> Level {
+        let hits: Vec<_> = applied
+            .lines
+            .iter()
+            .filter(|(_, line)| line.contains(containing))
+            .collect();
+        assert_eq!(hits.len(), 1, "{containing:?} in {:?}", applied.lines);
+        hits[0].0
+    }
+
+    /// The text of every line the rules would log, to look for what must not be in any of them.
+    fn lines_text(applied: &Applied) -> String {
+        applied
+            .lines
+            .iter()
+            .map(|(_, line)| line.as_str())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn the_command_line_says_which_layout_the_card_has() {
+        assert_eq!(
+            layout_of("console=tty1 panic=5 loglevel=4\n"),
+            Ok(Layout::Old)
+        );
+        assert_eq!(layout_of(""), Ok(Layout::Old));
+        assert_eq!(
+            layout_of("console=tty1 panic=5 loglevel=4 qberrypi.slot=a\n"),
+            Ok(Layout::Slot(BootSlot::A))
+        );
+        assert_eq!(layout_of("qberrypi.slot=b"), Ok(Layout::Slot(BootSlot::B)));
+        for bad in [
+            "qberrypi.slot=c",
+            "qberrypi.slot=a qberrypi.slot=b",
+            "qberrypi.slot=",
+        ] {
+            let error = layout_of(bad).unwrap_err();
+            assert!(error.contains("qberrypi.slot"), "{error}");
+        }
+        assert!(!layout_of("qberrypi.slot=zzz").unwrap_err().contains("zzz"));
+    }
+
+    #[test]
+    fn a_layout_names_its_folder_whether_it_restores_and_its_slot() {
+        assert_eq!(Layout::Old.dir(), "qberrypi");
+        assert_eq!(Layout::Slot(BootSlot::A).dir(), "qberrypi-a");
+        assert_eq!(Layout::Slot(BootSlot::B).dir(), "qberrypi-b");
+        assert_eq!(Layout::Unusable.dir(), "qberrypi");
+        assert!(Layout::Old.restores_pios());
+        assert!(!Layout::Slot(BootSlot::A).restores_pios());
+        assert!(!Layout::Unusable.restores_pios());
+        assert_eq!(Layout::Old.slot(), None);
+        assert_eq!(Layout::Unusable.slot(), None);
+        assert_eq!(Layout::Slot(BootSlot::B).slot(), Some(BootSlot::B));
+        // Until step 1 has read it, and in a test, the layout is the old one.
+        assert_eq!(layout(), Layout::Old);
+    }
+
+    #[test]
+    fn the_update_state_of_the_old_layout_has_nothing_and_a_slots_has_its_slot() {
+        let old = make_update(Layout::Old);
+        assert_eq!((old.slot(), old.boot_files()), (None, None));
+        assert_eq!(old.begin_receive().err(), Some(update::Refused::NoSlots));
+        let slotted = make_update(Layout::Slot(BootSlot::B));
+        assert_eq!(slotted.slot(), Some(BootSlot::B));
+        // The initramfs of this host has no digest file: it is unknown, not an invented one.
+        assert_eq!(slotted.boot_files(), None);
+    }
+
+    #[test]
+    fn the_selected_slot_is_read_from_the_root_config_and_a_bad_one_says_why_without_quoting_it() {
+        let card = FakeCard::slotted(BootSlot::B);
+        assert_eq!(read_selected_slot(card.dir.path()), Ok(BootSlot::B));
+        card.write("config.txt", "arm_64bit=1\nSECRETWORD\n");
+        let error = read_selected_slot(card.dir.path()).unwrap_err();
+        assert!(
+            error.contains("os_prefix") && !error.contains("SECRETWORD"),
+            "{error}"
+        );
+        card.write("config.txt", "os_prefix=SECRETWORD/\n");
+        let error = read_selected_slot(card.dir.path()).unwrap_err();
+        assert!(!error.contains("SECRETWORD"), "{error}");
+        card.remove("config.txt");
+        assert!(
+            read_selected_slot(card.dir.path())
+                .unwrap_err()
+                .starts_with("config.txt")
+        );
+        card.write(
+            "config.txt",
+            &format!(
+                "os_prefix=qberrypi-a/\n{}",
+                "#".repeat(ROOT_CONFIG_CAP as usize)
+            ),
+        );
+        let error = read_selected_slot(card.dir.path()).unwrap_err();
+        assert!(error.contains("larger than 65536"), "{error}");
+    }
+
+    #[test]
+    fn a_boot_with_no_marker_writes_nothing_and_says_which_slot_runs() {
+        for me in [BootSlot::A, BootSlot::B] {
+            let mut card = FakeCard::slotted(me);
+            let before = card.contents();
+            let ctl = ctl_on(me);
+
+            let (cfg, pem) = step_3(&mut card, me, &ctl).unwrap();
+
+            // One read-only mount, and no other use of the card; the files are as they were.
+            assert_eq!(card.ops, READ_OPS);
+            assert_eq!(card.contents(), before);
+            // The configuration and the key are the slot's own.
+            assert_eq!(cfg.hostname, format!("slot-{}", me.letter()));
+            assert_eq!(pem, Some(format!("pem of {}", me.letter()).into_bytes()));
+            let view = ctl.view();
+            assert_eq!((view.state, view.trial, view.last), ("idle", None, None));
+        }
+    }
+
+    #[test]
+    fn a_boot_with_no_marker_that_config_txt_does_not_select_warns_and_writes_nothing() {
+        let mut card = FakeCard::slotted(BootSlot::A);
+        let before = card.contents();
+        let ctl = ctl_on(BootSlot::B);
+
+        let applied = rules(&mut card, BootSlot::B, &ctl);
+
+        assert_eq!(level_of(&applied, "no trial is recorded"), Level::Warn);
+        assert!(!applied.restart_now);
+        assert!(card.ops.is_empty());
+        assert_eq!(card.contents(), before);
+    }
+
+    #[test]
+    fn the_old_layout_never_looks_at_a_marker_or_at_config_txt() {
+        let mut card = FakeCard::new();
+        card.mark_trial(BootSlot::B, slots::Mode::Tryboot, false);
+        let before = card.contents();
+
+        assert_eq!(load_config(&mut card).unwrap().hostname, "qberrypi");
+
+        assert_eq!(card.ops, READ_OPS);
+        assert_eq!(card.contents(), before);
+    }
+
+    #[test]
+    fn the_first_boot_of_a_firmware_trial_appends_started_and_runs_on_trial() {
+        let mut card = FakeCard::slotted(BootSlot::A);
+        card.mark_trial(BootSlot::B, slots::Mode::Tryboot, false);
+        let root_config = card.read("config.txt");
+        let ctl = ctl_on(BootSlot::B);
+
+        let (cfg, _) = step_3(&mut card, BootSlot::B, &ctl).unwrap();
+
+        // Its own slot's configuration, read, and one writable mount after the read-only one.
+        assert_eq!(cfg.hostname, "slot-b");
+        assert_eq!(
+            card.ops,
+            [READ_OPS.as_slice(), WRITE_OPS.as_slice()].concat()
+        );
+        assert_eq!(
+            card.read("qberrypi-trial.txt"),
+            "slot=b\nfrom=a\nbuild=1794470000\nmode=tryboot\nstarted\n"
+        );
+        assert_eq!(card.read("config.txt"), root_config);
+        let view = ctl.view();
+        assert_eq!(view.state, "trial");
+        let trial = ctl.trial().unwrap();
+        assert!(trial.marker.started);
+        assert_eq!(
+            (trial.marker.slot, trial.marker.from, trial.marker.build),
+            (BootSlot::B, BootSlot::A, BUILD_OF_THE_TRIAL)
+        );
+        assert_eq!(view.last, None);
+    }
+
+    #[test]
+    fn the_first_boot_of_a_software_trial_selects_the_slot_it_came_from_then_appends_started() {
+        let mut card = FakeCard::slotted(BootSlot::B);
+        card.mark_trial(BootSlot::B, slots::Mode::Software, false);
+        let ctl = ctl_on(BootSlot::B);
+
+        let (cfg, _) = step_3(&mut card, BootSlot::B, &ctl).unwrap();
+
+        assert_eq!(cfg.hostname, "slot-b");
+        // A restart boots slot a again: its own `config.txt`, byte for byte, is the root one.
+        assert_eq!(card.read("config.txt"), slot_config(BootSlot::A));
+        assert_eq!(
+            card.read("qberrypi-trial.txt"),
+            "slot=b\nfrom=a\nbuild=1794470000\nmode=software\nstarted\n"
+        );
+        assert_eq!(
+            card.ops,
+            [READ_OPS.as_slice(), WRITE_OPS.as_slice()].concat()
+        );
+        assert_eq!(ctl.view().state, "trial");
+    }
+
+    #[test]
+    fn a_software_trial_that_cannot_select_its_way_back_does_not_mark_itself_started() {
+        let mut card = FakeCard::slotted(BootSlot::B);
+        card.mark_trial(BootSlot::B, slots::Mode::Software, false);
+        // The slot it came from has no usable `config.txt` to be copied.
+        card.write("qberrypi-a/config.txt", "arm_64bit=1\n");
+        let ctl = ctl_on(BootSlot::B);
+        let marker_before = card.read("qberrypi-trial.txt");
+
+        let applied = rules(&mut card, BootSlot::B, &ctl);
+
+        assert_eq!(
+            level_of(&applied, "could not be selected again"),
+            Level::Error
+        );
+        // Nothing was changed: not `config.txt`, and not the marker, which would otherwise read
+        // as a confirm that was cut off at the next start.
+        assert_eq!(card.read("config.txt"), slot_config(BootSlot::B));
+        assert_eq!(card.read("qberrypi-trial.txt"), marker_before);
+        // The boot still runs on trial.
+        assert_eq!(ctl.view().state, "trial");
+        assert!(!ctl.trial().unwrap().marker.started);
+    }
+
+    #[test]
+    fn a_trial_whose_card_cannot_be_written_is_an_error_line_and_still_a_trial() {
+        let mut card = FakeCard::slotted(BootSlot::A);
+        card.mark_trial(BootSlot::B, slots::Mode::Tryboot, false);
+        card.mount_fails = true;
+        let ctl = ctl_on(BootSlot::B);
+
+        let applied = rules(&mut card, BootSlot::B, &ctl);
+
+        assert_eq!(level_of(&applied, "the trial runs unmarked"), Level::Error);
+        assert_eq!(ctl.view().state, "trial");
+        assert!(!applied.restart_now);
+    }
+
+    #[test]
+    fn a_confirm_that_was_cut_off_before_it_deleted_the_marker_is_finished() {
+        let mut card = FakeCard::slotted(BootSlot::B);
+        card.mark_trial(BootSlot::B, slots::Mode::Tryboot, true);
+        let ctl = ctl_on(BootSlot::B);
+
+        let applied = rules(&mut card, BootSlot::B, &ctl);
+
+        assert_eq!(level_of(&applied, "cut off"), Level::Info);
+        assert!(!card.has("qberrypi-trial.txt"));
+        // The slot stays selected.
+        assert_eq!(card.read("config.txt"), slot_config(BootSlot::B));
+        assert_eq!(card.ops, WRITE_OPS);
+        let view = ctl.view();
+        assert_eq!(view.state, "idle");
+        assert_eq!(view.last, Some(Outcome::confirmed(BUILD_OF_THE_TRIAL)));
+    }
+
+    #[test]
+    fn a_second_boot_of_the_trial_points_tryboot_txt_at_the_slot_it_came_from_and_restarts_at_once()
+    {
+        let mut card = FakeCard::slotted(BootSlot::A);
+        card.mark_trial(BootSlot::B, slots::Mode::Tryboot, true);
+        // What the update left, and what a firmware that keeps choosing it would boot again.
+        card.write("tryboot.txt", &slot_config(BootSlot::B));
+        let (config, marker) = (card.read("config.txt"), card.read("qberrypi-trial.txt"));
+        let ctl = ctl_on(BootSlot::B);
+
+        let applied = rules(&mut card, BootSlot::B, &ctl);
+
+        assert!(applied.restart_now);
+        assert_eq!(level_of(&applied, "begins again"), Level::Error);
+        // Slot a's own `config.txt`, byte for byte, in one writable mount: even a restart that
+        // the firmware answers with `tryboot.txt` again boots slot a.
+        assert_eq!(card.read("tryboot.txt"), slot_config(BootSlot::A));
+        assert_eq!(card.ops, WRITE_OPS);
+        // Nothing else is written: the marker stays for the boot that reports the rollback.
+        assert_eq!(card.read("config.txt"), config);
+        assert_eq!(card.read("qberrypi-trial.txt"), marker);
+        assert_eq!(ctl.view().state, "idle");
+    }
+
+    #[test]
+    fn a_second_boot_of_the_trial_restarts_even_when_tryboot_txt_cannot_be_pointed() {
+        // The slot it came from has no usable `config.txt` to be copied: refused, nothing written.
+        let mut card = FakeCard::slotted(BootSlot::A);
+        card.mark_trial(BootSlot::B, slots::Mode::Tryboot, true);
+        card.write("tryboot.txt", &slot_config(BootSlot::B));
+        card.write("qberrypi-a/config.txt", "arm_64bit=1\n");
+        let ctl = ctl_on(BootSlot::B);
+
+        let applied = rules(&mut card, BootSlot::B, &ctl);
+
+        assert!(applied.restart_now);
+        assert_eq!(level_of(&applied, "could not be pointed"), Level::Error);
+        assert_eq!(card.read("tryboot.txt"), slot_config(BootSlot::B));
+
+        // The card cannot be mounted writable: the same.
+        let mut card = FakeCard::slotted(BootSlot::A);
+        card.mark_trial(BootSlot::B, slots::Mode::Tryboot, true);
+        card.mount_fails = true;
+        let applied = rules(&mut card, BootSlot::B, &ctl);
+        assert!(applied.restart_now);
+        assert_eq!(level_of(&applied, "could not be pointed"), Level::Error);
+    }
+
+    #[test]
+    fn a_rollback_is_reported_with_its_case_and_the_marker_is_deleted() {
+        // Never started; started and restarted; gave up with a reason of its own.
+        for (started, failed, detail, said) in [
+            (
+                false,
+                None,
+                "the trial build never started",
+                "the trial build never started",
+            ),
+            (
+                true,
+                None,
+                "the trial build restarted before it confirmed",
+                "the trial build restarted before it confirmed",
+            ),
+            (
+                true,
+                Some("the Wi-Fi never associated"),
+                "the Wi-Fi never associated",
+                "the trial build gave up",
+            ),
+        ] {
+            let mut card = FakeCard::slotted(BootSlot::A);
+            let marker = Marker {
+                slot: BootSlot::B,
+                from: BootSlot::A,
+                build: BUILD_OF_THE_TRIAL,
+                mode: slots::Mode::Tryboot,
+                started,
+                failed: failed.map(str::to_owned),
+            };
+            slots::write_marker(card.dir.path(), &marker).unwrap();
+            let ctl = ctl_on(BootSlot::A);
+
+            let applied = rules(&mut card, BootSlot::A, &ctl);
+
+            assert_eq!(level_of(&applied, said), Level::Warn);
+            assert!(lines_text(&applied).contains("build 1794470000 on slot b"));
+            // The reason a build wrote itself is the statistics', and no line of the log has it.
+            assert!(
+                !lines_text(&applied).contains("never associated"),
+                "{applied:?}"
+            );
+            assert!(!card.has("qberrypi-trial.txt"));
+            assert_eq!(card.read("config.txt"), slot_config(BootSlot::A));
+            assert_eq!(card.ops, WRITE_OPS);
+            let view = ctl.view();
+            assert_eq!(view.state, "idle");
+            assert_eq!(
+                view.last,
+                Some(Outcome::rolled_back(BUILD_OF_THE_TRIAL, detail))
+            );
+        }
+    }
+
+    #[test]
+    fn an_unreadable_marker_is_an_error_and_is_deleted_without_a_word_of_it_in_the_log() {
+        for text in [
+            &b"slot=b\nfrom=b\nbuild=1\nmode=tryboot\n"[..],
+            b"\xff\xfe SECRETWORD",
+            b"SECRETWORD",
+        ] {
+            let mut card = FakeCard::slotted(BootSlot::A);
+            fs::write(card.dir.path().join("qberrypi-trial.txt"), text).unwrap();
+            let ctl = ctl_on(BootSlot::A);
+
+            let applied = rules(&mut card, BootSlot::A, &ctl);
+
+            assert_eq!(level_of(&applied, "is unusable"), Level::Error);
+            assert!(!lines_text(&applied).contains("SECRETWORD"));
+            assert!(!card.has("qberrypi-trial.txt"));
+            assert_eq!(ctl.view().last, None);
+        }
+    }
+
+    /// Makes the marker unreadable by an I/O error that deleting it does not share: a link to a
+    /// folder opens, and reading it fails, while the link itself can be removed.
+    fn make_marker_unreadable(card: &FakeCard) {
+        std::os::unix::fs::symlink(
+            card.dir.path().join("qberrypi-a"),
+            card.dir.path().join("qberrypi-trial.txt"),
+        )
+        .unwrap();
+        assert!(slots::read_marker(card.dir.path()).is_err());
+    }
+
+    #[test]
+    fn a_marker_that_cannot_be_read_stays_and_no_trial_is_begun_or_ended() {
+        // The marker may be a software trial's that config.txt already selects (the slot's
+        // build would become permanent if the marker were deleted), a trial's under the firmware,
+        // or the marker of a rollback: none of them can be told, so none is acted on.
+        for (me, selected) in [
+            (BootSlot::B, BootSlot::B),
+            (BootSlot::B, BootSlot::A),
+            (BootSlot::A, BootSlot::A),
+        ] {
+            let mut card = FakeCard::slotted(selected);
+            make_marker_unreadable(&card);
+            let before = card.contents();
+            let ctl = ctl_on(me);
+
+            let applied = rules(&mut card, me, &ctl);
+
+            assert_eq!(level_of(&applied, "could not be read"), Level::Error);
+            assert_eq!(applied.lines.len(), 1, "{applied:?}");
+            assert!(!applied.restart_now);
+            // Nothing is written, nothing deleted: not the marker, and not config.txt.
+            assert!(card.ops.is_empty(), "{:?}", card.ops);
+            assert!(
+                fs::symlink_metadata(card.dir.path().join("qberrypi-trial.txt")).is_ok(),
+                "the marker was deleted"
+            );
+            assert_eq!(card.contents(), before);
+            assert_eq!(card.read("config.txt"), slot_config(selected));
+            // No trial under way, and no outcome: the boot runs, and a trial is not supervised.
+            let view = ctl.view();
+            assert_eq!((view.state, view.trial, view.last), ("idle", None, None));
+        }
+    }
+
+    #[test]
+    fn a_marker_that_is_a_folder_stays_with_one_error_and_the_boot_goes_on() {
+        let mut card = FakeCard::slotted(BootSlot::A);
+        // A folder where the marker should be: opening it works, reading it does not.
+        fs::create_dir(card.dir.path().join("qberrypi-trial.txt")).unwrap();
+        let ctl = ctl_on(BootSlot::A);
+
+        let applied = rules(&mut card, BootSlot::A, &ctl);
+
+        assert_eq!(applied.lines.len(), 1, "{applied:?}");
+        assert_eq!(applied.lines[0].0, Level::Error);
+        assert!(!applied.restart_now);
+        assert!(card.ops.is_empty());
+        assert_eq!(ctl.view().state, "idle");
+    }
+
+    #[test]
+    fn a_config_txt_that_selects_no_slot_is_an_error_and_the_boot_goes_on_as_if_it_selected_this_one()
+     {
+        let mut card = FakeCard::slotted(BootSlot::A);
+        card.write("config.txt", "arm_64bit=1\n");
+        let ctl = ctl_on(BootSlot::B);
+
+        // With no marker: an error and nothing else, and no write.
+        let applied = rules(&mut card, BootSlot::B, &ctl);
+        assert_eq!(applied.lines.len(), 2, "{applied:?}");
+        assert_eq!(applied.lines[0].0, Level::Error);
+        assert_eq!(applied.lines[1].0, Level::Info);
+        assert!(card.ops.is_empty());
+
+        // With the marker of a trial of this slot: `config.txt` is repaired by selecting the slot
+        // the trial came from, which is what a software trial does.
+        card.mark_trial(BootSlot::B, slots::Mode::Tryboot, false);
+        rules(&mut card, BootSlot::B, &ctl);
+        assert_eq!(card.read("config.txt"), slot_config(BootSlot::A));
+        assert_eq!(ctl.view().state, "trial");
+    }
+
+    #[test]
+    fn no_line_of_the_rules_holds_a_value_of_the_configuration_or_of_a_file() {
+        let mut card = FakeCard::slotted(BootSlot::A);
+        card.write(
+            "qberrypi-b/qberrypi.toml",
+            &EXAMPLE.replace("hostname = \"qberrypi\"", "hostname = \"canary-name\""),
+        );
+        card.write("qberrypi-b/tls.pem", "canary-key");
+        card.mark_trial(BootSlot::B, slots::Mode::Tryboot, false);
+        let ctl = ctl_on(BootSlot::B);
+
+        let (cfg, pem) = step_3(&mut card, BootSlot::B, &ctl).unwrap();
+        assert_eq!(cfg.hostname, "canary-name");
+        assert_eq!(pem.as_deref(), Some(&b"canary-key"[..]));
+        let applied = rules(&mut card, BootSlot::B, &ctl);
+
+        let said = lines_text(&applied);
+        assert!(
+            !said.contains("canary") && !said.contains("arm_64bit"),
+            "{said}"
+        );
+    }
+
+    #[test]
+    fn the_rules_run_before_the_configuration_is_parsed() {
+        // A trial build whose configuration does not load has still marked itself started.
+        let mut card = FakeCard::slotted(BootSlot::A);
+        card.write("qberrypi-b/qberrypi.toml", "this is not a configuration");
+        card.mark_trial(BootSlot::B, slots::Mode::Tryboot, false);
+        let ctl = ctl_on(BootSlot::B);
+
+        let error = step_3(&mut card, BootSlot::B, &ctl).unwrap_err();
+
+        assert!(error.contains("qberrypi.toml"), "{error}");
+        assert!(card.read("qberrypi-trial.txt").ends_with("\nstarted\n"));
+        assert_eq!(ctl.view().state, "trial");
+    }
+
+    #[test]
+    fn the_rules_run_before_a_configuration_that_is_missing_is_an_error() {
+        let mut card = FakeCard::slotted(BootSlot::A);
+        card.remove("qberrypi-b/qberrypi.toml");
+        card.mark_trial(BootSlot::B, slots::Mode::Tryboot, false);
+        let ctl = ctl_on(BootSlot::B);
+
+        let error = step_3(&mut card, BootSlot::B, &ctl).unwrap_err();
+
+        assert!(error.starts_with("qberrypi.toml: "), "{error}");
+        assert!(card.read("qberrypi-trial.txt").ends_with("\nstarted\n"));
+    }
+
+    #[test]
+    fn no_slot_boot_restores_raspberry_pi_os_not_in_step_4_and_not_in_the_rescue() {
+        let slot_b = Layout::Slot(BootSlot::B);
+        // The plan of a fatal error: nothing restored, and the log saved only where it is kept.
+        assert!(!restore_on_fatal_in(slot_b, None));
+        assert!(!restore_on_fatal_in(slot_b, Some(&cfg_with_one_shot(true))));
+        assert_eq!(rescue_plan_in(slot_b, None), NEITHER);
+        assert_eq!(
+            rescue_plan_in(slot_b, Some(&cfg_debug(true, false))),
+            NEITHER
+        );
+        assert_eq!(
+            rescue_plan_in(slot_b, Some(&cfg_debug(true, true))),
+            LOG_ONLY
+        );
+        assert_eq!(
+            rescue_plan_in(slot_b, Some(&cfg_debug(false, true))),
+            LOG_ONLY
+        );
+        // The old layout is as it was.
+        assert_eq!(rescue_plan_in(Layout::Old, None), BOTH);
+        assert!(restore_on_fatal_in(
+            Layout::Old,
+            Some(&cfg_with_one_shot(true))
+        ));
+        // A command line that could not be used restores nothing either.
+        assert!(!restore_on_fatal_in(Layout::Unusable, None));
+
+        // Step 4 on a slot card with the one-shot switch on: nothing is restored, the card is not
+        // touched at all unless the log is kept on it.
+        let mut card = FakeCard::slotted(BootSlot::B);
+        card.write("config.pios.txt", PIOS);
+        let before = card.contents();
+        restore_and_save_log_in(
+            slot_b,
+            &cfg_debug(true, false),
+            &mut card,
+            &log_holding(&[]),
+        );
+        assert!(card.ops.is_empty());
+        assert_eq!(card.contents(), before);
+        // The log goes in the slot's own folder, and `config.txt` is left as it is.
+        let log = log_holding(&["a line"]);
+        restore_and_save_log_in(slot_b, &cfg_debug(true, true), &mut card, &log);
+        assert_eq!(card.read("config.txt"), slot_config(BootSlot::B));
+        assert_eq!(card.read("config.pios.txt"), PIOS);
+        assert_eq!(card.read("qberrypi-b/log.txt"), header() + "a line\n");
+        assert!(!card.has("qberrypi/log.txt"));
+        assert_eq!(card.ops, WRITE_OPS);
+    }
+
+    #[test]
+    fn a_fatal_error_on_a_slot_card_saves_the_log_in_the_slots_folder_and_restores_nothing() {
+        let layout = Layout::Slot(BootSlot::A);
+        let mut card = FakeCard::slotted(BootSlot::A);
+        card.write("config.pios.txt", PIOS);
+        let log = log_holding(&["loading brcmfmac: bad signature"]);
+        let cfg = cfg_debug(true, true);
+
+        rescue_with(
+            rescue_plan_in(layout, Some(&cfg)),
+            layout.dir(),
+            &mut card,
+            Some(&log),
+            LONG,
+            &mut || {},
+        );
+
+        assert_eq!(card.read("config.txt"), slot_config(BootSlot::A));
+        assert_eq!(
+            card.read("qberrypi-a/log.txt"),
+            header() + "loading brcmfmac: bad signature\n"
+        );
+        assert_eq!(card.ops, WRITE_OPS);
+
+        // With the log not kept on the card, nothing is written at all.
+        let mut card = FakeCard::slotted(BootSlot::A);
+        let before = card.contents();
+        let cfg = cfg_debug(true, false);
+        rescue_with(
+            rescue_plan_in(layout, Some(&cfg)),
+            layout.dir(),
+            &mut card,
+            Some(&log),
+            LONG,
+            &mut || {},
+        );
+        assert!(card.ops.is_empty());
+        assert_eq!(card.contents(), before);
+    }
+
+    #[test]
+    fn the_board_leaves_for_an_update_at_info_and_for_a_trial_that_gave_up_at_error() {
+        let staged = Reason::Restart(Restart::Tryboot);
+        let (level, line) = leaving_line(&staged);
+        assert_eq!(level, Level::Info);
+        assert!(
+            line.starts_with("update: restarting: ") && line.contains("tryboot"),
+            "{line}"
+        );
+        let software = Reason::Restart(Restart::Plain(Cause::Update));
+        assert_eq!(leaving_line(&software).0, Level::Info);
+        let gave_up = Reason::Restart(Restart::Plain(Cause::GaveUp("no clock".into())));
+        let (level, line) = leaving_line(&gave_up);
+        assert_eq!(level, Level::Error);
+        assert!(line.contains("no clock"), "{line}");
+        // The others are as they were.
+        assert_eq!(
+            leaving_line(&Reason::ReturnAfter),
+            (Level::Info, "returning".to_owned())
+        );
+        assert_eq!(leaving_line(&Reason::NoAssociation).0, Level::Error);
+    }
+
+    #[test]
+    fn only_an_update_staged_for_the_firmwares_trial_restarts_with_tryboot() {
+        assert!(restarts_with_tryboot(&Reason::Restart(Restart::Tryboot)));
+        for plain in [
+            Reason::Restart(Restart::Plain(Cause::Update)),
+            Reason::Restart(Restart::Plain(Cause::GaveUp("x".into()))),
+            Reason::ReturnAfter,
+            Reason::NoAssociation,
+            Reason::ComponentFailed("dns"),
+        ] {
+            assert!(!restarts_with_tryboot(&plain), "{plain:?}");
+        }
     }
 }

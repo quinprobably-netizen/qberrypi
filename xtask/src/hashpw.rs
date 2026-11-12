@@ -66,16 +66,46 @@ fn login_body_len(password: &str) -> usize {
 /// Reads the password from standard input and prints its `password_hash` line on standard
 /// output, with a hint for what to do with it on standard error.
 pub fn run() -> Result<()> {
+    let password = read_password_from_stdin()?;
+    let line = hash_line(&password, random_salt()?)?;
+    println!("{line}");
+    eprintln!("put this line under [api] in qberrypi.toml");
+    Ok(())
+}
+
+/// Reads the password from standard input, which must be a pipe or a file and not a terminal: it
+/// is never typed where it would be shown, and never taken from an argument. Refuses more than
+/// [`MAX_INPUT`] bytes. The buffer is wiped when it is dropped; no error holds any of it.
+pub(crate) fn read_password_from_stdin() -> Result<Zeroizing<Vec<u8>>> {
     let stdin = io::stdin();
     ensure!(
         !stdin.is_terminal(),
         "pipe the password in (for example from the keyring that holds it); it is not read from a terminal, so it is never shown"
     );
-    let password = read_password(stdin.lock())?;
-    let line = hash_line(&password, random_salt()?)?;
-    println!("{line}");
-    eprintln!("put this line under [api] in qberrypi.toml");
-    Ok(())
+    read_password(stdin.lock())
+}
+
+/// The body of the login request that `password` makes, `{"password":"..."}` in compact JSON, in a
+/// buffer that is wiped when it is dropped; an error for a password that could never log in, as
+/// [`hash_line`] refuses one: an empty one, one that is not UTF-8 text, and one whose login
+/// request would exceed [`MAX_BODY`]. No error holds any of the password.
+///
+/// The buffer is made at its full size from the start, so that no copy of the password is left
+/// behind in memory that was freed without being wiped.
+pub(crate) fn login_body(password: &[u8]) -> Result<Zeroizing<Vec<u8>>> {
+    ensure!(!password.is_empty(), "the password is empty");
+    let Ok(text) = std::str::from_utf8(password) else {
+        bail!("the password must be UTF-8 text, as the login sends it in JSON");
+    };
+    let length = login_body_len(text);
+    ensure!(
+        length <= MAX_BODY,
+        "the password is too long: its login request would exceed 4 KiB"
+    );
+    let mut body = Zeroizing::new(Vec::with_capacity(length));
+    serde_json::to_writer(&mut *body, &BTreeMap::from([("password", text)]))
+        .context("cannot make the login request")?;
+    Ok(body)
 }
 
 /// Reads all of `input` as the password, less one trailing `\n` or `\r\n`; refuses more than
@@ -252,5 +282,39 @@ mod tests {
         }
         let e = read_password(Broken(false)).unwrap_err();
         assert!(!format!("{e:#}").contains("secret"), "{e:#}");
+    }
+
+    #[test]
+    fn the_login_body_is_the_compact_json_that_qnet_sends_in_a_buffer_that_never_grew() {
+        for password in [
+            "x",
+            "\"quoted\"",
+            "back\\slash",
+            "p\u{e4}ssw\u{f6}rd \u{1f511}",
+        ] {
+            let body = login_body(password.as_bytes()).unwrap();
+            let expected = serde_json::to_vec(&serde_json::json!({ "password": password }));
+            assert_eq!(
+                body.as_slice(),
+                expected.unwrap().as_slice(),
+                "{password:?}"
+            );
+            assert_eq!(body.capacity(), body.len(), "{password:?}");
+        }
+    }
+
+    #[test]
+    fn a_password_that_could_never_log_in_makes_no_login_body_and_the_error_holds_none_of_it() {
+        assert_eq!(
+            login_body(b"").unwrap_err().to_string(),
+            "the password is empty"
+        );
+        let e = login_body(b"secret\xff").unwrap_err();
+        assert!(e.to_string().contains("UTF-8"), "{e}");
+        assert!(!format!("{e:#}").contains("secret"), "{e:#}");
+        login_body("x".repeat(MAX_BODY - 15).as_bytes()).unwrap();
+        let e = login_body("x".repeat(MAX_BODY - 14).as_bytes()).unwrap_err();
+        assert!(e.to_string().contains("exceed 4 KiB"), "{e}");
+        assert!(!format!("{e:#}").contains("xxx"), "{e:#}");
     }
 }

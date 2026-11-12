@@ -2,12 +2,16 @@
 //! writes `out/qberrypi/`, the folder that goes onto the Pi's boot partition.
 //!
 //! The folder holds the kernel and device tree exactly as fetched, the
-//! initramfs, the two text files the Pi's boot firmware reads, the three
-//! overlay files that go with them, and the checksums of those eight. The
+//! initramfs, the two text files the Pi's boot firmware reads, the four
+//! overlay files that go with them, and the checksums of those nine. The
 //! same inputs always give the same bytes.
 //!
 //! The initramfs also holds the block lists that `cargo xtask fetch-lists` cached, as one
 //! compressed snapshot, so that the Pi can block before it has a network.
+//!
+//! Bluetooth is absent by design: the device-tree node is disabled (`dtoverlay=disable-bt`), the
+//! initramfs holds no Bluetooth module and no Bluetooth firmware, and the build refuses to pack
+//! either ([`refuse_bluetooth`]).
 
 use std::env;
 use std::ffi::OsString;
@@ -19,6 +23,8 @@ use std::process::Command;
 use anyhow::{Context, Result, anyhow, bail};
 use qberrypi::lists::snapshot::{Header, SNAPSHOT_PATH};
 use qberrypi::modules::{DEFAULT_TABLE, MODULE_DIR, MODULE_LIST, ModuleTable};
+use qberrypi::slots::{self, Slot};
+use qberrypi::update::BOOT_FILES_PATH;
 use sha2::{Digest, Sha256};
 
 use crate::cpio::{CpioWriter, Node};
@@ -29,12 +35,15 @@ pub const CMDLINE_TXT: &str = "console=tty1 panic=5 loglevel=4\n";
 
 /// The `config.txt` that makes the Pi's boot firmware start qberrypi from its folder.
 ///
-/// The last three lines are the touchscreen's: the SPI bus, the prefix the
-/// firmware puts before an overlay's file name, and the overlay that describes
-/// the screen on the bus, with `rotate=270` for the way up the screen is
-/// mounted. With `os_prefix=qberrypi/` the firmware reads `qberrypi/ov-README`
-/// and `qberrypi/ov-qb-piscreen.dtbo`: qberrypi's own copy of the overlay,
-/// which an upgrade of Raspberry Pi OS cannot take away or change.
+/// The last four lines are the hardware's: the SPI bus, the prefix the
+/// firmware puts before an overlay's file name, the overlay that describes
+/// the touchscreen on the bus, with `rotate=270` for the way up the screen is
+/// mounted, and the overlay that disables the Bluetooth device-tree node
+/// (`disable-bt`: on a Pi 3 B+ it also gives UART0 back to GPIO 14 and 15, which nothing here
+/// uses). With `os_prefix=qberrypi/` the firmware reads `qberrypi/ov-README`,
+/// `qberrypi/ov-qb-piscreen.dtbo` and `qberrypi/ov-disable-bt.dtbo`: qberrypi's
+/// own copies of the overlays, which an upgrade of Raspberry Pi OS cannot take
+/// away or change.
 pub const CONFIG_TXT: &str = "\
 # qberrypi. Copy config.pios.txt over this file to return to Raspberry Pi OS.
 arm_64bit=1
@@ -45,7 +54,60 @@ disable_overscan=1
 dtparam=spi=on
 overlay_prefix=ov-
 dtoverlay=qb-piscreen,speed=16000000,rotate=270
+dtoverlay=disable-bt
 ";
+
+/// The lines that only a slot's `config.txt` has, for a faster boot. Each is in the official
+/// documentation of the Pi's firmware (`docs/bring-up/m8-only-os.md` has the source of each):
+///
+/// - `disable_splash=1` leaves out the rainbow splash screen;
+/// - `initial_turbo=60` runs the processor in turbo from the start of the firmware until the kernel's
+///   `cpufreq` driver takes over (60 s is the most the firmware takes, and init sets the
+///   `performance` governor within a second of its start anyway);
+/// - `camera_auto_detect=0` and `display_auto_detect=0` keep the firmware from probing for a CSI
+///   camera and a DSI display, which the board does not have (the screen is on the SPI bus);
+/// - `dtparam=audio=off` keeps the onboard audio interface off, which is the base device tree's
+///   default and is stated so that it holds whatever the default is.
+///
+/// Nothing here touches the console, the Wi-Fi, the watchdog or the screen.
+const SLOT_BOOT_LINES: &str = "\
+disable_splash=1
+initial_turbo=60
+camera_auto_detect=0
+display_auto_detect=0
+dtparam=audio=off
+";
+
+/// The first line of a slot's `config.txt`: how slots are selected. It does not name the slot, so
+/// that the two slots' files differ in their `os_prefix=` value alone, as the digest of the boot
+/// files (`slots::slot_a_form`) takes them to.
+const SLOT_COMMENT: &str = "# qberrypi, two slots. A slot is selected by copying its config.txt over the root config.txt (tryboot.txt for one trial boot).";
+
+/// The `config.txt` of a slot on a card with two slots: [`CONFIG_TXT`] with the slot's own
+/// `os_prefix=` and a first comment line about how slots are selected in place of the one about
+/// returning to Raspberry Pi OS, which is not on such a card.
+///
+/// The firmware reads only the root `config.txt`, which is a copy of the selected slot's file
+/// (`slots::select`); this one is the record of the slot, which init checks before it copies it
+/// (`slots::check_slot_config`). Its overlay lines are [`CONFIG_TXT`]'s, so with `os_prefix` the
+/// firmware reads the slot's own `ov-` files. After [`CONFIG_TXT`]'s lines come the boot-speed
+/// lines that only a slot has ([`SLOT_BOOT_LINES`]); the old layout's text is left as it was.
+pub fn slot_config_txt(slot: Slot) -> String {
+    let (_comment, rest) = CONFIG_TXT
+        .split_once('\n')
+        .expect("CONFIG_TXT has a first line");
+    let selects = format!("os_prefix={}", slot.os_prefix());
+    let rest = rest.replacen("os_prefix=qberrypi/", &selects, 1);
+    format!("{SLOT_COMMENT}\n{rest}{SLOT_BOOT_LINES}")
+}
+
+/// The `cmdline.txt` of a slot on a card with two slots: [`CMDLINE_TXT`]'s line and the
+/// argument that names the slot, which is how the running build knows which slot it is
+/// (`slots::Slot::from_cmdline`).
+pub fn slot_cmdline_txt(slot: Slot) -> String {
+    let line = CMDLINE_TXT.strip_suffix('\n').unwrap_or(CMDLINE_TXT);
+    format!("{line} {}\n", slot.cmdline_arg())
+}
 
 /// The folder under the repository root that `cargo xtask fetch` extracts into.
 const EXTRACTED_DIR: &str = "vendor-cache/extracted";
@@ -64,8 +126,14 @@ const INITRAMFS: &str = "initramfs8";
 /// The overlay files of the boot folder, as `cargo xtask fetch` leaves them under `vendor-cache/extracted/`.
 ///
 /// `CONFIG_TXT`'s `overlay_prefix=ov-` is what makes the firmware ask for these names, in this
-/// order: the README that says the overlays are here, the map, and the screen's overlay.
-const OVERLAY_FILES: [&str; 3] = ["ov-README", "ov-overlay_map.dtb", "ov-qb-piscreen.dtbo"];
+/// order: the README that says the overlays are here, the map, the screen's overlay and the one
+/// that disables Bluetooth.
+const OVERLAY_FILES: [&str; 4] = [
+    "ov-README",
+    "ov-overlay_map.dtb",
+    "ov-qb-piscreen.dtbo",
+    "ov-disable-bt.dtbo",
+];
 
 /// The kernel module files a module table names, in the table's order.
 ///
@@ -75,6 +143,89 @@ const OVERLAY_FILES: [&str; 3] = ["ov-README", "ov-overlay_map.dtb", "ov-qb-pisc
 fn module_files(table: &str) -> Result<Vec<String>> {
     let table = ModuleTable::parse(table).map_err(|e| anyhow!("the module table: {e}"))?;
     Ok(table.files().map(str::to_owned).collect())
+}
+
+/// The kernel modules of Bluetooth, by name; `-` and `_` are the same in a module's name.
+const BLUETOOTH_MODULES: [&str; 10] = [
+    "bluetooth",
+    "btbcm",
+    "hci_uart",
+    "btsdio",
+    "bnep",
+    "rfcomm",
+    "hidp",
+    "btusb",
+    "btintel",
+    "btrtl",
+];
+
+/// Whether `module` (a module's name, or its file's name without `.ko` and what follows) is one of
+/// Bluetooth's: those of [`BLUETOOTH_MODULES`], and any `hci_*`.
+fn is_bluetooth_module(module: &str) -> bool {
+    let name = module.to_ascii_lowercase().replace('-', "_");
+    BLUETOOTH_MODULES.contains(&name.as_str()) || name.starts_with("hci_")
+}
+
+/// Why `path`, a name or a path in the initramfs or in the module table, is Bluetooth's: a module of
+/// Bluetooth by its name, a file under the kernel's Bluetooth folders, or a firmware file of a
+/// Bluetooth chip (`*.hcd`). `None` for anything else.
+fn bluetooth_reason(path: &str) -> Option<&'static str> {
+    let lower = path.to_ascii_lowercase();
+    if lower.contains("kernel/net/bluetooth/") || lower.contains("kernel/drivers/bluetooth/") {
+        return Some("a file of the kernel's Bluetooth folders");
+    }
+    if lower.ends_with(".hcd") {
+        return Some("a Bluetooth firmware file (.hcd)");
+    }
+    let file = lower.rsplit('/').next().unwrap_or(&lower);
+    let module = file.split(".ko").next().unwrap_or(file);
+    if file.contains(".ko") && is_bluetooth_module(module) {
+        return Some("a Bluetooth kernel module");
+    }
+    None
+}
+
+/// Refuses an initramfs that would hold any Bluetooth: a module of the table (its name, its file or a
+/// module it needs), a firmware file, or any entry, whatever its path. Bluetooth is absent from
+/// qberrypi by design: the device-tree node is disabled (`dtoverlay=disable-bt`), and with no module
+/// and no firmware there is nothing that could start it. The error names each offender, and that
+/// it is Bluetooth's.
+pub fn refuse_bluetooth(table: &str, entries: &[(String, Node)]) -> Result<()> {
+    let mut found: Vec<String> = Vec::new();
+    let table = ModuleTable::parse(table).map_err(|e| anyhow!("the module table: {e}"))?;
+    for entry in table.entries() {
+        let named = [&entry.name, &entry.file]
+            .into_iter()
+            .chain(entry.deps.iter())
+            .any(|name| is_bluetooth_module(name.trim_end_matches(".ko")));
+        if named || bluetooth_reason(&entry.file).is_some() {
+            found.push(format!(
+                "module table entry {} (a Bluetooth kernel module)",
+                entry.name
+            ));
+        }
+    }
+    for (path, node) in entries {
+        let target = match node {
+            Node::Symlink { target } => Some(*target),
+            _ => None,
+        };
+        for text in std::iter::once(path.as_str()).chain(target) {
+            if let Some(reason) = bluetooth_reason(text) {
+                found.push(format!("{path} ({reason})"));
+                break;
+            }
+        }
+    }
+    if found.is_empty() {
+        return Ok(());
+    }
+    bail!(
+        "the initramfs would hold Bluetooth: {}. qberrypi has no Bluetooth by design (no modules, no \
+         firmware, the device-tree node disabled by dtoverlay=disable-bt): take it out of the module \
+         table and the firmware list",
+        found.join("; ")
+    )
 }
 
 /// Where the build leaves the time it gave the executable as its build time.
@@ -149,7 +300,7 @@ const TYPEFACE_LICENCE_PATH: &str = "licenses/JetBrainsMono-OFL.txt";
 const TYPEFACE_LICENCE: &[u8] = include_bytes!("../../crates/qb-panel/fonts/OFL.txt");
 
 /// The directories of the initramfs, each after the one it lies in.
-const DIRS: [&str; 10] = [
+const DIRS: [&str; 12] = [
     "dev",
     "proc",
     "sys",
@@ -160,6 +311,8 @@ const DIRS: [&str; 10] = [
     "lib/firmware",
     "lib/firmware/brcm",
     "licenses",
+    "etc",
+    "etc/qberrypi",
 ];
 
 /// How hard zstd works on the initramfs. The kernel unpacks any level.
@@ -177,6 +330,30 @@ pub struct ExtractedFiles {
     modules: Vec<(String, Vec<u8>)>,
     /// Each of `FIRMWARE` with its contents.
     firmware: Vec<(&'static str, Vec<u8>)>,
+    /// The file the initramfs holds at `BOOT_FILES_PATH`: the digest of the boot files of this
+    /// build (see [`boot_files_digest`]) and a line end.
+    boot_files: String,
+}
+
+/// The digest of the boot files of a build, as the running build reports it and the update
+/// receiver compares it (`slots::boot_files_digest`): the kernel, the device tree and the four
+/// overlay files as they are, and `config.txt` and `cmdline.txt` in their slot a forms, which
+/// `slot_config_txt` and `slot_cmdline_txt` make. The slot b forms give the same digest.
+pub fn boot_files_digest(
+    kernel: &[u8],
+    dtb: &[u8],
+    overlays: &[(&str, Vec<u8>)],
+) -> Result<String> {
+    let config = slot_config_txt(Slot::A);
+    let cmdline = slot_cmdline_txt(Slot::A);
+    let mut entries: Vec<(&str, &[u8])> = vec![
+        (KERNEL, kernel),
+        (DEVICE_TREE, dtb),
+        ("cmdline.txt", cmdline.as_bytes()),
+        ("config.txt", config.as_bytes()),
+    ];
+    entries.extend(overlays.iter().map(|(name, data)| (*name, &data[..])));
+    slots::boot_files_digest(entries).map_err(|e| anyhow!("the digest of the boot files: {e}"))
 }
 
 impl ExtractedFiles {
@@ -208,12 +385,14 @@ impl ExtractedFiles {
         for name in FIRMWARE {
             firmware.push((name, read(&format!("firmware/{name}"))?));
         }
+        let boot_files = format!("{}\n", boot_files_digest(&kernel, &dtb, &overlays)?);
         Ok(Self {
             kernel,
             dtb,
             overlays,
             modules,
             firmware,
+            boot_files,
         })
     }
 }
@@ -261,6 +440,11 @@ pub fn initramfs_entries<'a>(
         entries.push((path.to_owned(), Node::Symlink { target }));
     }
     entries.push((TYPEFACE_LICENCE_PATH.to_owned(), file(TYPEFACE_LICENCE)));
+    // What the build reports as its boot files: init reads it and `/api/v1/stats` tells it.
+    entries.push((
+        BOOT_FILES_PATH.trim_start_matches('/').to_owned(),
+        file(extracted.boot_files.as_bytes()),
+    ));
     entries.push((
         SNAPSHOT_PATH.trim_start_matches('/').to_owned(),
         file(snapshot),
@@ -402,7 +586,9 @@ fn write_boot_folder(
     snapshot: &[u8],
     epoch: u64,
 ) -> Result<PathBuf> {
-    let initramfs = pack_initramfs(&initramfs_entries(extracted, init, snapshot))?;
+    let entries = initramfs_entries(extracted, init, snapshot);
+    refuse_bluetooth(DEFAULT_TABLE, &entries)?;
+    let initramfs = pack_initramfs(&entries)?;
     let mut files: Vec<(&str, &[u8])> = vec![
         (KERNEL, &extracted.kernel),
         (DEVICE_TREE, &extracted.dtb),
@@ -473,8 +659,8 @@ mod tests {
     use std::os::unix::fs::symlink;
     use tempfile::TempDir;
 
-    /// The twenty files `cargo xtask fetch` leaves under `vendor-cache/extracted/`.
-    const FETCHED: [&str; 20] = [
+    /// The twenty-one files `cargo xtask fetch` leaves under `vendor-cache/extracted/`.
+    const FETCHED: [&str; 21] = [
         "kernel8.img",
         "bcm2710-rpi-3-b-plus.dtb",
         "modules/rfkill.ko",
@@ -495,10 +681,11 @@ mod tests {
         "ov-README",
         "ov-overlay_map.dtb",
         "ov-qb-piscreen.dtbo",
+        "ov-disable-bt.dtbo",
     ];
 
     /// Every path of the initramfs in order, each after the letter `ls -l` shows for its kind.
-    const INITRAMFS: [&str; 34] = [
+    const INITRAMFS: [&str; 37] = [
         "d dev",
         "d proc",
         "d sys",
@@ -509,6 +696,8 @@ mod tests {
         "d lib/firmware",
         "d lib/firmware/brcm",
         "d licenses",
+        "d etc",
+        "d etc/qberrypi",
         "c dev/console",
         "c dev/null",
         "- init",
@@ -532,6 +721,7 @@ mod tests {
         "l lib/firmware/brcm/brcmfmac43455-sdio.raspberrypi,3-model-b-plus.clm_blob",
         "l lib/firmware/brcm/brcmfmac43455-sdio.raspberrypi,3-model-b-plus.txt",
         "- licenses/JetBrainsMono-OFL.txt",
+        "- etc/qberrypi/boot-files",
         "- blocklist.zst",
     ];
 
@@ -629,21 +819,32 @@ mod tests {
     #[test]
     fn config_txt_takes_overlays_from_qberrypis_own_folder() {
         assert_eq!(
-            CONFIG_TXT.lines().rev().take(3).collect::<Vec<_>>(),
+            CONFIG_TXT.lines().rev().take(4).collect::<Vec<_>>(),
             [
+                "dtoverlay=disable-bt",
                 "dtoverlay=qb-piscreen,speed=16000000,rotate=270",
                 "overlay_prefix=ov-",
                 "dtparam=spi=on"
             ]
         );
-        // Still no graphics overlay.
+        // Still no graphics overlay: the screen's, and the one that disables Bluetooth.
         assert_eq!(
             CONFIG_TXT
                 .lines()
                 .filter(|l| l.starts_with("dtoverlay="))
-                .count(),
-            1
+                .collect::<Vec<_>>(),
+            [
+                "dtoverlay=qb-piscreen,speed=16000000,rotate=270",
+                "dtoverlay=disable-bt"
+            ]
         );
+        // Every overlay it asks for is one of the build's own files, by the prefix's name.
+        for overlay in ["qb-piscreen", "disable-bt"] {
+            assert!(
+                OVERLAY_FILES.contains(&format!("ov-{overlay}.dtbo").as_str()),
+                "{overlay}"
+            );
+        }
     }
 
     #[test]
@@ -658,9 +859,197 @@ mod tests {
              disable_overscan=1\n\
              dtparam=spi=on\n\
              overlay_prefix=ov-\n\
-             dtoverlay=qb-piscreen,speed=16000000,rotate=270\n"
+             dtoverlay=qb-piscreen,speed=16000000,rotate=270\n\
+             dtoverlay=disable-bt\n"
         );
         assert_eq!(CMDLINE_TXT, "console=tty1 panic=5 loglevel=4\n");
+    }
+
+    #[test]
+    fn a_slots_config_txt_is_the_shipped_one_with_its_own_prefix_and_a_line_about_slots() {
+        for slot in [Slot::A, Slot::B] {
+            let text = slot_config_txt(slot);
+            // It passes the check that init makes before it copies the file over the root one.
+            assert_eq!(slots::check_slot_config(text.as_bytes(), slot), Ok(()));
+            assert_eq!(slots::selected_slot(text.as_bytes()), Ok(slot));
+            assert!(text.ends_with('\n'));
+            // The first line is a comment about slots, and says nothing of Raspberry Pi OS.
+            let first = text.lines().next().unwrap();
+            assert!(first.starts_with('#') && first.contains("slot"), "{first}");
+            assert!(!first.contains("Raspberry Pi OS"), "{first}");
+            // Every other line is the shipped one, but the prefix, and then come the lines that
+            // only a slot has.
+            let others: Vec<&str> = text.lines().skip(1).collect();
+            let shipped: Vec<&str> = CONFIG_TXT.lines().skip(1).collect();
+            assert_eq!(
+                others.len(),
+                shipped.len() + SLOT_BOOT_LINES.lines().count()
+            );
+            assert_eq!(
+                others[shipped.len()..],
+                SLOT_BOOT_LINES.lines().collect::<Vec<_>>()
+            );
+            for (ours, theirs) in others.iter().zip(&shipped) {
+                if theirs.starts_with("os_prefix=") {
+                    assert_eq!(*ours, format!("os_prefix={}", slot.os_prefix()));
+                } else {
+                    assert_eq!(ours, theirs);
+                }
+            }
+        }
+        // The two slots' files differ in the value of the prefix alone.
+        assert_eq!(
+            slot_config_txt(Slot::A).replace("os_prefix=qberrypi-a/", "os_prefix=qberrypi-b/"),
+            slot_config_txt(Slot::B)
+        );
+        // The shipped text of the old layout is untouched.
+        assert!(CONFIG_TXT.lines().any(|l| l == "os_prefix=qberrypi/"));
+    }
+
+    #[test]
+    fn a_slots_config_txt_has_the_boot_speed_lines_and_the_old_layouts_has_none_of_them() {
+        // Each line is one the official documentation has (the sources are in m8-only-os.md).
+        assert_eq!(
+            SLOT_BOOT_LINES.lines().collect::<Vec<_>>(),
+            [
+                "disable_splash=1",
+                "initial_turbo=60",
+                "camera_auto_detect=0",
+                "display_auto_detect=0",
+                "dtparam=audio=off",
+            ]
+        );
+        for slot in [Slot::A, Slot::B] {
+            let text = slot_config_txt(slot);
+            for line in SLOT_BOOT_LINES.lines() {
+                assert_eq!(text.lines().filter(|l| *l == line).count(), 1, "{line}");
+                assert!(!CONFIG_TXT.lines().any(|l| l == line), "{line}");
+            }
+            // What the slot must keep: the 64-bit kernel and its initramfs, the screen, the
+            // Bluetooth overlay, and no line that moves the console, the Wi-Fi or the watchdog.
+            for line in [
+                "arm_64bit=1",
+                "kernel=kernel8.img",
+                "initramfs initramfs8 followkernel",
+                "dtparam=spi=on",
+                "dtoverlay=qb-piscreen,speed=16000000,rotate=270",
+                "dtoverlay=disable-bt",
+            ] {
+                assert!(text.lines().any(|l| l == line), "{line}");
+            }
+            for key in [
+                "boot_delay",
+                "enable_uart",
+                "dtoverlay=miniuart-bt",
+                "dtparam=watchdog",
+                "dtoverlay=disable-wifi",
+                "dtparam=sd_",
+                "force_turbo",
+                "arm_freq",
+                "over_voltage",
+            ] {
+                assert!(!text.contains(key), "{key}");
+            }
+        }
+        // `initial_turbo` is the most the firmware takes, 60 seconds.
+        assert!(SLOT_BOOT_LINES.contains("initial_turbo=60\n"));
+    }
+
+    #[test]
+    fn a_slots_cmdline_txt_is_the_shipped_line_and_the_argument_that_names_the_slot() {
+        assert_eq!(
+            slot_cmdline_txt(Slot::A),
+            "console=tty1 panic=5 loglevel=4 qberrypi.slot=a\n"
+        );
+        assert_eq!(
+            slot_cmdline_txt(Slot::B),
+            "console=tty1 panic=5 loglevel=4 qberrypi.slot=b\n"
+        );
+        for slot in [Slot::A, Slot::B] {
+            let text = slot_cmdline_txt(slot);
+            assert_eq!(slots::check_slot_cmdline(text.as_bytes(), slot), Ok(()));
+            assert_eq!(Slot::from_cmdline(&text), Ok(Some(slot)));
+        }
+        // The old layout's command line names no slot.
+        assert_eq!(Slot::from_cmdline(CMDLINE_TXT), Ok(None));
+    }
+
+    /// What the digest of the boot files of the fixture is, from the files of `slot` as a slot
+    /// image holds them.
+    fn digest_of_slot(extracted: &ExtractedFiles, slot: Slot) -> String {
+        let (config, cmdline) = (slot_config_txt(slot), slot_cmdline_txt(slot));
+        let mut entries: Vec<(&str, &[u8])> = vec![
+            (KERNEL, &extracted.kernel),
+            (DEVICE_TREE, &extracted.dtb),
+            ("config.txt", config.as_bytes()),
+            ("cmdline.txt", cmdline.as_bytes()),
+            // Files that are not boot files are not in the digest.
+            ("initramfs8", b"whatever"),
+            ("qberrypi.toml", b"whatever"),
+            ("tls.pem", b"whatever"),
+        ];
+        entries.extend(extracted.overlays.iter().map(|(n, d)| (*n, &d[..])));
+        slots::boot_files_digest(entries).unwrap()
+    }
+
+    #[test]
+    fn the_initramfs_packs_the_digest_of_the_boot_files_of_both_slots() {
+        let extracted = fixture_extracted();
+        let entries = initramfs_entries(&extracted, b"ELF", b"SNAPSHOT");
+        let packed = file_data(&entries, "etc/qberrypi/boot-files");
+
+        let text = std::str::from_utf8(packed).unwrap();
+        let digest = text.strip_suffix('\n').expect("a line end");
+        assert_eq!(digest.len(), 64);
+        assert_eq!(digest, digest_of_slot(&extracted, Slot::A));
+        assert_eq!(digest, digest_of_slot(&extracted, Slot::B));
+        assert_eq!(digest, extracted.boot_files.trim_end());
+        // The path is the one init reads, and init reads exactly this file.
+        assert_eq!(BOOT_FILES_PATH, "/etc/qberrypi/boot-files");
+        let tmp = tempfile::tempdir().unwrap();
+        let on_disk = tmp.path().join("boot-files");
+        fs::write(&on_disk, packed).unwrap();
+        assert_eq!(
+            qberrypi::update::read_boot_files(&on_disk).as_deref(),
+            Some(digest)
+        );
+        // Not something to run.
+        assert!(
+            entries
+                .iter()
+                .any(|(path, node)| path == "etc/qberrypi/boot-files"
+                    && matches!(node, Node::File { mode, .. } if mode & 0o111 == 0))
+        );
+    }
+
+    #[test]
+    fn the_packed_digest_changes_with_any_boot_file_and_not_with_the_initramfs_or_the_snapshot() {
+        let packed = |extracted: &ExtractedFiles, init: &[u8], snapshot: &[u8]| {
+            let entries = initramfs_entries(extracted, init, snapshot);
+            file_data(&entries, "etc/qberrypi/boot-files").to_vec()
+        };
+        let base = fixture_extracted();
+        let reference = packed(&base, b"ELF", b"SNAPSHOT");
+        // The executable and the block lists make the build, not the boot files.
+        assert_eq!(packed(&base, b"ANOTHER ELF", b"OTHER SNAPSHOT"), reference);
+        let changed = |edit: &dyn Fn(&mut ExtractedFiles)| {
+            let mut extracted = fixture_extracted();
+            edit(&mut extracted);
+            extracted.boot_files = format!(
+                "{}\n",
+                boot_files_digest(&extracted.kernel, &extracted.dtb, &extracted.overlays).unwrap()
+            );
+            packed(&extracted, b"ELF", b"SNAPSHOT")
+        };
+        assert_ne!(changed(&|e| e.kernel.push(1)), reference);
+        assert_ne!(changed(&|e| e.dtb.push(1)), reference);
+        for which in 0..3 {
+            assert_ne!(
+                changed(&|e| e.overlays[which].1.push(1)),
+                reference,
+                "{which}"
+            );
+        }
     }
 
     #[test]
@@ -905,6 +1294,7 @@ mod tests {
                 "initramfs8",
                 "kernel8.img",
                 "ov-README",
+                "ov-disable-bt.dtbo",
                 "ov-overlay_map.dtb",
                 "ov-qb-piscreen.dtbo",
             ]
@@ -940,6 +1330,7 @@ mod tests {
                 "ov-README",
                 "ov-overlay_map.dtb",
                 "ov-qb-piscreen.dtbo",
+                "ov-disable-bt.dtbo",
             ]
         );
         let check = Command::new("sha256sum")
@@ -952,19 +1343,24 @@ mod tests {
             String::from_utf8_lossy(&check.stdout)
                 .matches(": OK")
                 .count(),
-            8
+            9
         );
     }
 
     #[test]
-    fn the_boot_folder_holds_the_three_overlay_files_and_their_checksums() {
+    fn the_boot_folder_holds_the_four_overlay_files_and_their_checksums() {
         let root = fixture_root();
         let extracted = fixture_extracted();
 
         let out = write_boot_folder(root.path(), &extracted, b"ELF", b"SNAPSHOT", EPOCH).unwrap();
 
         let sums = fs::read_to_string(out.join("SHA256SUMS")).unwrap();
-        for name in ["ov-README", "ov-overlay_map.dtb", "ov-qb-piscreen.dtbo"] {
+        for name in [
+            "ov-README",
+            "ov-overlay_map.dtb",
+            "ov-qb-piscreen.dtbo",
+            "ov-disable-bt.dtbo",
+        ] {
             // Each is in the folder as the package had it, and listed with its own digest.
             assert_eq!(fs::read(out.join(name)).unwrap(), name.as_bytes(), "{name}");
             let line = sha256sums(&[(name, name.as_bytes())]);
@@ -986,9 +1382,9 @@ mod tests {
         assert_eq!(fs::read_to_string(record).unwrap(), "1700000123\n");
         assert_eq!(read_build_epoch(root.path()).unwrap(), EPOCH);
         // What goes onto the card, and what its checksums list, is as it was.
-        assert_eq!(files_under(&out).len(), 9);
+        assert_eq!(files_under(&out).len(), 10);
         let sums = fs::read_to_string(out.join("SHA256SUMS")).unwrap();
-        assert_eq!(sums.lines().count(), 8);
+        assert_eq!(sums.lines().count(), 9);
         assert!(!sums.contains("build-epoch"));
     }
 
@@ -1053,6 +1449,127 @@ mod tests {
     }
 
     #[test]
+    fn the_image_holds_no_bluetooth_module_and_no_bluetooth_firmware() {
+        let extracted = fixture_extracted();
+        let entries = initramfs_entries(&extracted, b"ELF", b"SNAPSHOT");
+        refuse_bluetooth(DEFAULT_TABLE, &entries).unwrap();
+        // What the image does hold is told from what it must not: none of its files is Bluetooth's.
+        for (path, _) in &entries {
+            assert_eq!(bluetooth_reason(path), None, "{path}");
+        }
+        for module in module_files(DEFAULT_TABLE).unwrap() {
+            assert!(
+                !is_bluetooth_module(module.trim_end_matches(".ko")),
+                "{module}"
+            );
+        }
+        for firmware in FIRMWARE {
+            assert_eq!(bluetooth_reason(firmware), None, "{firmware}");
+        }
+    }
+
+    #[test]
+    fn a_bluetooth_module_in_the_module_table_stops_the_build() {
+        let extracted = fixture_extracted();
+        let entries = initramfs_entries(&extracted, b"ELF", b"SNAPSHOT");
+        for module in [
+            "bluetooth",
+            "btbcm",
+            "hci_uart",
+            "btsdio",
+            "bnep",
+            "rfcomm",
+            "hidp",
+            "btusb",
+            "btintel",
+            "btrtl",
+            "hci_vhci",
+        ] {
+            // As an entry of its own, and as something an entry needs.
+            let own = format!("{DEFAULT_TABLE}{module}\t{module}.ko\t\n");
+            let error = format!("{:#}", refuse_bluetooth(&own, &entries).unwrap_err());
+            assert!(error.contains("would hold Bluetooth"), "{module}: {error}");
+            assert!(
+                error.contains(&format!("module table entry {module}")),
+                "{module}: {error}"
+            );
+            assert!(error.contains("dtoverlay=disable-bt"), "{module}: {error}");
+            let file_only = format!("{DEFAULT_TABLE}extra\t{module}.ko\t\n");
+            let error = format!("{:#}", refuse_bluetooth(&file_only, &entries).unwrap_err());
+            assert!(
+                error.contains("module table entry extra"),
+                "{module}: {error}"
+            );
+        }
+        // A dash is an underscore, and capitals are small letters.
+        let dashed = format!("{DEFAULT_TABLE}x\thci-uart.ko\t\n");
+        assert!(refuse_bluetooth(&dashed, &entries).is_err());
+        // A table that does not parse is its own error, and not a pass.
+        let error = refuse_bluetooth("broken\n", &entries).unwrap_err();
+        assert!(format!("{error:#}").contains("module table"), "{error:#}");
+    }
+
+    #[test]
+    fn bluetooth_firmware_or_a_module_of_the_bluetooth_folders_in_the_image_stops_the_build() {
+        let extracted = fixture_extracted();
+        let mut entries = initramfs_entries(&extracted, b"ELF", b"SNAPSHOT");
+        refuse_bluetooth(DEFAULT_TABLE, &entries).unwrap();
+        for path in [
+            "lib/firmware/brcm/BCM4345C0.hcd",
+            "lib/firmware/brcm/bcm43xx.HCD",
+            "lib/firmware/anything.hcd",
+            "lib/modules/btbcm.ko",
+            "lib/modules/hci_uart.ko",
+            "lib/modules/kernel/net/bluetooth/rfcomm/rfcomm.ko",
+            "lib/modules/kernel/drivers/bluetooth/other.ko",
+            "lib/modules/btusb.ko.xz",
+        ] {
+            entries.push((
+                path.to_owned(),
+                Node::File {
+                    data: b"x",
+                    mode: 0o644,
+                },
+            ));
+            let error = format!(
+                "{:#}",
+                refuse_bluetooth(DEFAULT_TABLE, &entries).unwrap_err()
+            );
+            assert!(error.contains(&format!("{path} (")), "{path}: {error}");
+            entries.pop();
+        }
+        // A link to one is as much Bluetooth's as the file.
+        entries.push((
+            "lib/firmware/brcm/BCM4345C0-raspberrypi.hcd".to_owned(),
+            Node::Symlink { target: "x" },
+        ));
+        assert!(refuse_bluetooth(DEFAULT_TABLE, &entries).is_err());
+        entries.pop();
+        entries.push((
+            "lib/firmware/brcm/link".to_owned(),
+            Node::Symlink {
+                target: "BCM4345C0.hcd",
+            },
+        ));
+        assert!(refuse_bluetooth(DEFAULT_TABLE, &entries).is_err());
+    }
+
+    #[test]
+    fn the_boot_folder_is_not_written_for_an_initramfs_that_would_hold_bluetooth() {
+        let root = fixture_root();
+        let mut extracted = fixture_extracted();
+        extracted
+            .firmware
+            .push(("brcm/BCM4345C0.hcd", b"patch".to_vec()));
+
+        let error =
+            write_boot_folder(root.path(), &extracted, b"ELF", b"SNAPSHOT", EPOCH).unwrap_err();
+
+        assert!(format!("{error:#}").contains("BCM4345C0.hcd"), "{error:#}");
+        assert!(!root.path().join(BOOT_FOLDER).exists());
+    }
+
+    #[test]
     fn the_fetched_modules_that_are_read_are_those_of_the_default_table() {
         let extracted = fixture_extracted();
         let read: Vec<&str> = extracted.modules.iter().map(|(name, _)| &**name).collect();
@@ -1084,6 +1601,7 @@ mod tests {
                 "qberrypi/initramfs8",
                 "qberrypi/kernel8.img",
                 "qberrypi/ov-README",
+                "qberrypi/ov-disable-bt.dtbo",
                 "qberrypi/ov-overlay_map.dtb",
                 "qberrypi/ov-qb-piscreen.dtbo",
             ]

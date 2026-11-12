@@ -6,11 +6,17 @@
 //! A query that is blocked as a threat raises an alert, through the sink of the watch that is set
 //! ([`Dns::set_watch`]), at most once an hour for each client and name ([`threat`]).
 //!
+//! A client that is exempt ([`Dns::exempt`], which the device watch keeps) is held to the threat
+//! lists alone: its ads are let through, and its threats are blocked as anyone's. In the list mode
+//! that is a client whose address is in the exempt set; in the exempt-by-default mode it is every
+//! client but one whose address is fully blocked.
+//!
 //! Nothing here logs a name that is asked for, or an address that asks.
 
 pub mod client;
 pub mod clients;
 pub mod dot;
+pub mod exempt;
 pub mod listen;
 pub mod threat;
 pub mod upstream;
@@ -24,13 +30,16 @@ use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use qb_dns::{Action, BlockSet, Now, Pending, Resolver, ThreatHit, Transport, UpstreamOutcome};
+use qb_dns::{
+    Action, BlockSet, Filter, Now, Pending, Resolver, ThreatHit, Transport, UpstreamOutcome,
+};
 use tokio::sync::Semaphore;
 
 use crate::alerts::{Alert, Severity};
 use crate::lane::LaneFeed;
 use crate::watch::{Watch, rebind};
 use clients::Clients;
+use exempt::Exemption;
 use threat::{THREAT_KIND, ThreatThrottle};
 use upstream::Upstreams;
 
@@ -136,6 +145,9 @@ pub struct Dns {
     first_answer: AtomicBool,
     /// Where the names that the front panel shows are offered, once there is a panel.
     lane: OnceLock<Arc<LaneFeed>>,
+    /// Whose questions are held to the threat lists alone: the mode and the sets of addresses
+    /// that the device watch keeps; read before the resolver is locked.
+    exempt: Arc<Exemption>,
 }
 
 impl Dns {
@@ -181,6 +193,7 @@ impl Dns {
             clients: Mutex::default(),
             first_answer: AtomicBool::new(false),
             lane: OnceLock::new(),
+            exempt: Arc::default(),
         });
         dns.sync_utc_offset();
         dns
@@ -270,6 +283,23 @@ impl Dns {
         self.watch.get().map_or(0, |watch| watch.feed.dropped())
     }
 
+    /// Who is exempt from the ads lists now: the device watch writes the mode and the addresses,
+    /// and every question of a client is checked against them before the resolver is locked.
+    pub fn exempt(&self) -> &Arc<Exemption> {
+        &self.exempt
+    }
+
+    /// Which lists a question of `client` is held to: the threat lists alone for a client that is
+    /// exempt ([`Exemption::is_exempt`]), and every list for any other, and for this program's own
+    /// (`None`) in either mode. In the list mode with the exempt set empty it costs two relaxed
+    /// atomic loads; in the exempt-by-default mode, one load and a look in the blocked set.
+    fn filter_for(&self, client: Option<IpAddr>) -> Filter {
+        match client {
+            Some(client) if self.exempt.is_exempt(client) => Filter::ThreatsOnly,
+            _ => Filter::All,
+        }
+    }
+
     /// Offers the names that clients ask for to `lane` from now on. Set once: a second feed is
     /// ignored, and the first stays.
     pub fn set_lane(&self, lane: Arc<LaneFeed>) {
@@ -310,22 +340,29 @@ impl Dns {
     /// decides on its receive loop. The query that this counts is offered to the lane, if there
     /// is one, which does not wait either.
     ///
+    /// The client's address is checked against the exemption first, before the resolver is
+    /// locked: an exempt client is held to the threat lists alone ([`Filter::ThreatsOnly`]).
+    /// The check is one relaxed load of the mode and one look in a set of addresses: with the
+    /// set empty, one relaxed atomic load more; with addresses in it, one read lock that only a
+    /// change of the set waits on, and a binary search. Neither allocates.
+    ///
     /// A query that is blocked as a threat may raise an alert on the watch's sink, after the
-    /// resolver is unlocked ([`Dns::threat_hit`]). Every other answer costs one test of an
-    /// `Option` more than the resolver's own decision: no lock, no allocation.
+    /// resolver is unlocked ([`Dns::threat_hit`]). Every other answer costs that check and one
+    /// test of an `Option` more than the resolver's own decision: no other lock, no allocation.
     pub(crate) fn decide_from(
         &self,
         packet: &[u8],
         transport: Transport,
         client: Option<IpAddr>,
     ) -> Action {
+        let filter = self.filter_for(client);
         let now = self.now();
         let mut resolver = self.resolver();
         let lane = self
             .lane
             .get()
             .map(|lane| (lane, resolver.stats().total().queries));
-        let (action, hit) = resolver.handle_query_threat(packet, transport, now);
+        let (action, hit) = resolver.handle_query_filtered(packet, transport, now, filter);
         if let Some((lane, before)) = lane {
             lane.offer_latest(&resolver, before, now);
         }
@@ -743,6 +780,130 @@ mod tests {
         let raised = sink.raised_after(2).await;
         assert_eq!(raised.len(), 2);
         assert_eq!(raised[1].2, None);
+    }
+
+    /// The addresses that a client of `dns` gets for `name` A over UDP: through the upstream, the
+    /// cache or the block, as the resolver decides for `from`.
+    async fn addresses_for(dns: &Arc<Dns>, name: &str, from: Option<IpAddr>) -> Vec<Ipv4Addr> {
+        let packet = client::query(5, name, TYPE_A).unwrap();
+        let reply = dns.answer_for(&packet, Transport::Udp, from).await.unwrap();
+        client::read_answer(&reply, 5).unwrap().v4()
+    }
+
+    #[tokio::test]
+    async fn an_exempt_client_gets_its_ads_and_keeps_its_threats_blocked() {
+        let up = FakeUpstream::start(Reply::Answer(ip("192.0.2.10"))).await;
+        let sink = Arc::new(RecordingSink::default());
+        let dns = Dns::new(
+            threat_set(),
+            Upstreams::with(vec![up.addr], ms(300), ms(600)),
+            Box::new(FixedOffset(0)),
+        );
+        let (feed, _events) = watch::feed();
+        dns.set_watch(Watch::for_test(feed, sink.clone()));
+        dns.exempt()
+            .listed()
+            .replace(&[Ipv4Addr::new(192, 0, 2, 20)]);
+        let mapped = Some(IpAddr::V6(Ipv4Addr::new(192, 0, 2, 20).to_ipv6_mapped()));
+        let blocked = [Ipv4Addr::UNSPECIFIED];
+
+        // The exempt client gets the ad from the upstream, and then from the cache, in either
+        // form of its address.
+        let ad = "ads.example.com";
+        assert_eq!(
+            addresses_for(&dns, ad, client(20)).await,
+            [ip("192.0.2.10")]
+        );
+        assert_eq!(addresses_for(&dns, ad, mapped).await, [ip("192.0.2.10")]);
+        assert_eq!(up.udp_queries(), 1);
+        // Another client, and a lookup of our own, are blocked all the same.
+        assert_eq!(addresses_for(&dns, ad, client(21)).await, blocked);
+        assert_eq!(addresses_for(&dns, ad, None).await, blocked);
+        // A threat is blocked for the exempt client too, and raises its alert.
+        let threat = "x.bad.example.net";
+        assert_eq!(addresses_for(&dns, threat, client(20)).await, blocked);
+        assert_eq!(
+            sink.raised_after(1).await,
+            [("threat", "high", client(20), threat.to_owned())]
+        );
+        let total = dns.resolver().stats().total();
+        assert_eq!(
+            (
+                total.queries,
+                total.forwarded,
+                total.cache_hits,
+                total.blocked
+            ),
+            (5, 1, 1, 3)
+        );
+        assert_eq!(total.blocked_threat, 1);
+
+        // Once the set is empty again, the client is blocked like any other.
+        dns.exempt().listed().replace(&[]);
+        assert_eq!(addresses_for(&dns, ad, client(20)).await, blocked);
+        assert_eq!(up.udp_queries(), 1);
+    }
+
+    #[tokio::test]
+    async fn exempt_by_default_lets_ads_through_for_all_but_the_blocked_and_never_threats() {
+        let up = FakeUpstream::start(Reply::Answer(ip("192.0.2.10"))).await;
+        let sink = Arc::new(RecordingSink::default());
+        let dns = Dns::new(
+            threat_set(),
+            Upstreams::with(vec![up.addr], ms(300), ms(600)),
+            Box::new(FixedOffset(0)),
+        );
+        let (feed, _events) = watch::feed();
+        dns.set_watch(Watch::for_test(feed, sink.clone()));
+        // 192.0.2.1 is the router and .30 a device on the block list; .20 is on the exempt list,
+        // which this mode does not read.
+        dns.exempt()
+            .blocked()
+            .replace(&[Ipv4Addr::new(192, 0, 2, 1), Ipv4Addr::new(192, 0, 2, 30)]);
+        dns.exempt()
+            .listed()
+            .replace(&[Ipv4Addr::new(192, 0, 2, 20)]);
+        dns.exempt().set_by_default(true);
+        let v6 = Some(IpAddr::V6("2001:db8::7".parse().unwrap()));
+        let blocked_mapped = Some(IpAddr::V6(Ipv4Addr::new(192, 0, 2, 30).to_ipv6_mapped()));
+        let blocked = [Ipv4Addr::UNSPECIFIED];
+        let ad = "ads.example.com";
+
+        // A client nobody named, and one that asks over IPv6, get the ad.
+        assert_eq!(
+            addresses_for(&dns, ad, client(21)).await,
+            [ip("192.0.2.10")]
+        );
+        assert_eq!(addresses_for(&dns, ad, v6).await, [ip("192.0.2.10")]);
+        assert_eq!(
+            addresses_for(&dns, ad, client(20)).await,
+            [ip("192.0.2.10")]
+        );
+        // The blocked device in either form, the router and our own lookups are blocked.
+        for from in [client(30), blocked_mapped, client(1), None] {
+            assert_eq!(addresses_for(&dns, ad, from).await, blocked, "{from:?}");
+        }
+        // A threat is blocked for an exempt client too, and raises its alert.
+        let threat = "x.bad.example.net";
+        assert_eq!(addresses_for(&dns, threat, client(21)).await, blocked);
+        assert_eq!(
+            sink.raised_after(1).await,
+            [("threat", "high", client(21), threat.to_owned())]
+        );
+        // The mode flips at once: back in the list mode only .20 is exempt.
+        dns.exempt().set_by_default(false);
+        assert_eq!(addresses_for(&dns, ad, client(21)).await, blocked);
+        assert_eq!(
+            addresses_for(&dns, ad, client(20)).await,
+            [ip("192.0.2.10")]
+        );
+        dns.exempt().set_by_default(true);
+        assert_eq!(
+            addresses_for(&dns, ad, client(22)).await,
+            [ip("192.0.2.10")]
+        );
+        assert_eq!(addresses_for(&dns, ad, client(30)).await, blocked);
+        assert_eq!(up.udp_queries(), 1);
     }
 
     #[tokio::test]
@@ -1546,5 +1707,141 @@ mod tests {
         }
         let hook = started.elapsed().as_nanos() as f64 / (BATCH * BATCHES) as f64;
         println!("the hook alone, blocked, room in the lane: {hook:.0} ns");
+    }
+
+    /// The ns per call of `decide_from` on `packet`, asked by `client`, over one batch.
+    fn batch_ns_from(dns: &Dns, packet: &[u8], client: Option<IpAddr>) -> f64 {
+        let started = Instant::now();
+        for _ in 0..BATCH {
+            black_box(dns.decide_from(black_box(packet), Transport::Udp, black_box(client)));
+        }
+        started.elapsed().as_nanos() as f64 / BATCH as f64
+    }
+
+    /// Run in release:
+    /// `cargo test -p qberrypi --release -- --ignored decide_cost_with_an_exempt_set --nocapture`.
+    ///
+    /// The cost that the exemption adds to `decide`, which runs on the listener's receive loop:
+    /// for a cached, a blocked and a forwarded name, asked by this program (no client, so no
+    /// check); in the list mode by a client with the set empty, and with 64 addresses in the set
+    /// by a client that is not one of them and by one that is; and in the exempt-by-default mode
+    /// by a client with the blocked set empty, and with 64 addresses in it by one of them and by
+    /// one that is not. An exempt client's "blocked" name is an ad, so it is let through and
+    /// forwarded. The seven take turns in batches of 2,000 calls, the one that goes first
+    /// changing every time, and each is the median of its batches.
+    #[ignore = "a timing, for release builds"]
+    #[tokio::test]
+    async fn decide_cost_with_an_exempt_set() {
+        const ALLOWED_NS: f64 = 200.0;
+
+        let up = FakeUpstream::start(Reply::Answer(ip("192.0.2.10"))).await;
+        let upstreams = || Upstreams::with(vec![up.addr], ms(300), ms(600));
+        let denied = || lists::from_config(&["ads.example.org".to_owned()], &[]).build();
+        let make = || Dns::new(denied(), upstreams(), Box::new(FixedOffset(0)));
+        let (empty, full, open, guarded) = (make(), make(), make(), make());
+        let set: Vec<Ipv4Addr> = (1..=64)
+            .map(|host| Ipv4Addr::new(192, 0, 2, host))
+            .collect();
+        full.exempt().listed().replace(&set);
+        assert_eq!(full.exempt().listed().len(), 64);
+        open.exempt().set_by_default(true);
+        guarded.exempt().blocked().replace(&set);
+        guarded.exempt().set_by_default(true);
+        let (other, exempt) = (client(200), client(33));
+
+        let cached = client::query(5, "cached.example.org", TYPE_A).unwrap();
+        for dns in [&empty, &full, &open, &guarded] {
+            assert!(dns.answer(&cached, Transport::Udp).await.is_some());
+        }
+        let blocked = client::query(6, "ads.example.org", TYPE_A).unwrap();
+        let forwarded = client::query(7, "elsewhere.example.org", TYPE_A).unwrap();
+        for (dns, from, forwards) in [
+            (&full, other, false),
+            (&full, exempt, true),
+            (&open, other, true),
+            (&guarded, exempt, false),
+            (&guarded, other, true),
+        ] {
+            let action = dns.decide_from(&blocked, Transport::Udp, from);
+            assert_eq!(matches!(action, Action::Forward(_)), forwards, "{from:?}");
+        }
+
+        println!("decide, median ns per query over {BATCHES} batches of {BATCH}:");
+        println!(
+            "{:<11}{:>11}{:>11}{:>11}{:>11}{:>11}{:>11}{:>11}",
+            "",
+            "no client",
+            "list empty",
+            "64, other",
+            "64, exempt",
+            "dflt empty",
+            "64, block",
+            "64, other"
+        );
+        let columns: [(&Dns, Option<IpAddr>); 7] = [
+            (&empty, None),
+            (&empty, other),
+            (&full, other),
+            (&full, exempt),
+            (&open, other),
+            (&guarded, exempt),
+            (&guarded, other),
+        ];
+        let rows: [(&str, &[u8]); 3] = [
+            ("cached", &cached),
+            ("blocked", &blocked),
+            ("forwarded", &forwarded),
+        ];
+        for (label, packet) in rows {
+            let mut times: [Vec<f64>; 7] = Default::default();
+            for batch in 0..BATCHES {
+                for turn in 0..columns.len() {
+                    let column = (batch + turn) % columns.len();
+                    let (dns, from) = columns[column];
+                    times[column].push(batch_ns_from(dns, packet, from));
+                }
+            }
+            let [none, empty_set, miss, hit, open_ns, held, free] = times.map(median);
+            println!(
+                "{label:<11}{none:>11.0}{empty_set:>11.0}{miss:>11.0}{hit:>11.0}{open_ns:>11.0}{held:>11.0}{free:>11.0}"
+            );
+            // A check that leaves the client held to every list may add little: the list mode's
+            // empty set and its miss, and the blocked client of the exempt-by-default mode.
+            for (adds, what) in [
+                (empty_set - none, "list empty"),
+                (miss - none, "64, other"),
+                (held - none, "default, 64, blocked"),
+            ] {
+                assert!(
+                    adds < ALLOWED_NS,
+                    "{label}, {what}: the check adds {adds:.0} ns a query, which is over {ALLOWED_NS}"
+                );
+            }
+        }
+
+        // The check by itself: `is_exempt` in the list mode on an empty set, and on the set of
+        // 64 for an address that is not in it and one that is; and in the exempt-by-default mode
+        // on an empty blocked set, and on the set of 64 for an address in it and one that is not.
+        let calls = BATCH * BATCHES;
+        let check_ns = |exemption: &Exemption, addr: IpAddr| {
+            let started = Instant::now();
+            for _ in 0..calls {
+                black_box(exemption.is_exempt(black_box(addr)));
+            }
+            started.elapsed().as_nanos() as f64 / calls as f64
+        };
+        let (other, exempt) = (other.unwrap(), exempt.unwrap());
+        println!(
+            "is_exempt alone, list mode: set empty {:.1} ns, 64 and not in it {:.1} ns, 64 and in it {:.1} ns",
+            check_ns(empty.exempt(), other),
+            check_ns(full.exempt(), other),
+            check_ns(full.exempt(), exempt),
+        );
+        println!(
+            "is_exempt alone, exempt by default: set empty {:.1} ns, 64 and in it {:.1} ns, 64 and not in it {:.1} ns",
+            check_ns(open.exempt(), other),
+            check_ns(guarded.exempt(), exempt),
+            check_ns(guarded.exempt(), other),
+        );
     }
 }

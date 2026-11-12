@@ -14,8 +14,10 @@
 //! | `GET alerts[?since=R]` | `{"rev", "suppressed", "alerts": [...]}`: the alerts that changed after revision `R` |
 //! | `POST alerts/{id}/ack` | `{"acked": true}`, or 404 for an id that no alert has |
 //! | `PUT alerts/acked` | `{"restored": n}` for `{"acked": ["<16 hex>", ...]}` |
-//! | `GET devices` | `{"known_list", "devices": [...]}` |
+//! | `GET devices` | `{"known_list", "devices": [...], "exempt_macs": [...], "exempt_default", "block_macs": [...]}` |
 //! | `PUT devices/known` | `{"known": n}` for `{"known": ["02:00:00:00:00:01", ...], "append": false, "complete": true}` |
+//! | `PUT devices/exempt` | `{"exempt": n}` for `{"exempt": ["02:00:00:00:00:01", ...]}` |
+//! | `PUT devices/policy` | `{"exempt_default": b, "block": n}` for `{"exempt_default": b, "block": ["02:00:00:00:00:01", ...]}` |
 //!
 //! The known list may be longer than a body can be (4 KiB, about 230 addresses), so it can be sent in
 //! chunks: `append` (default false) says whether the chunk is added to the list that is being sent
@@ -24,13 +26,38 @@
 //! list is `{append: false, complete: false}`, then `{append: true, complete: false}` as often as
 //! it takes, then `{append: true, complete: true}`. The answer is the size of the set so far.
 //!
+//! The exempt list names the devices whose questions are held to the threat lists alone: their ads
+//! are let through, and their threats are blocked and alerted on as anyone's. `PUT devices/exempt`
+//! replaces the list that the desktop pushes, and leaves the configuration's `watch.exempt` alone;
+//! `[]` clears it, and the answer is how many different addresses it holds. It fits one body, at
+//! [`MAX_EXEMPT`] addresses, so it is never sent in chunks: more different ones than that are a
+//! 400. The list lives in memory only, and the desktop sends it again after the board starts. In
+//! `GET devices` `exempt_macs` is both lists together, sorted, in lower case, with the addresses
+//! that have not been heard yet.
+//!
+//! The policy turns the exempt-by-default mode on or off: with it on, every client is held to the
+//! threat lists alone but the devices on a block list, the router and the Pi, and the exempt lists
+//! have no effect; with it off, the block lists have none. `PUT devices/policy` takes both keys,
+//! `exempt_default` and `block`, and replaces the pushed mode, which is in force from then on, and
+//! the pushed block list, which sits beside the configuration's `watch.block` as the pushed exempt
+//! list sits beside `watch.exempt`; the answer is the mode and how many different addresses the
+//! pushed block list holds, at most [`MAX_BLOCK`]. Until a policy is pushed the configuration's
+//! `watch.exempt_default` is in force. It lives in memory only, like the exempt list. In
+//! `GET devices` `exempt_default` is the mode in force and `block_macs` both block lists together,
+//! as `exempt_macs` is; each device has `blocked`, whether it is on a block list, and `exempt`,
+//! whether it is exempt in the mode in force: on an exempt list in the list mode, and in the
+//! exempt-by-default mode on no block list and claiming neither the router's address nor the Pi's.
+//!
 //! A body is read whole before anything changes: one bad key or address, or a flag that is not
 //! `true` or `false`, is a 400 and nothing is restored or replaced. No answer to a bad body repeats a piece of it. The lock of the device
-//! inventory is held for a copy of its view or for `set_known`, and never while JSON is made; the
-//! alerts that `set_known` makes are raised into the store after the lock is released.
+//! inventory is held for a copy of its view, for `set_known`, `set_exempt` or `set_policy`, and
+//! never while
+//! JSON is made; the alerts that `set_known` makes are raised into the store after the lock is
+//! released.
 //!
 //! [`Api::handle`]: super::routes::Api::handle
 
+use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Instant;
 
@@ -39,7 +66,7 @@ use serde_json::{Value, json};
 use super::hex;
 use super::http::Reply;
 use super::routes::{Error, METHOD_NOT_ALLOWED, NO_VALID_JSON, NOT_FOUND, error, ok};
-use crate::watch::devices::{DeviceView, Devices, with_devices};
+use crate::watch::devices::{DeviceView, Devices, MAX_BLOCK, MAX_EXEMPT, with_devices};
 use crate::watch::frames::Mac;
 use crate::watch::store::{AlertStore, AlertView, key_hex};
 
@@ -55,6 +82,18 @@ const BAD_ACKED: Error = (
 const BAD_KNOWN: Error = (
     "bad_request",
     "\"known\" must be a list of Ethernet addresses",
+);
+/// A body of `PUT devices/exempt` that is not an object with `exempt` a list of addresses, or
+/// whose list has more than [`MAX_EXEMPT`] different ones.
+const BAD_EXEMPT: Error = (
+    "bad_request",
+    "\"exempt\" must be a list of at most 64 different Ethernet addresses",
+);
+/// A body of `PUT devices/policy` that is not an object with `exempt_default` true or false and
+/// `block` a list of addresses, or whose list has more than [`MAX_BLOCK`] different ones.
+const BAD_POLICY: Error = (
+    "bad_request",
+    "\"exempt_default\" must be true or false and \"block\" a list of at most 64 different Ethernet addresses",
 );
 /// A body of `PUT devices/known` whose `append` or `complete` is there and is not true or false.
 const BAD_FLAG: Error = (
@@ -92,6 +131,10 @@ enum Route {
     Devices,
     /// `devices/known`.
     Known,
+    /// `devices/exempt`.
+    Exempt,
+    /// `devices/policy`.
+    Policy,
 }
 
 impl Route {
@@ -103,6 +146,8 @@ impl Route {
             "alerts/acked" => Route::Restore,
             "devices" => Route::Devices,
             "devices/known" => Route::Known,
+            "devices/exempt" => Route::Exempt,
+            "devices/policy" => Route::Policy,
             _ => {
                 let id = rest.strip_prefix("alerts/")?.strip_suffix("/ack")?;
                 if id.is_empty() || !id.bytes().all(|byte| byte.is_ascii_digit()) {
@@ -118,7 +163,7 @@ impl Route {
         match self {
             Route::Alerts | Route::Devices => "GET",
             Route::Ack(_) => "POST",
-            Route::Restore | Route::Known => "PUT",
+            Route::Restore | Route::Known | Route::Exempt | Route::Policy => "PUT",
         }
     }
 }
@@ -149,6 +194,8 @@ pub(super) fn handle(
         Route::Restore => restore(&watch.alerts, body, started),
         Route::Devices => devices(&watch.devices, started),
         Route::Known => known(watch, body, started),
+        Route::Exempt => exempt(watch, body, started),
+        Route::Policy => policy(watch, body, started),
     }
 }
 
@@ -226,14 +273,23 @@ fn restore(store: &AlertStore, body: &[u8], started: Instant) -> Reply {
     ok(json!({ "restored": store.restore_acked(&keys) }), started)
 }
 
-/// `GET devices`: whether a known list has come, and every device, the one seen last first.
+/// `GET devices`: whether a known list has come, every device, the one seen last first, the MACs
+/// of both exempt lists, the mode in force and the MACs of both block lists.
 ///
 /// The inventory is locked for the copy of its view, and the JSON is made after.
 fn devices(devices: &Mutex<Devices>, started: Instant) -> Reply {
     let view = lock(devices).view();
     let list: Vec<Value> = view.devices.iter().map(device_json).collect();
+    let exempt: Vec<String> = view.exempt_macs.iter().map(ToString::to_string).collect();
+    let block: Vec<String> = view.block_macs.iter().map(ToString::to_string).collect();
     ok(
-        json!({ "known_list": view.known_list.as_str(), "devices": list }),
+        json!({
+            "known_list": view.known_list.as_str(),
+            "devices": list,
+            "exempt_macs": exempt,
+            "exempt_default": view.exempt_default,
+            "block_macs": block,
+        }),
         started,
     )
 }
@@ -248,6 +304,8 @@ fn device_json(device: &DeviceView) -> Value {
         "first_unix": device.first_unix,
         "last_unix": device.last_unix,
         "known": device.known,
+        "exempt": device.exempt,
+        "blocked": device.blocked,
     })
 }
 
@@ -282,6 +340,67 @@ fn known(watch: &QbpWatch, body: &[u8], started: Instant) -> Reply {
         devices.load_known(macs, append, complete)
     });
     ok(json!({ "known": kept }), started)
+}
+
+/// `PUT devices/exempt`: replaces the pushed exempt list with the addresses of the body, each once,
+/// and answers how many different ones it holds now. They are all read before the inventory is
+/// touched: one that is not an Ethernet address, or more than [`MAX_EXEMPT`] different ones, is a
+/// 400 and the list stays as it was.
+fn exempt(watch: &QbpWatch, body: &[u8], started: Instant) -> Reply {
+    let texts = match strings(body, "exempt", BAD_EXEMPT) {
+        Ok(texts) => texts,
+        Err(refusal) => return error(400, refusal, started),
+    };
+    let mut macs = BTreeSet::new();
+    for text in &texts {
+        let Ok(mac) = text.parse::<Mac>() else {
+            return error(400, BAD_EXEMPT, started);
+        };
+        macs.insert(mac);
+        if macs.len() > MAX_EXEMPT {
+            return error(400, BAD_EXEMPT, started);
+        }
+    }
+    let kept = with_devices(&watch.devices, &*watch.alerts, |devices| {
+        devices.set_exempt(macs.into_iter().collect())
+    });
+    ok(json!({ "exempt": kept }), started)
+}
+
+/// `PUT devices/policy`: replaces the pushed mode with `exempt_default` and the pushed block list
+/// with the addresses of `block`, each once, and answers the mode and how many different addresses
+/// the list holds now. Both keys are required, and all is read before the inventory is touched: a
+/// mode that is not true or false, an address that is not an Ethernet address, or more than
+/// [`MAX_BLOCK`] different ones, is a 400 and the policy stays as it was.
+fn policy(watch: &QbpWatch, body: &[u8], started: Instant) -> Reply {
+    let value = match serde_json::from_slice::<Value>(body) {
+        Ok(value) => value,
+        Err(_) => return error(400, NO_VALID_JSON, started),
+    };
+    let Some(exempt_default) = value.get("exempt_default").and_then(Value::as_bool) else {
+        return error(400, BAD_POLICY, started);
+    };
+    let texts = match string_list(&value, "block", BAD_POLICY) {
+        Ok(texts) => texts,
+        Err(refusal) => return error(400, refusal, started),
+    };
+    let mut macs = BTreeSet::new();
+    for text in &texts {
+        let Ok(mac) = text.parse::<Mac>() else {
+            return error(400, BAD_POLICY, started);
+        };
+        macs.insert(mac);
+        if macs.len() > MAX_BLOCK {
+            return error(400, BAD_POLICY, started);
+        }
+    }
+    let kept = with_devices(&watch.devices, &*watch.alerts, |devices| {
+        devices.set_policy(exempt_default, macs.into_iter().collect())
+    });
+    ok(
+        json!({ "exempt_default": exempt_default, "block": kept }),
+        started,
+    )
 }
 
 /// The boolean field `field` of the JSON object `body`: `default` when it is not there, and `None`
@@ -671,8 +790,12 @@ mod tests {
         let (status, body) = setup.send("GET", "/api/qbp/devices", "");
         assert_eq!(status, 200);
         assert_eq!(
-            (&body["known_list"], &body["devices"]),
-            (&json!("waiting"), &json!([]))
+            (&body["known_list"], &body["devices"], &body["exempt_macs"]),
+            (&json!("waiting"), &json!([]), &json!([]))
+        );
+        assert_eq!(
+            (&body["exempt_default"], &body["block_macs"]),
+            (&json!(false), &json!([]))
         );
         assert!(body["took"].is_number());
 
@@ -683,9 +806,275 @@ mod tests {
             body["devices"],
             json!([{
                 "mac": "02:00:00:00:00:05", "ipv4": ["192.0.2.40"], "hostname": "laptop",
-                "first_unix": UNIX, "last_unix": UNIX, "known": false,
+                "first_unix": UNIX, "last_unix": UNIX, "known": false, "exempt": false,
+                "blocked": false,
             }])
         );
+    }
+
+    /// Sends `body` to `PUT devices/exempt`, and gives the status and the answer.
+    fn put_exempt(setup: &Setup, body: &str) -> (u16, Value) {
+        setup.send("PUT", "/api/qbp/devices/exempt", body)
+    }
+
+    /// The `exempt_macs` that `GET devices` tells, and each device's MAC with its `exempt`.
+    fn exempt_state(setup: &Setup) -> (Value, Vec<(String, bool)>) {
+        let (status, body) = setup.send("GET", "/api/qbp/devices", "");
+        assert_eq!(status, 200);
+        let devices = body["devices"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|d| {
+                (
+                    d["mac"].as_str().unwrap().to_owned(),
+                    d["exempt"].as_bool().unwrap(),
+                )
+            })
+            .collect();
+        (body["exempt_macs"].clone(), devices)
+    }
+
+    #[test]
+    fn an_exempt_list_replaces_the_pushed_one_and_leaves_the_configurations_alone() {
+        let setup = Setup::new();
+        setup.hear(mac(5), "laptop");
+        setup.hear(mac(6), "phone");
+        with_devices(&setup.watch.devices, &*setup.watch.alerts, |devices| {
+            devices.set_exempt_config(vec![mac(9)]);
+        });
+
+        let (status, body) = put_exempt(
+            &setup,
+            r#"{"exempt": ["02:00:00:00:00:05", "02-00-00-00-00-05", "02:00:00:00:00:AA"]}"#,
+        );
+
+        // Two different addresses: the first two spell the same one.
+        assert_eq!((status, &body["exempt"]), (200, &json!(2)));
+        assert!(body["took"].is_number());
+        let (macs, devices) = exempt_state(&setup);
+        // Both lists, sorted, in lower case, the ones not heard yet included.
+        assert_eq!(
+            macs,
+            json!([
+                "02:00:00:00:00:05",
+                "02:00:00:00:00:09",
+                "02:00:00:00:00:aa"
+            ])
+        );
+        assert_eq!(devices, [(mac_text(6), false), (mac_text(5), true)]);
+        // An empty list clears the pushed one; the configuration's stays.
+        let (status, body) = put_exempt(&setup, r#"{"exempt": [], "other": 1}"#);
+        assert_eq!((status, &body["exempt"]), (200, &json!(0)));
+        let (macs, devices) = exempt_state(&setup);
+        assert_eq!(macs, json!(["02:00:00:00:00:09"]));
+        assert!(devices.iter().all(|(_, exempt)| !exempt));
+        // Exemption raises nothing, and is no part of the known list.
+        assert!(setup.listed().is_empty());
+        assert_eq!(list_state(&setup), json!("waiting"));
+    }
+
+    #[test]
+    fn an_exempt_list_of_64_different_addresses_is_the_most() {
+        let setup = Setup::new();
+        let list = |n: u8| -> Vec<String> { (0..n).map(mac_text).collect() };
+        // 64 different ones, each twice: 64.
+        let twice: Vec<String> = list(64).into_iter().chain(list(64)).collect();
+        let (status, body) = put_exempt(&setup, &json!({ "exempt": twice }).to_string());
+        assert_eq!((status, &body["exempt"]), (200, &json!(64)));
+        // One more is a 400, and the list that was there stays.
+        let (status, body) = put_exempt(&setup, &json!({ "exempt": list(65) }).to_string());
+        assert_eq!((status, error_key(&body)), (400, "bad_request"));
+        assert!(!body.to_string().contains("02:00"), "{body}");
+        assert_eq!(exempt_state(&setup).0.as_array().unwrap().len(), 64);
+    }
+
+    #[test]
+    fn a_bad_exempt_list_changes_nothing() {
+        let setup = Setup::new();
+        setup.hear(mac(5), "laptop");
+        put_exempt(&setup, r#"{"exempt": ["02:00:00:00:00:05"]}"#);
+        let bad = [
+            "",
+            "02:00:00:00:00:05",
+            r#"{"exempt": ["#,
+            "[]",
+            "{}",
+            r#"{"known": []}"#,
+            r#"{"exempt": null}"#,
+            r#"{"exempt": "02:00:00:00:00:05"}"#,
+            r#"{"exempt": [5]}"#,
+            r#"{"exempt": ["02:00:00:00:00:05", null]}"#,
+            r#"{"exempt": ["02:00:00:00:00:05", "02:00:00:00:00:0"]}"#,
+            r#"{"exempt": ["02:00:00:00:00:05", "02:00:00:00:00:0g"]}"#,
+            r#"{"exempt": ["02:00:00:00:00:05", "02:00-00:00:00:06"]}"#,
+            r#"{"exempt": ["02:00:00:00:00:05", "020000000006"]}"#,
+            r#"{"exempt": ["02:00:00:00:00:05", " 02:00:00:00:00:06"]}"#,
+        ];
+        for body in bad {
+            let (status, answer) = put_exempt(&setup, body);
+            assert_eq!(status, 400, "{body}");
+            assert_eq!(error_key(&answer), "bad_request", "{body}");
+            // The refusal does not repeat an address.
+            assert!(!answer.to_string().contains("02:00"), "{body}");
+        }
+        let (macs, devices) = exempt_state(&setup);
+        assert_eq!(macs, json!(["02:00:00:00:00:05"]));
+        assert_eq!(devices, [(mac_text(5), true)]);
+    }
+
+    /// Sends `body` to `PUT devices/policy`, and gives the status and the answer.
+    fn put_policy(setup: &Setup, body: &str) -> (u16, Value) {
+        setup.send("PUT", "/api/qbp/devices/policy", body)
+    }
+
+    /// What `GET devices` tells of the policy: `exempt_default`, `block_macs`, and each device's
+    /// MAC with its `exempt` and `blocked`.
+    fn policy_state(setup: &Setup) -> (Value, Value, Vec<(String, bool, bool)>) {
+        let (status, body) = setup.send("GET", "/api/qbp/devices", "");
+        assert_eq!(status, 200);
+        let devices = body["devices"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|d| {
+                (
+                    d["mac"].as_str().unwrap().to_owned(),
+                    d["exempt"].as_bool().unwrap(),
+                    d["blocked"].as_bool().unwrap(),
+                )
+            })
+            .collect();
+        (
+            body["exempt_default"].clone(),
+            body["block_macs"].clone(),
+            devices,
+        )
+    }
+
+    #[test]
+    fn a_policy_turns_exempt_by_default_on_and_replaces_the_pushed_block_list() {
+        let setup = Setup::new();
+        setup.hear(mac(5), "laptop");
+        setup.hear(mac(6), "phone");
+        with_devices(&setup.watch.devices, &*setup.watch.alerts, |devices| {
+            devices.set_block_config(vec![mac(9)]);
+            devices.set_exempt_config(vec![mac(5)]);
+        });
+        // The list mode: the exempt list says who is exempt, the block list only who is on it.
+        let (on, block, devices) = policy_state(&setup);
+        assert_eq!((on, block), (json!(false), json!(["02:00:00:00:00:09"])));
+        assert_eq!(
+            devices,
+            [(mac_text(6), false, false), (mac_text(5), true, false)]
+        );
+
+        let (status, body) = put_policy(
+            &setup,
+            r#"{"exempt_default": true, "block": ["02:00:00:00:00:06", "02-00-00-00-00-06", "02:00:00:00:00:AA"], "other": 1}"#,
+        );
+
+        assert_eq!(
+            (status, &body["exempt_default"], &body["block"]),
+            (200, &json!(true), &json!(2))
+        );
+        assert!(body["took"].is_number());
+        let (on, block, devices) = policy_state(&setup);
+        assert_eq!(on, json!(true));
+        // Both lists, sorted, in lower case, the ones not heard yet included.
+        assert_eq!(
+            block,
+            json!([
+                "02:00:00:00:00:06",
+                "02:00:00:00:00:09",
+                "02:00:00:00:00:aa"
+            ])
+        );
+        // Every device is exempt but the blocked one; the exempt list is kept, and has no say.
+        assert_eq!(
+            devices,
+            [(mac_text(6), false, true), (mac_text(5), true, false)]
+        );
+        let (_, body) = setup.send("GET", "/api/qbp/devices", "");
+        assert_eq!(body["exempt_macs"], json!(["02:00:00:00:00:05"]));
+        // Off again, with an empty list: the exempt list rules, and the configuration's block
+        // list stays.
+        let (status, body) = put_policy(&setup, r#"{"exempt_default": false, "block": []}"#);
+        assert_eq!(
+            (status, &body["exempt_default"], &body["block"]),
+            (200, &json!(false), &json!(0))
+        );
+        let (on, block, devices) = policy_state(&setup);
+        assert_eq!((on, block), (json!(false), json!(["02:00:00:00:00:09"])));
+        assert_eq!(
+            devices,
+            [(mac_text(6), false, false), (mac_text(5), true, false)]
+        );
+        // A policy raises nothing, and is no part of the known list.
+        assert!(setup.listed().is_empty());
+        assert_eq!(list_state(&setup), json!("waiting"));
+    }
+
+    #[test]
+    fn a_policy_with_64_different_blocked_addresses_is_the_most() {
+        let setup = Setup::new();
+        let list = |n: u8| -> Vec<String> { (0..n).map(mac_text).collect() };
+        let twice: Vec<String> = list(64).into_iter().chain(list(64)).collect();
+        let (status, body) = put_policy(
+            &setup,
+            &json!({ "exempt_default": true, "block": twice }).to_string(),
+        );
+        assert_eq!((status, &body["block"]), (200, &json!(64)));
+        let (status, body) = put_policy(
+            &setup,
+            &json!({ "exempt_default": false, "block": list(65) }).to_string(),
+        );
+        assert_eq!((status, error_key(&body)), (400, "bad_request"));
+        assert!(!body.to_string().contains("02:00"), "{body}");
+        // The policy that was there stays, mode and list.
+        let (on, block, _) = policy_state(&setup);
+        assert_eq!(on, json!(true));
+        assert_eq!(block.as_array().unwrap().len(), 64);
+    }
+
+    #[test]
+    fn a_bad_policy_changes_nothing() {
+        let setup = Setup::new();
+        setup.hear(mac(5), "laptop");
+        put_policy(
+            &setup,
+            r#"{"exempt_default": true, "block": ["02:00:00:00:00:05"]}"#,
+        );
+        let bad = [
+            "",
+            "true",
+            r#"{"exempt_default": "#,
+            "[]",
+            "{}",
+            r#"{"block": []}"#,
+            r#"{"exempt_default": false}"#,
+            r#"{"exempt_default": null, "block": []}"#,
+            r#"{"exempt_default": "false", "block": []}"#,
+            r#"{"exempt_default": 0, "block": []}"#,
+            r#"{"exempt_default": false, "block": null}"#,
+            r#"{"exempt_default": false, "block": "02:00:00:00:00:05"}"#,
+            r#"{"exempt_default": false, "block": [5]}"#,
+            r#"{"exempt_default": false, "block": ["02:00:00:00:00:05", null]}"#,
+            r#"{"exempt_default": false, "block": ["02:00:00:00:00:05", "02:00:00:00:00:0g"]}"#,
+            r#"{"exempt_default": false, "block": ["02:00:00:00:00:05", "020000000006"]}"#,
+            r#"{"exempt_default": false, "block": ["02:00:00:00:00:05", " 02:00:00:00:00:06"]}"#,
+            r#"{"exempt_default": false, "exempt": []}"#,
+        ];
+        for body in bad {
+            let (status, answer) = put_policy(&setup, body);
+            assert_eq!(status, 400, "{body}");
+            assert_eq!(error_key(&answer), "bad_request", "{body}");
+            // The refusal does not repeat an address.
+            assert!(!answer.to_string().contains("02:00"), "{body}");
+        }
+        let (on, block, devices) = policy_state(&setup);
+        assert_eq!((on, block), (json!(true), json!(["02:00:00:00:00:05"])));
+        assert_eq!(devices, [(mac_text(5), false, true)]);
     }
 
     #[test]
@@ -900,6 +1289,8 @@ mod tests {
             ("PUT", "/api/qbp/alerts/acked"),
             ("GET", "/api/qbp/devices"),
             ("PUT", "/api/qbp/devices/known"),
+            ("PUT", "/api/qbp/devices/exempt"),
+            ("PUT", "/api/qbp/devices/policy"),
         ];
         for (right, path) in paths {
             for method in [
@@ -908,7 +1299,8 @@ mod tests {
                 if method == right {
                     continue;
                 }
-                let (status, body) = setup.send(method, path, r#"{"acked": [], "known": []}"#);
+                let body = r#"{"acked": [], "known": [], "exempt": [], "exempt_default": true, "block": []}"#;
+                let (status, body) = setup.send(method, path, body);
                 assert_eq!(status, 405, "{method} {path}");
                 assert_eq!(error_key(&body), "method_not_allowed", "{method} {path}");
             }
@@ -918,6 +1310,8 @@ mod tests {
         assert_eq!(setup.listed()[0]["acked"], json!(false));
         let (_, devices) = setup.send("GET", "/api/qbp/devices", "");
         assert_eq!(devices["known_list"], json!("waiting"));
+        assert_eq!(devices["exempt_macs"], json!([]));
+        assert_eq!(devices["exempt_default"], json!(false));
     }
 
     #[test]
@@ -938,21 +1332,33 @@ mod tests {
             ("GET", "/api/qbp/devices/"),
             ("GET", "/api/qbp/devices/known/"),
             ("GET", "/api/qbp/devices/other"),
+            ("PUT", "/api/qbp/devices/exempt/"),
+            ("PUT", "/api/qbp/devices/Exempt"),
+            ("PUT", "/api/qbp/exempt"),
+            ("PUT", "/api/qbp/devices/policy/"),
+            ("PUT", "/api/qbp/devices/Policy"),
+            ("PUT", "/api/qbp/policy"),
             ("DELETE", "/api/qbp/nope"),
             // A query on any path but `GET alerts` is no such path.
             ("GET", "/api/qbp/devices?x=1"),
             ("GET", "/api/qbp/devices?"),
             ("PUT", "/api/qbp/devices/known?x=1"),
+            ("PUT", "/api/qbp/devices/exempt?x=1"),
+            ("PUT", "/api/qbp/devices/policy?x=1"),
             ("PUT", "/api/qbp/alerts/acked?since=0"),
             ("POST", "/api/qbp/alerts/1/ack?x=1"),
         ];
         for (method, path) in paths {
-            let (status, body) = setup.send(method, path, r#"{"acked": [], "known": []}"#);
+            let body =
+                r#"{"acked": [], "known": [], "exempt": [], "exempt_default": true, "block": []}"#;
+            let (status, body) = setup.send(method, path, body);
             assert_eq!(status, 404, "{method} {path}");
             assert_eq!(error_key(&body), "not_found", "{method} {path}");
         }
         let (_, devices) = setup.send("GET", "/api/qbp/devices", "");
         assert_eq!(devices["known_list"], json!("waiting"));
+        assert_eq!(devices["exempt_macs"], json!([]));
+        assert_eq!(devices["exempt_default"], json!(false));
     }
 
     #[test]
@@ -960,7 +1366,7 @@ mod tests {
         let setup = Setup::new();
         setup.raise("dga", Some(client(7)), "random NXDOMAIN names");
         setup.hear(mac(5), "laptop");
-        let body = br#"{"acked": ["0123456789abcdef"], "known": ["02:00:00:00:00:05"]}"#;
+        let body = br#"{"acked": ["0123456789abcdef"], "known": ["02:00:00:00:00:05"], "exempt": ["02:00:00:00:00:05"], "exempt_default": true, "block": ["02:00:00:00:00:05"]}"#;
         let requests = [
             ("GET", "/api/qbp/alerts"),
             ("GET", "/api/qbp/alerts?since=0"),
@@ -968,6 +1374,8 @@ mod tests {
             ("PUT", "/api/qbp/alerts/acked"),
             ("GET", "/api/qbp/devices"),
             ("PUT", "/api/qbp/devices/known"),
+            ("PUT", "/api/qbp/devices/exempt"),
+            ("PUT", "/api/qbp/devices/policy"),
             ("GET", "/api/qbp/nope"),
             ("GET", "/api/qbp/"),
             ("DELETE", "/api/qbp/alerts"),
@@ -988,6 +1396,11 @@ mod tests {
         assert_eq!(setup.listed()[0]["acked"], json!(false));
         let (_, devices) = setup.send("GET", "/api/qbp/devices", "");
         assert_eq!(devices["known_list"], json!("waiting"));
+        assert_eq!(devices["exempt_macs"], json!([]));
+        assert_eq!(
+            (&devices["exempt_default"], &devices["block_macs"]),
+            (&json!(false), &json!([]))
+        );
     }
 
     #[test]
@@ -998,6 +1411,8 @@ mod tests {
             ("GET", "/api/qbp/alerts"),
             ("GET", "/api/qbp/devices"),
             ("PUT", "/api/qbp/devices/known"),
+            ("PUT", "/api/qbp/devices/exempt"),
+            ("PUT", "/api/qbp/devices/policy"),
             ("GET", "/api/qbp/"),
         ] {
             let (status, body) = ask(&api, method, path, Some(&sid), b"{}");

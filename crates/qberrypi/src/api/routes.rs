@@ -21,6 +21,13 @@
 //! The watchdog's endpoints, everything under `/api/qbp/`, are handed on to [`qbp`] once the
 //! session is valid, and are 404 on an API that was given no watch ([`Api::with_watch`]).
 //!
+//! `POST /api/qbp/update` is the one request that is not answered here: its body is far over the
+//! cap that every other request has, so the connection recognises it from the head, asks
+//! [`Api::has_session`] before a byte of the body is read, and streams the body to the update
+//! receiver ([`Api::with_update`]). What reaches [`Api::handle`] on that path is a request that was
+//! read whole: 405 for any other method, 404 for a query string, and 404 on an API with no
+//! receiver, and for a POST that a connection would have streamed, a 400 that says so.
+//!
 //! The login is held back by the [`Limiter`] before the password is checked at all, and checked
 //! again once this call holds the verification lock, so a guess that queued behind another meets
 //! the hold-back that the other started: the other records its failure before it lets go of the
@@ -46,6 +53,7 @@ use super::password::PasswordHash;
 use super::qbp::{self, QbpWatch};
 use super::seams::{Client, MAX_QUERIES, ServerStats, query_json};
 use super::session::{HoldBack, Limiter, SESSION_SECS, Sessions};
+use crate::update::receive::{self, Receiver};
 
 /// The queries `/api/v1/queries` lists when no `n` is given.
 const DEFAULT_QUERIES: usize = 100;
@@ -85,6 +93,11 @@ const NO_RANDOM: Error = ("internal", "no random source");
 const MALFORMED: Error = ("bad_request", "Malformed request");
 /// A request with a head or a body over the limits.
 const TOO_LARGE: Error = ("payload_too_large", "Request too large");
+/// The update, sent as a request that was read whole instead of streamed.
+const NOT_STREAMED: Error = (
+    "bad_request",
+    "The update's body is streamed, not sent as one small request",
+);
 
 /// The figures and the blocking switch that the endpoints answer from, provided by the rest of
 /// qberrypi.
@@ -140,6 +153,9 @@ pub struct Api {
     verifying: Mutex<()>,
     /// What the endpoints under `/api/qbp/` answer from; `None` until [`Api::with_watch`].
     qbp: Option<Arc<QbpWatch>>,
+    /// The update receiver, which the connection hands the body of `POST /api/qbp/update` to;
+    /// `None` until [`Api::with_update`].
+    update: Option<Receiver>,
 }
 
 /// The endpoints, by path.
@@ -204,6 +220,7 @@ impl Api {
             limiter: Mutex::default(),
             verifying: Mutex::default(),
             qbp: None,
+            update: None,
         }
     }
 
@@ -212,6 +229,25 @@ impl Api {
     pub fn with_watch(mut self, watch: Arc<QbpWatch>) -> Self {
         self.qbp = Some(watch);
         self
+    }
+
+    /// This API, with `POST /api/qbp/update` taken by `receiver`: the connection streams the
+    /// body of that request to it. Without it the path is 404.
+    pub fn with_update(mut self, receiver: Receiver) -> Self {
+        self.update = Some(receiver);
+        self
+    }
+
+    /// The update receiver, if the API was given one.
+    pub(super) fn receiver(&self) -> Option<&Receiver> {
+        self.update.as_ref()
+    }
+
+    /// Whether `sid` is a valid session now, which uses it as any request that carries it does.
+    /// For the connection, which must know before it reads a body that [`Api::handle`] never sees.
+    pub(super) fn has_session(&self, sid: Option<&str>) -> bool {
+        let now = (self.mono_secs)();
+        sid.is_some_and(|sid| self.sessions().touch(sid, now).is_some())
     }
 
     /// Answers `request`, which came from `from`, in the order of checks the module describes.
@@ -242,6 +278,14 @@ impl Api {
                 error(401, UNAUTHORIZED, started)
             };
         };
+        if path == receive::PATH {
+            return match (&self.update, request.method.as_str()) {
+                _ if query.is_some() => error(404, NOT_FOUND, started),
+                (None, _) => error(404, NOT_FOUND, started),
+                (Some(_), "POST") => error(400, NOT_STREAMED, started),
+                (Some(_), _) => error(405, METHOD_NOT_ALLOWED, started),
+            };
+        }
         if let Some(rest) = path.strip_prefix("/api/qbp/") {
             return match &self.qbp {
                 Some(watch) => {
@@ -498,6 +542,11 @@ pub fn too_large() -> Reply {
     error(413, TOO_LARGE, Instant::now())
 }
 
+/// The answer to a request that needs a session and has none: Pi-hole's error shape, 401.
+pub fn unauthorized() -> Reply {
+    error(401, UNAUTHORIZED, Instant::now())
+}
+
 /// The queries answered from the cache or here: the cache hits, and the queries that were
 /// neither blocked, cached nor forwarded, as Pi-hole's "from cache or local configuration" counts
 /// them.
@@ -554,12 +603,18 @@ fn queries_wanted(query: Option<&str>) -> Option<usize> {
 }
 
 /// A 200 with `body` and its `took`.
-pub(super) fn ok(body: Value, started: Instant) -> Reply {
+pub(crate) fn ok(body: Value, started: Instant) -> Reply {
     reply(200, body, Some(started))
 }
 
 /// Pi-hole's error object, with `status`.
 pub(super) fn error(status: u16, (key, message): Error, started: Instant) -> Reply {
+    error_with(status, key, message, started)
+}
+
+/// Pi-hole's error object, with `status` and a message that is made as it is needed instead of
+/// being one of the constants: the update receiver's, which say which of the eleven files.
+pub(crate) fn error_with(status: u16, key: &str, message: &str, started: Instant) -> Reply {
     reply(
         status,
         json!({ "error": { "key": key, "message": message, "hint": null } }),
@@ -637,6 +692,7 @@ mod tests {
     use crate::api::http::{Reply, Request};
     use crate::api::password::PasswordHash;
     use crate::api::seams::{Client, MAX_QUERIES, ServerStats};
+    use crate::update::UpdateCtl;
 
     const ME: Ipv4Addr = Ipv4Addr::new(192, 0, 2, 7);
 
@@ -1234,6 +1290,61 @@ mod tests {
     }
 
     // The tests below are this task's own, beyond the plan's.
+
+    #[test]
+    fn the_update_path_is_404_without_a_receiver_and_401_without_a_session_either_way() {
+        let without = api(Fake::default());
+        let sid = login(&without);
+        let status = |api: &Api, m: &str, t: &str, sid: Option<&str>| {
+            api.handle(&req(m, t, sid, b""), ME).status
+        };
+        let path = crate::update::receive::PATH;
+        assert_eq!(status(&without, "POST", path, Some(&sid)), 404);
+        assert_eq!(status(&without, "GET", path, Some(&sid)), 404);
+        assert_eq!(status(&without, "POST", path, None), 401);
+
+        let with = api(Fake::default()).with_update(Receiver::new(UpdateCtl::off(), 1));
+        let sid = login(&with);
+        assert_eq!(status(&with, "POST", path, None), 401);
+        assert_eq!(status(&with, "GET", path, None), 401);
+        assert_eq!(status(&with, "POST", path, Some("0000")), 401);
+        // Another method on the path is 405, a query string is 404 whatever the method.
+        for method in ["GET", "PUT", "DELETE"] {
+            assert_eq!(status(&with, method, path, Some(&sid)), 405, "{method}");
+        }
+        assert_eq!(
+            status(&with, "POST", &format!("{path}?x=1"), Some(&sid)),
+            404
+        );
+        assert_eq!(
+            status(&with, "GET", &format!("{path}?x=1"), Some(&sid)),
+            404
+        );
+        // A POST that was read whole is not an update: the connection streams those, and says so.
+        let reply = with.handle(&req("POST", path, Some(&sid), b"{}"), ME);
+        assert_eq!(reply.status, 400);
+        assert_eq!(json(&reply)["error"]["key"], "bad_request");
+    }
+
+    #[test]
+    fn a_session_is_checked_for_the_connection_and_used_as_any_request_that_carries_it_is() {
+        let api = api(Fake::default());
+        let sid = login(&api);
+        assert!(api.has_session(Some(&sid)));
+        assert!(!api.has_session(None));
+        assert!(!api.has_session(Some("0123")));
+        assert!(!api.has_session(Some(&"0".repeat(32))));
+        // It expires as any session does: 30 minutes after its last use, which the check counts.
+        advance(&api, SESSION_SECS - 1);
+        assert!(api.has_session(Some(&sid)));
+        advance(&api, SESSION_SECS - 1);
+        assert!(api.has_session(Some(&sid)), "the last check was a use");
+        advance(&api, SESSION_SECS);
+        assert!(!api.has_session(Some(&sid)));
+        let reply = unauthorized();
+        assert_eq!(reply.status, 401);
+        assert_eq!(json(&reply)["error"]["key"], "unauthorized");
+    }
 
     #[test]
     fn a_pause_shows_in_the_get_and_its_timer_is_whole_seconds_up_to_a_day() {

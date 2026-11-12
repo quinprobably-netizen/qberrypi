@@ -88,6 +88,8 @@ const ATTR_REG_ALPHA2: u16 = 33;
 const ATTR_WIPHY_FREQ: u16 = 38;
 /// Attribute: the network's name.
 const ATTR_SSID: u16 = 52;
+/// Attribute: the nest that lists the frequencies a scan covers; left out, a scan covers every channel.
+const ATTR_SCAN_FREQUENCIES: u16 = 44;
 /// Attribute: the nest that names the networks a scan asks for.
 const ATTR_SCAN_SSIDS: u16 = 45;
 /// Attribute: how a scan is done.
@@ -238,8 +240,23 @@ pub fn set_power_save_off(family: u16, ifindex: u32) -> MsgBuilder {
 }
 
 /// A request to scan for the network called `ssid`, dropping the old results first.
-pub fn trigger_scan(family: u16, ifindex: u32, ssid: &[u8]) -> MsgBuilder {
-    on_interface(family, CMD_TRIGGER_SCAN, ifindex)
+///
+/// The scan is a directed one: it probes for `ssid`. It covers every channel when `freqs_mhz` is empty, and
+/// only the channels with these centre frequencies otherwise. The kernel refuses a request that names a
+/// frequency its radio has no channel for, with `EINVAL`; the caller sees that as a failed scan.
+pub fn trigger_scan(family: u16, ifindex: u32, ssid: &[u8], freqs_mhz: &[u32]) -> MsgBuilder {
+    let message = on_interface(family, CMD_TRIGGER_SCAN, ifindex);
+    let message = if freqs_mhz.is_empty() {
+        message
+    } else {
+        // The attributes of the nest are the frequencies, numbered from 1 as `wpa_supplicant` numbers them.
+        message.nest(ATTR_SCAN_FREQUENCIES, |freqs| {
+            (1..)
+                .zip(freqs_mhz)
+                .fold(freqs, |freqs, (index, mhz)| freqs.attr_u32(index, *mhz))
+        })
+    };
+    message
         .nest(ATTR_SCAN_SSIDS, |ssids| ssids.attr(1, ssid))
         .attr_u32(ATTR_SCAN_FLAGS, SCAN_FLAG_FLUSH)
 }
@@ -605,9 +622,23 @@ mod tests {
             hex!("240000001c00050007000000000000003d000000080003000300000008005d0000000000")
         );
         assert_eq!(
-            trigger_scan(F, 3, b"ThisIsASSID").finish(7),
+            trigger_scan(F, 3, b"ThisIsASSID", &[]).finish(7),
             hex!(
                 "380000001c000500070000000000000021000000080003000300000014002d800f00010054686973497341535349440008009e0002000000"
+            )
+        );
+        // The same request for one channel: a nest of one frequency (5180 MHz) before the name.
+        assert_eq!(
+            trigger_scan(F, 3, b"ThisIsASSID", &[5180]).finish(7),
+            hex!(
+                "440000001c00050007000000000000002100000008000300030000000c002c8008000100 3c140000 14002d800f00010054686973497341535349440008009e0002000000"
+            )
+        );
+        // And for two, numbered from 1 in the order given (5180 and 2437 MHz).
+        assert_eq!(
+            trigger_scan(F, 3, b"ThisIsASSID", &[5180, 2437]).finish(7),
+            hex!(
+                "4c0000001c00050007000000000000002100000008000300030000001400 2c80 08000100 3c140000 08000200 85090000 14002d800f00010054686973497341535349440008009e0002000000"
             )
         );
         assert_eq!(

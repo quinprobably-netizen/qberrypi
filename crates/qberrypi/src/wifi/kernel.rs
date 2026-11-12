@@ -138,8 +138,8 @@ impl Radio for KernelRadio {
         Ok(nonce)
     }
 
-    async fn trigger_scan(&mut self, ssid: &[u8]) -> Result<(), RadioError> {
-        let message = nl80211::trigger_scan(self.nl.family(), self.ifindex, ssid);
+    async fn trigger_scan(&mut self, ssid: &[u8], freqs_mhz: &[u32]) -> Result<(), RadioError> {
+        let message = nl80211::trigger_scan(self.nl.family(), self.ifindex, ssid, freqs_mhz);
         match self.nl.request(message).await {
             Ok(_) => Ok(()),
             Err(error) if refused_with(&error, &BUSY) => Err(RadioError::Busy),

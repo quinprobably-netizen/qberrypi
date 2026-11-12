@@ -82,7 +82,8 @@ pub const PACKAGES: &[Package] = &[
                 "modules/ads7846.ko",
             ),
             // qberrypi's own overlays: the firmware reads `ov-README` and then
-            // `ov-overlay_map.dtb` and `ov-<overlay>.dtbo` from beside the kernel.
+            // `ov-overlay_map.dtb` and `ov-<overlay>.dtbo` from beside the kernel. The second
+            // overlay, `disable-bt`, disables the Bluetooth device-tree node.
             (
                 "usr/lib/modules/6.18.60+rpt-rpi-v8/dtb/overlays/README",
                 "ov-README",
@@ -94,6 +95,10 @@ pub const PACKAGES: &[Package] = &[
             (
                 "usr/lib/modules/6.18.60+rpt-rpi-v8/dtb/overlays/piscreen.dtbo",
                 "ov-qb-piscreen.dtbo",
+            ),
+            (
+                "usr/lib/modules/6.18.60+rpt-rpi-v8/dtb/overlays/disable-bt.dtbo",
+                "ov-disable-bt.dtbo",
             ),
         ],
     },
@@ -116,6 +121,29 @@ pub const PACKAGES: &[Package] = &[
             (
                 "usr/lib/firmware/brcm/brcmfmac43455-sdio.txt",
                 "firmware/brcm/brcmfmac43455-sdio.txt",
+            ),
+        ],
+    },
+    // The Raspberry Pi 3's boot firmware, which the card needs beside the slots (`cargo xtask
+    // image`). It is not the Wi-Fi firmware above, which is the wireless chip's and goes into the
+    // initramfs. The pin is the SHA-512, like the other packages of this archive; the SHA-256 of
+    // the package, which the design names, is
+    // 56b6f8792fb27bcc22f101a5a0d27af637e0d13e85dfc0fde5ff140abc929b0f. Its data archive is
+    // gzip, which is why `deb::extract` reads that.
+    Package {
+        name: "boot firmware",
+        url: "https://archive.raspberrypi.com/debian/pool/main/r/raspi-firmware/raspi-firmware_1.20260915-1_all.deb",
+        file: "raspi-firmware_1.20260915-1_all.deb",
+        digest: Digest::Sha512(
+            "4558b24a88ecbd29b10eca8d18d6852791d19b823f7cc964fd384761c56aab20670ae008595b8d428a8794c2c13efe4dd343adff7866298d265d3ef7106bd8d2",
+        ),
+        wanted: &[
+            ("usr/lib/raspi-firmware/bootcode.bin", "boot/bootcode.bin"),
+            ("usr/lib/raspi-firmware/start.elf", "boot/start.elf"),
+            ("usr/lib/raspi-firmware/fixup.dat", "boot/fixup.dat"),
+            (
+                "usr/lib/raspi-firmware/LICENCE.broadcom",
+                "boot/LICENCE.broadcom",
             ),
         ],
     },
@@ -145,7 +173,7 @@ mod tests {
     use std::path::{Component, Path};
 
     #[test]
-    fn the_packages_produce_the_twenty_files_the_image_needs() {
+    fn the_packages_produce_the_twenty_five_files_the_image_and_the_card_need() {
         let mut outputs: Vec<&str> = PACKAGES
             .iter()
             .flat_map(|package| package.wanted.iter().map(|(_, output)| *output))
@@ -156,6 +184,10 @@ mod tests {
             outputs,
             [
                 "bcm2710-rpi-3-b-plus.dtb",
+                "boot/LICENCE.broadcom",
+                "boot/bootcode.bin",
+                "boot/fixup.dat",
+                "boot/start.elf",
                 "firmware/brcm/brcmfmac43455-sdio.bin",
                 "firmware/brcm/brcmfmac43455-sdio.clm_blob",
                 "firmware/brcm/brcmfmac43455-sdio.txt",
@@ -173,6 +205,7 @@ mod tests {
                 "modules/rfkill.ko",
                 "modules/spi-bcm2835.ko",
                 "ov-README",
+                "ov-disable-bt.dtbo",
                 "ov-overlay_map.dtb",
                 "ov-qb-piscreen.dtbo",
             ]
@@ -204,6 +237,59 @@ mod tests {
         assert_eq!(
             member("ov-qb-piscreen.dtbo"),
             format!("{overlays}piscreen.dtbo")
+        );
+        assert_eq!(
+            member("ov-disable-bt.dtbo"),
+            format!("{overlays}disable-bt.dtbo")
+        );
+    }
+
+    #[test]
+    fn the_boot_firmware_is_taken_from_its_package_into_the_folder_the_image_reads() {
+        use crate::image::{FIRMWARE_FILES, FIRMWARE_FOLDER};
+        let package = PACKAGES
+            .iter()
+            .find(|package| package.name == "boot firmware")
+            .expect("the boot firmware is pinned");
+        let folder = FIRMWARE_FOLDER
+            .strip_prefix("vendor-cache/extracted/")
+            .expect("the image reads what fetch extracted");
+
+        // Each file the image needs is taken from the package's firmware folder, by its own name.
+        let wanted: Vec<(&str, &str)> = package.wanted.to_vec();
+        let expected: Vec<(String, String)> = FIRMWARE_FILES
+            .iter()
+            .map(|name| {
+                (
+                    format!("usr/lib/raspi-firmware/{name}"),
+                    format!("{folder}/{name}"),
+                )
+            })
+            .collect();
+        assert_eq!(
+            wanted,
+            expected
+                .iter()
+                .map(|(member, output)| (member.as_str(), output.as_str()))
+                .collect::<Vec<_>>()
+        );
+        // The package is the one of the design, and the wireless firmware stays a package of its own.
+        assert_eq!(package.file, "raspi-firmware_1.20260915-1_all.deb");
+        assert!(
+            package
+                .url
+                .starts_with("https://archive.raspberrypi.com/debian/")
+        );
+        assert!(
+            matches!(&package.digest, Digest::Sha512(sum) if sum.starts_with("4558b24a88ecbd29")),
+            "the pin is the design's package"
+        );
+        assert_eq!(
+            PACKAGES
+                .iter()
+                .filter(|p| p.name.contains("firmware"))
+                .count(),
+            2
         );
     }
 

@@ -172,12 +172,14 @@ const RECOVERY: &str = "If qberrypi started with debug.one_shot on, it has alrea
 ///
 /// A configuration that is to stay must have no development switch on: not `debug.one_shot`
 /// (which would return the Pi to Raspberry Pi OS at the first restart), nor the log on the card,
-/// a return time, the touch calibration or a provoked fault. The first of them in that order is
-/// named, and every such error says that nothing was copied.
+/// a return time, the touch calibration, a provoked fault (the two that act only on a trial boot
+/// included) or either of the trial switches (`debug.trial_confirm_secs`, `debug.trial_offline`).
+/// The first of them in that order is named, and every such error says that nothing was copied.
 pub fn check_local(toml_text: &str, permanent: bool) -> Result<(), String> {
     let debug = debug_settings(toml_text)?;
     if permanent {
-        return refuse_development_switches(&debug);
+        return refuse_development_switches(&debug, "--permanent")
+            .map_err(|refusal| format!("{refusal}; nothing was copied"));
     }
     if debug.one_shot {
         return Ok(());
@@ -188,30 +190,57 @@ pub fn check_local(toml_text: &str, permanent: bool) -> Result<(), String> {
     ))
 }
 
-/// Refuses a configuration with a development switch on, for a build that is to stay.
-fn refuse_development_switches(debug: &config::DebugCfg) -> Result<(), String> {
-    let refusal = if debug.one_shot {
-        "--permanent with debug.one_shot on would return to Raspberry Pi OS at the first \
-         restart: turn debug.one_shot off"
-            .to_owned()
+/// Refuses a configuration with a development switch on, for a build that is to stay: the one
+/// that `--permanent` deploys, and the ones that `cargo xtask image` and `cargo xtask update` put
+/// on a card.
+///
+/// `command` is what the refusal calls the caller in the one sentence that is about the caller
+/// (`debug.one_shot`): `"--permanent"` for a deploy, `"cargo xtask image"`, `"cargo xtask update"`.
+/// The first switch that is on, in the order of [`check_local`]'s text, is named; the error is the
+/// sentence alone, for the caller to say what was not done after it ("nothing was copied", "no
+/// image was written", "nothing was uploaded").
+pub(crate) fn refuse_development_switches(
+    debug: &config::DebugCfg,
+    command: &str,
+) -> Result<(), String> {
+    if debug.one_shot {
+        Err(format!(
+            "{command} with debug.one_shot on would return to Raspberry Pi OS at the first \
+             restart: turn debug.one_shot off"
+        ))
     } else if debug.log_to_sd {
-        "a permanent qberrypi must not write its log to the card: turn debug.log_to_sd off"
-            .to_owned()
+        Err(
+            "a permanent qberrypi must not write its log to the card: turn debug.log_to_sd off"
+                .to_owned(),
+        )
     } else if debug.return_after_secs != 0 {
-        "a permanent qberrypi with debug.return_after_secs set would restart for ever: set it \
-         to 0"
-            .to_owned()
+        Err(
+            "a permanent qberrypi with debug.return_after_secs set would restart for ever: set \
+             it to 0"
+                .to_owned(),
+        )
     } else if debug.calibrate_touch {
-        "debug.calibrate_touch is for one boot of calibration: turn it off".to_owned()
+        Err("debug.calibrate_touch is for one boot of calibration: turn it off".to_owned())
     } else if debug.fault != config::Fault::None {
-        format!(
+        Err(format!(
             "{CONFIG_FILE} has debug.fault set: a permanent qberrypi with a provoked failure \
              would restart for ever. Set debug.fault to \"none\""
+        ))
+    } else if debug.trial_confirm_secs != 0 {
+        Err(
+            "debug.trial_confirm_secs moves the time at which a trial confirms, which is for \
+             development: set it to 0"
+                .to_owned(),
+        )
+    } else if debug.trial_offline {
+        Err(
+            "debug.trial_offline lets a trial confirm with no Wi-Fi, clock or upstream, which is \
+             for development: turn it off"
+                .to_owned(),
         )
     } else {
-        return Ok(());
-    };
-    Err(format!("{refusal}; nothing was copied"))
+        Ok(())
+    }
 }
 
 /// Reads the bring-up switches, which decide whether and when the Pi comes back.
@@ -1690,6 +1719,8 @@ mod tests {
             "no-wifi",
             "drop-link",
             "mute-probe",
+            "trial_panic",
+            "trial_stall",
         ] {
             let text = EXAMPLE.replace("fault = \"none\"", &format!("fault = \"{word}\""));
             assert!(check_local(&text, true).is_err(), "{word}");
@@ -1718,6 +1749,18 @@ mod tests {
                 "debug.calibrate_touch",
             ),
             ("fault = \"none\"", "fault = \"stall\"", "debug.fault"),
+            ("fault = \"none\"", "fault = \"trial_panic\"", "debug.fault"),
+            ("fault = \"none\"", "fault = \"trial_stall\"", "debug.fault"),
+            (
+                "trial_confirm_secs = 0",
+                "trial_confirm_secs = 5",
+                "debug.trial_confirm_secs",
+            ),
+            (
+                "trial_offline = false",
+                "trial_offline = true",
+                "debug.trial_offline",
+            ),
         ];
         for (from, to, key) in cases {
             let error = check_local(&base.replace(from, to), true).unwrap_err();
@@ -1733,12 +1776,14 @@ mod tests {
     #[test]
     fn a_permanent_deploy_names_the_first_switch_that_is_on_in_a_fixed_order() {
         // With every switch on, each refusal in turn is the one that is shown, in the plan's order.
-        const KEYS: [&str; 5] = [
+        const KEYS: [&str; 7] = [
             "debug.one_shot",
             "debug.log_to_sd",
             "debug.return_after_secs",
             "debug.calibrate_touch",
             "debug.fault",
+            "debug.trial_confirm_secs",
+            "debug.trial_offline",
         ];
         let mut text = base_with_every_switch_on();
         for (at, key) in KEYS.iter().enumerate() {
@@ -1755,10 +1800,45 @@ mod tests {
                 "debug.calibrate_touch" => {
                     text.replace("calibrate_touch = true", "calibrate_touch = false")
                 }
-                _ => text.replace("fault = \"stall\"", "fault = \"none\""),
+                "debug.fault" => text.replace("fault = \"stall\"", "fault = \"none\""),
+                "debug.trial_confirm_secs" => {
+                    text.replace("trial_confirm_secs = 5", "trial_confirm_secs = 0")
+                }
+                _ => text.replace("trial_offline = true", "trial_offline = false"),
             };
         }
         assert!(check_local(&text, true).is_ok());
+    }
+
+    #[test]
+    fn a_card_that_stays_is_refused_in_the_words_of_the_command_that_would_put_it_there() {
+        let text = base_with_every_switch_on();
+        let debug = config::parse(&text).unwrap().debug;
+
+        // `image` and `update` are not `--permanent`, and the refusal does not say they are.
+        for command in ["cargo xtask image", "cargo xtask update"] {
+            let error = refuse_development_switches(&debug, command).unwrap_err();
+            assert!(
+                error.starts_with(&format!("{command} with debug.one_shot on")),
+                "{error}"
+            );
+            assert!(!error.contains("--permanent"), "{error}");
+            // The caller says what was not done: the sentence has no ending of its own.
+            assert!(!error.contains("nothing was"), "{error}");
+        }
+        // The deploy's own words are what they were.
+        assert_eq!(
+            check_local(&text, true).unwrap_err(),
+            "--permanent with debug.one_shot on would return to Raspberry Pi OS at the first \
+             restart: turn debug.one_shot off; nothing was copied"
+        );
+        // With the first switch off, the rest do not depend on the command.
+        let text = text.replace("one_shot = true", "one_shot = false");
+        let debug = config::parse(&text).unwrap().debug;
+        assert_eq!(
+            refuse_development_switches(&debug, "cargo xtask update"),
+            refuse_development_switches(&debug, "--permanent")
+        );
     }
 
     fn base_with_every_switch_on() -> String {
@@ -1768,6 +1848,8 @@ mod tests {
             .replace("return_after_secs = 0", "return_after_secs = 40")
             .replace("calibrate_touch = false", "calibrate_touch = true")
             .replace("fault = \"none\"", "fault = \"stall\"")
+            .replace("trial_confirm_secs = 0", "trial_confirm_secs = 5")
+            .replace("trial_offline = false", "trial_offline = true")
     }
 
     #[test]

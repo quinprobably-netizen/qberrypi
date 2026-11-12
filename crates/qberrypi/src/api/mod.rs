@@ -22,6 +22,14 @@
 //! whole, and the requests at [`CONNECTION_LIFE`]. Every request that cannot be read closes the
 //! connection, and a refusal says why when the client is still owed an answer. No log line here
 //! names a client, a session or a body: the log is open to the network.
+//!
+//! One request is read in another way. `POST /api/qbp/update`, which an API that has an update
+//! receiver ([`routes::Api::with_update`]) takes, is recognised from its head: without a valid
+//! session it is a 401 and no byte of its body is read; with one, its body is streamed to the
+//! receiver on this same thread, bounded by [`Limits::upload`] for the whole request counted from
+//! its head and by [`Limits::upload_idle`] for each read, in place of the connection's life and
+//! idle wait. The reply is written under a fresh [`WRITE_WAIT`] and the connection closes after it,
+//! whatever the client asked.
 
 use std::future::Future;
 use std::io::{self, BufReader, Read, Write};
@@ -34,9 +42,12 @@ use tokio::net::TcpListener;
 use tokio::sync::Semaphore;
 use zeroize::Zeroize;
 
-use self::http::{ReadError, Reply, Request, read_request, write_reply};
+use self::http::{
+    Head, ReadError, Reply, Request, read_request_body, read_request_head, write_reply,
+};
 use self::routes::Api;
 use crate::services::blocking;
+use crate::update::receive::{self, Receiver};
 
 mod hex;
 pub mod http;
@@ -81,6 +92,10 @@ pub const WRITE_WAIT: Duration = Duration::from_secs(5);
 pub const CONNECTION_LIFE: Duration = Duration::from_secs(60);
 /// The most requests one connection answers.
 pub const MAX_REQUESTS: usize = 100;
+/// How long the update's request may take, counted from its head: ten minutes.
+pub const UPLOAD_LIFE: Duration = Duration::from_secs(600);
+/// How long the update's request waits for the next bytes of its body.
+pub const UPLOAD_IDLE_WAIT: Duration = Duration::from_secs(30);
 
 /// What bounds each connection: how long each of its waits and its life may be. How many are
 /// alive at once is for the [`places`] to say.
@@ -92,6 +107,11 @@ pub struct Limits {
     pub idle: Duration,
     /// The life of a connection, from its accept.
     pub life: Duration,
+    /// The whole of the update's request, from the moment its head was read, which takes the place
+    /// of `life` for it.
+    pub upload: Duration,
+    /// Each wait for bytes of the update's body, which takes the place of `idle` for it.
+    pub upload_idle: Duration,
 }
 
 impl Limits {
@@ -100,6 +120,8 @@ impl Limits {
         handshake: HANDSHAKE_WAIT,
         idle: IDLE_WAIT,
         life: CONNECTION_LIFE,
+        upload: UPLOAD_LIFE,
+        upload_idle: UPLOAD_IDLE_WAIT,
     };
 }
 
@@ -402,18 +424,26 @@ fn connection(
 
     let mut served = 0;
     loop {
-        let mut request = match read_request(&mut stream) {
+        let head = match read_request_head(&mut stream) {
+            Ok(head) => head,
+            Err(error) => {
+                refuse_unreadable(&mut stream, error);
+                break;
+            }
+        };
+        if let Some(receiver) = api
+            .receiver()
+            .filter(|_| head.method == "POST" && head.target == receive::PATH)
+        {
+            upload(&mut stream, api, receiver, &head, limits);
+            break;
+        }
+        let mut request = match read_request_body(&mut stream, head) {
             Ok(request) => request,
-            Err(ReadError::TooLarge) => {
-                let _ = write_reply(stream.get_mut(), &routes::too_large(), true);
+            Err(error) => {
+                refuse_unreadable(&mut stream, error);
                 break;
             }
-            Err(ReadError::Malformed(_)) => {
-                let _ = write_reply(stream.get_mut(), &routes::malformed(), true);
-                break;
-            }
-            // The client is done, or it stalled, or the connection's time is out: nothing is owed.
-            Err(ReadError::Closed | ReadError::Io(_)) => break,
         };
         served += 1;
         let reply = answer(api, &mut request, peer);
@@ -427,6 +457,41 @@ fn connection(
         }
     }
     say_goodbye(&mut stream);
+}
+
+/// Answers a request that could not be read, if the client is still owed an answer: a head or a
+/// body over the limits is a 413 and bytes that are no request a 400; a peer that is done, or
+/// stalled, or out of time is owed nothing.
+fn refuse_unreadable(stream: &mut Stream, error: ReadError) {
+    let reply = match error {
+        ReadError::TooLarge => routes::too_large(),
+        ReadError::Malformed(_) => routes::malformed(),
+        ReadError::Closed | ReadError::Io(_) => return,
+    };
+    let _ = write_reply(stream.get_mut(), &reply, true);
+}
+
+/// Serves `POST /api/qbp/update`, whose head has been read and whose body has not: a request
+/// without a valid session is a 401 and nothing more is read; otherwise `receiver` takes the body
+/// from the stream under the upload's bounds, and the reply is written under a fresh write wait.
+/// The restart that a staged update asks for follows the reply ([`receive::Received`]).
+fn upload(stream: &mut Stream, api: &Api, receiver: &Receiver, head: &Head, limits: Limits) {
+    if !api.has_session(head.sid.as_deref()) {
+        let _ = write_reply(stream.get_mut(), &routes::unauthorized(), true);
+        return;
+    }
+    stream.get_mut().sock.bound(
+        Instant::now() + limits.upload,
+        limits.upload_idle,
+        WRITE_WAIT,
+    );
+    let received = receiver.receive(head, stream);
+    // The upload may have used its whole time: the answer to it still gets its own.
+    stream
+        .get_mut()
+        .sock
+        .bound(Instant::now() + WRITE_WAIT, limits.idle, WRITE_WAIT);
+    let _ = received.send_then_restart(|reply| write_reply(stream.get_mut(), reply, true));
 }
 
 /// Answers `request`, which came from `peer`, and wipes its body, which may be a password, before
@@ -565,6 +630,12 @@ mod tests {
             (limits.handshake, limits.idle, limits.life),
             (HANDSHAKE_WAIT, IDLE_WAIT, CONNECTION_LIFE)
         );
+        // The update's request: ten minutes from its head, 30 s for each read.
+        assert_eq!((UPLOAD_LIFE, UPLOAD_IDLE_WAIT), (secs(600), secs(30)));
+        assert_eq!(
+            (limits.upload, limits.upload_idle),
+            (UPLOAD_LIFE, UPLOAD_IDLE_WAIT)
+        );
         assert_eq!(places().available_permits(), CONNECTIONS);
     }
 
@@ -676,6 +747,7 @@ mod tests {
             handshake: Duration::from_secs(2),
             idle: 300 * MS,
             life: Duration::from_secs(1),
+            ..Limits::DEFAULT
         };
         let served = served(limits).await;
         let (addr, client) = (served.addr, pinned_client(&served.cert));

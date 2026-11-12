@@ -90,8 +90,11 @@ pub struct FakeRadio {
     pub nonce: Nonce,
     /// What `next_event` returns, in order.
     pub script: VecDeque<Step>,
-    /// What every `scan_results` returns.
+    /// What `scan_results` returns: every access point of it, or only those on the channels that the last
+    /// `trigger_scan` was limited to, as a radio that scans just those channels hears just those.
     pub results: Vec<Bss>,
+    /// The frequencies each `trigger_scan` was limited to, in order; an empty list is a scan of every channel.
+    pub scan_freqs: Vec<Vec<u32>>,
     /// Returned by the next `trigger_scan` calls, one each.
     pub trigger_errors: VecDeque<RadioError>,
     /// `connect` returns an error.
@@ -124,6 +127,7 @@ impl FakeRadio {
             nonce: SNONCE,
             script: VecDeque::new(),
             results: Vec::new(),
+            scan_freqs: Vec::new(),
             trigger_errors: VecDeque::new(),
             fail_connect: false,
             fail_install: false,
@@ -181,14 +185,21 @@ impl Radio for FakeRadio {
         Ok(self.nonce)
     }
 
-    async fn trigger_scan(&mut self, _ssid: &[u8]) -> Result<(), RadioError> {
+    async fn trigger_scan(&mut self, _ssid: &[u8], freqs_mhz: &[u32]) -> Result<(), RadioError> {
         self.record(Call::TriggerScan);
+        self.scan_freqs.push(freqs_mhz.to_vec());
         self.trigger_errors.pop_front().map_or(Ok(()), Err)
     }
 
     async fn scan_results(&mut self) -> Result<Vec<Bss>, RadioError> {
         self.record(Call::ScanResults);
-        Ok(self.results.clone())
+        let limited = self.scan_freqs.last().filter(|freqs| !freqs.is_empty());
+        Ok(self
+            .results
+            .iter()
+            .filter(|bss| limited.is_none_or(|freqs| freqs.contains(&bss.freq_mhz)))
+            .cloned()
+            .collect())
     }
 
     async fn connect(&mut self, _ssid: &[u8], candidate: &Candidate) -> Result<(), RadioError> {
@@ -299,6 +310,7 @@ pub fn cfg() -> JoinCfg {
     JoinCfg {
         ssid: b"ThisIsASSID".to_vec(),
         pmk: Pmk::from_passphrase("ThisIsAPassword", b"ThisIsASSID").unwrap(),
+        hint_mhz: Vec::new(),
     }
 }
 

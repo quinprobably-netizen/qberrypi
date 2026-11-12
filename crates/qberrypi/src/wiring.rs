@@ -283,20 +283,24 @@ impl SignalCache {
 
 /// What the panel and the status page show of the Wi-Fi for the Wi-Fi task's `status`.
 ///
-/// Only a joined link has a signal and an access point. The signal is the live one, which
+/// Only a joined link has a signal, an access point and a channel. The signal is the live one, which
 /// `signal` reads, and when that is unknown it is the one the join measured. `signal` is called
-/// only when joined. The access point is its address in the form the log shows.
+/// only when joined. The access point is its address in the form the log shows. The channel's frequency
+/// is the one the join found, copied out of the status: nothing is asked of the radio for it.
 pub fn link_status(
     status: &wifi::WifiStatus,
     signal: impl FnOnce() -> Option<i8>,
 ) -> live::WifiStatus {
     match status {
         wifi::WifiStatus::Joined {
-            bssid, signal_mbm, ..
+            bssid,
+            freq_mhz,
+            signal_mbm,
         } => live::WifiStatus {
             associated: true,
             signal_dbm: signal().or_else(|| Some(held(wifi::dbm(*signal_mbm)))),
             ap: Some(wifi::mac(bssid)),
+            freq_mhz: Some(*freq_mhz),
         },
         _ => live::WifiStatus::default(),
     }
@@ -378,6 +382,7 @@ mod tests {
             associated,
             signal_dbm,
             ap: None,
+            freq_mhz: None,
         }
     }
 
@@ -649,6 +654,7 @@ mod tests {
                 associated: true,
                 signal_dbm: Some(-55),
                 ap: Some("00:00:5e:00:53:01".to_owned()),
+                freq_mhz: Some(5180),
             }
         );
         // Without a live figure, the join's own is shown.

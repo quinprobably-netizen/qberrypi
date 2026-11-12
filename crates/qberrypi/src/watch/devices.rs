@@ -4,8 +4,10 @@
 //! Nothing here reads a socket or a clock of its own: the device watch calls in with what it
 //! heard, and time is read from the clock that `Devices::new` was given, which is the same
 //! shape as the alert store's: (monotonic seconds, unix seconds). Everything is bounded: 512
-//! devices, 4 addresses each, a known list of 1024, 64 held alerts and 64 alerts waiting to be
-//! taken, so that a flood of forged frames fills a table that never grows past that.
+//! devices, 4 addresses each, a known list of 1024, two exempt lists of 64 and two block lists of
+//! 64, 64 held alerts and 64
+//! alerts waiting to be taken, so that a flood of forged frames fills a table that never grows past
+//! that.
 //!
 //! The inventory never calls a sink. The alerts that a call makes wait inside it until
 //! [`Devices::take_alerts`] takes them, and whoever called raises them after the lock of the
@@ -24,8 +26,27 @@
 //! device seen so far is learned as known, silently. With nothing heard there is nothing to learn,
 //! and the state stays as it is.
 //!
-//! Nothing here logs but two counts, once each: the devices on a known list that came, and the
-//! devices learned. A MAC, an address or a host name never reaches a log line from this file.
+//! The exempt devices are those whose MAC is on the configuration's exempt list or on the one the
+//! desktop pushed: their questions are held to the threat lists alone. An IPv4 address is exempt
+//! while the device that claimed it last, by ARP or DHCP, is an exempt one, and leaves the set at
+//! once when another device claims it. The router's address and the Pi's own are never exempt,
+//! whatever MAC claims them: an exempt device that claimed the router's would exempt every client
+//! whose questions the router relays. The inventory publishes the exempt addresses to the set that
+//! the DNS service reads ([`Exemption::listed`]) whenever they change: the DNS side touches that
+//! small set alone, and never this inventory or its lock. Exemption has no part in the new-device or the
+//! spoof alerts, and does not depend on the known list.
+//!
+//! In the exempt-by-default mode the exempt lists have no effect: every client is exempt but the
+//! fully blocked ones, and an address is fully blocked while the device that claimed it last is on
+//! the configuration's block list or the pushed one, and always when it is the router's or the
+//! Pi's own. The inventory keeps the blocked addresses ([`Exemption::blocked`]) in step the same
+//! way, in either mode, so that turning the mode on finds them ready. The mode in force is the
+//! pushed one once a policy has been pushed since the start, and the configuration's until then.
+//!
+//! Nothing here logs but counts and the mode: the devices on a known list that came, the devices
+//! learned, the devices on an exempt list that came, and the mode and number of blocked devices of
+//! a policy that came and changed them. A MAC, an address or a host name never reaches a log line
+//! from this file.
 
 use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr};
@@ -33,6 +54,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 
 use super::frames::{Arp, DHCP_DISCOVER, DHCP_REQUEST, Dhcp, HOSTNAME_MAX, Mac};
 use crate::alerts::{Alert, AlertSink, Severity};
+use crate::dns::exempt::{self, Exemption};
 
 /// How many devices the inventory holds; past that the one seen longest ago goes.
 pub const MAX_DEVICES: usize = 512;
@@ -45,6 +67,17 @@ pub const MAX_KNOWN: usize = 1024;
 
 /// How many new-device alerts are held while the known list has not come.
 pub const MAX_HELD: usize = 64;
+
+/// How many MACs each exempt list keeps: the configuration's, and the one the desktop pushes.
+pub const MAX_EXEMPT: usize = 64;
+
+/// How many MACs each block list keeps: the configuration's, and the one the desktop pushes.
+pub const MAX_BLOCK: usize = 64;
+
+// Every address of every device on both exempt lists fits the set that the DNS side reads, and
+// so does every address of every device on both block lists with the router's and the Pi's own.
+const _: () = assert!(2 * MAX_EXEMPT * MAX_IPV4 <= exempt::MAX_ADDRS);
+const _: () = assert!(2 * MAX_BLOCK * MAX_IPV4 + 2 <= exempt::MAX_ADDRS);
 
 /// How long the watch waits for a known list before it learns every device it has seen, in
 /// monotonic seconds from the first sighting of any device.
@@ -104,6 +137,13 @@ pub struct DeviceView {
     pub last_unix: u64,
     /// Whether its MAC is on the known list, which is the learned one after the learning.
     pub known: bool,
+    /// Whether it is exempt from the ads lists. In the list mode: its MAC is on an exempt list,
+    /// the configuration's or the pushed one. In the exempt-by-default mode: it is not on a block
+    /// list, and no address that it claimed last is the router's or the Pi's own.
+    pub exempt: bool,
+    /// Whether its MAC is on a block list, the configuration's or the pushed one, whatever the
+    /// mode.
+    pub blocked: bool,
 }
 
 /// The inventory as a reader sees it.
@@ -113,6 +153,12 @@ pub struct DevicesView {
     pub known_list: KnownList,
     /// Every device in the inventory, the one seen last first.
     pub devices: Vec<DeviceView>,
+    /// The MACs of both exempt lists, sorted and each once, those not heard yet included.
+    pub exempt_macs: Vec<Mac>,
+    /// Whether the exempt-by-default mode is in force.
+    pub exempt_default: bool,
+    /// The MACs of both block lists, sorted and each once, those not heard yet included.
+    pub block_macs: Vec<Mac>,
 }
 
 /// What the inventory keeps of one device.
@@ -139,6 +185,9 @@ struct Device {
 pub struct Devices {
     /// The Pi's own address on the wireless link, which is never a device; set once it is known.
     own_mac: Option<Mac>,
+    /// The Pi's own IPv4 address, which is never exempt and always fully blocked; set once it is
+    /// given.
+    own_ip: Option<Ipv4Addr>,
     /// The router's address, whose MAC the first ARP that claims it fixes.
     gateway: Ipv4Addr,
     /// The MAC that the gateway was first heard from, fixed for the boot.
@@ -169,6 +218,29 @@ pub struct Devices {
     dropped_holds: u64,
     /// How many sightings there have been.
     sightings: u64,
+    /// The MACs that the configuration exempts from the ads lists, at most [`MAX_EXEMPT`].
+    exempt_config: HashSet<Mac>,
+    /// The MACs that the desktop last pushed as exempt, at most [`MAX_EXEMPT`].
+    exempt_pushed: HashSet<Mac>,
+    /// Whether a pushed exempt list has come since the start, which decides a log line.
+    exempt_received: bool,
+    /// Whether the configuration turns the exempt-by-default mode on.
+    default_config: bool,
+    /// The mode that the desktop last pushed; `None` until a policy has come since the start.
+    default_pushed: Option<bool>,
+    /// The MACs that the configuration keeps fully blocked, at most [`MAX_BLOCK`].
+    block_config: HashSet<Mac>,
+    /// The MACs that the desktop last pushed as fully blocked, at most [`MAX_BLOCK`].
+    block_pushed: HashSet<Mac>,
+    /// The mode and the number of blocked devices that the last policy line told, which decides
+    /// the next one; `None` until one is logged.
+    policy_logged: Option<(bool, usize)>,
+    /// Where the mode and the addresses are published, for the DNS side.
+    exemption: Arc<Exemption>,
+    /// The exempt addresses that were published last, sorted, each once.
+    exempt_published: Vec<Ipv4Addr>,
+    /// The fully blocked addresses that were published last, sorted, each once.
+    blocked_published: Vec<Ipv4Addr>,
 }
 
 impl Devices {
@@ -180,6 +252,7 @@ impl Devices {
     pub fn new(own_mac: Option<Mac>, gateway: Ipv4Addr, clock: Clock) -> Self {
         Self {
             own_mac,
+            own_ip: None,
             gateway,
             gateway_mac: None,
             pending: Vec::new(),
@@ -194,7 +267,130 @@ impl Devices {
             held: Vec::new(),
             dropped_holds: 0,
             sightings: 0,
+            exempt_config: HashSet::new(),
+            exempt_pushed: HashSet::new(),
+            exempt_received: false,
+            default_config: false,
+            default_pushed: None,
+            block_config: HashSet::new(),
+            block_pushed: HashSet::new(),
+            policy_logged: None,
+            exemption: Arc::default(),
+            exempt_published: Vec::new(),
+            blocked_published: Vec::new(),
         }
+    }
+
+    /// Makes the inventory publish who is exempt to `exemption`, which the DNS service reads: it
+    /// is given the mode and the addresses now at once, and kept in step from then on. Until this
+    /// is called the inventory publishes to one of its own, which nobody reads.
+    pub fn with_exemption(mut self, exemption: Arc<Exemption>) -> Self {
+        self.exemption = exemption;
+        self.exempt_published = self.exempt_now();
+        self.exemption.listed().replace(&self.exempt_published);
+        self.blocked_published = self.blocked_now();
+        self.exemption.blocked().replace(&self.blocked_published);
+        self.publish_unblocked();
+        self.exemption.set_by_default(self.exempt_default());
+        self
+    }
+
+    /// Gives the inventory the Pi's own IPv4 address, which, like the router's, is never in the
+    /// exempt set and always in the blocked one, whatever MAC claims it.
+    pub fn with_own_ip(mut self, ip: Ipv4Addr) -> Self {
+        self.own_ip = Some(ip);
+        self.refresh_exempt();
+        self
+    }
+
+    /// Sets whether the configuration turns the exempt-by-default mode on. It is the mode in
+    /// force until a policy is pushed.
+    pub fn set_exempt_default_config(&mut self, on: bool) {
+        self.default_config = on;
+        self.publish_mode();
+    }
+
+    /// Replaces the configuration's block list with `macs` and says how many different ones it
+    /// kept: the first [`MAX_BLOCK`] of them. The pushed list stays as it is, and the blocked
+    /// addresses are worked out again.
+    pub fn set_block_config(&mut self, macs: Vec<Mac>) -> usize {
+        self.block_config = first_different(macs, MAX_BLOCK);
+        self.refresh_exempt();
+        self.block_config.len()
+    }
+
+    /// Replaces the pushed policy: the mode, which is the one in force from now on, and the pushed
+    /// block list, of which the first [`MAX_BLOCK`] different MACs are kept; it says how many. The
+    /// configuration's block list stays as it is. A MAC need not be in the inventory: one that has
+    /// not been heard has no address, and its address is fully blocked from when it is heard.
+    ///
+    /// One line tells the mode, and in the exempt-by-default mode the number of different MACs of
+    /// both block lists, when that is not what the line before told; no MAC or address is logged.
+    pub fn set_policy(&mut self, exempt_default: bool, block: Vec<Mac>) -> usize {
+        self.block_pushed = first_different(block, MAX_BLOCK);
+        self.default_pushed = Some(exempt_default);
+        // The blocked set is up to date before the mode that reads it is turned on.
+        self.refresh_exempt();
+        self.publish_mode();
+        if let Some(line) = self.policy_news() {
+            log::info!("{line}");
+        }
+        self.block_pushed.len()
+    }
+
+    /// The line that tells the policy in force, after one was pushed, if it is not what the line
+    /// before told: the mode and, in the exempt-by-default mode, the number of different MACs of
+    /// both block lists. It tells no MAC and no address.
+    fn policy_news(&mut self) -> Option<String> {
+        let on = self.exempt_default();
+        let blocked = self.block_config.union(&self.block_pushed).count();
+        let told = (on, if on { blocked } else { 0 });
+        if self.policy_logged == Some(told) {
+            return None;
+        }
+        self.policy_logged = Some(told);
+        Some(if on {
+            format!(
+                "watch: exemption policy received: exempt by default, {blocked} blocked devices"
+            )
+        } else {
+            "watch: exemption policy received: exempt list only".to_owned()
+        })
+    }
+
+    /// Whether the exempt-by-default mode is in force: the pushed mode once a policy has come,
+    /// and the configuration's until then.
+    pub fn exempt_default(&self) -> bool {
+        self.default_pushed.unwrap_or(self.default_config)
+    }
+
+    /// Replaces the configuration's exempt list with `macs` and says how many different ones it
+    /// kept: the first [`MAX_EXEMPT`] of them. The pushed list stays as it is, and the exempt
+    /// addresses are worked out again.
+    pub fn set_exempt_config(&mut self, macs: Vec<Mac>) -> usize {
+        self.exempt_config = first_different(macs, MAX_EXEMPT);
+        self.refresh_exempt();
+        self.exempt_config.len()
+    }
+
+    /// Replaces the pushed exempt list with `macs` and says how many different ones it kept: the
+    /// first [`MAX_EXEMPT`] of them. The configuration's list stays as it is, and the exempt
+    /// addresses are worked out again. A MAC need not be in the inventory: one that has not been
+    /// heard has no address, and is exempt from when it is heard.
+    ///
+    /// One line says how many devices the list has, when it is the first since the start or that
+    /// count changed; no MAC or address is logged.
+    pub fn set_exempt(&mut self, macs: Vec<Mac>) -> usize {
+        let pushed = first_different(macs, MAX_EXEMPT);
+        let kept = pushed.len();
+        let news = !self.exempt_received || self.exempt_pushed.len() != kept;
+        self.exempt_pushed = pushed;
+        self.exempt_received = true;
+        self.refresh_exempt();
+        if news {
+            log::info!("watch: exempt list of {kept} devices received");
+        }
+        kept
     }
 
     /// Sets the Pi's own hardware address, which is never a device, and drops it from the
@@ -347,6 +543,7 @@ impl Devices {
 
     /// The inventory now, the device seen last first.
     pub fn view(&self) -> DevicesView {
+        let by_default = self.exempt_default();
         let mut seen: Vec<(u64, DeviceView)> = self
             .devices
             .iter()
@@ -358,14 +555,35 @@ impl Devices {
                     first_unix: device.first_unix,
                     last_unix: device.last_unix,
                     known: self.known.contains(&mac),
+                    exempt: if by_default {
+                        !self.is_blocked(mac) && !self.claims_router_or_pi(mac, device)
+                    } else {
+                        self.is_exempt(mac)
+                    },
+                    blocked: self.is_blocked(mac),
                 };
                 (device.seen, view)
             })
             .collect();
         seen.sort_unstable_by_key(|(seen, _)| std::cmp::Reverse(*seen));
+        let mut exempt_macs: Vec<Mac> = self
+            .exempt_config
+            .union(&self.exempt_pushed)
+            .copied()
+            .collect();
+        exempt_macs.sort_unstable();
+        let mut block_macs: Vec<Mac> = self
+            .block_config
+            .union(&self.block_pushed)
+            .copied()
+            .collect();
+        block_macs.sort_unstable();
         DevicesView {
             known_list: self.state,
             devices: seen.into_iter().map(|(_, view)| view).collect(),
+            exempt_macs,
+            exempt_default: by_default,
+            block_macs,
         }
     }
 
@@ -400,7 +618,113 @@ impl Devices {
     /// Whether `mac` can be the address of a device: not all zeros, not a broadcast or multicast
     /// address, and not the Pi's own.
     fn is_device(&self, mac: Mac) -> bool {
-        mac.0 != [0; 6] && mac.0[0] & 1 == 0 && Some(mac) != self.own_mac
+        mac.can_be_a_device() && Some(mac) != self.own_mac
+    }
+
+    /// Whether `mac` is on an exempt list, the configuration's or the pushed one.
+    fn is_exempt(&self, mac: Mac) -> bool {
+        self.exempt_config.contains(&mac) || self.exempt_pushed.contains(&mac)
+    }
+
+    /// Whether `mac` is on a block list, the configuration's or the pushed one.
+    fn is_blocked(&self, mac: Mac) -> bool {
+        self.block_config.contains(&mac) || self.block_pushed.contains(&mac)
+    }
+
+    /// Whether `mac` is on any of the four lists, so that an address it takes or leaves may
+    /// change a published set.
+    fn is_listed(&self, mac: Mac) -> bool {
+        self.is_exempt(mac) || self.is_blocked(mac)
+    }
+
+    /// Whether `ip` is the router's address or the Pi's own.
+    fn is_router_or_pi(&self, ip: Ipv4Addr) -> bool {
+        ip == self.gateway || Some(ip) == self.own_ip
+    }
+
+    /// Whether `device`, which is `mac`'s, claimed the router's address or the Pi's own last.
+    fn claims_router_or_pi(&self, mac: Mac, device: &Device) -> bool {
+        device
+            .ipv4
+            .iter()
+            .any(|&ip| self.is_router_or_pi(ip) && self.by_ip.get(&ip) == Some(&mac))
+    }
+
+    /// The addresses that the devices of `macs` claimed last, as an iterator: each address of
+    /// each of them that is in the inventory, and that no other device claimed after it.
+    fn claimed_by<'a>(
+        &'a self,
+        macs: impl Iterator<Item = &'a Mac> + 'a,
+    ) -> impl Iterator<Item = Ipv4Addr> + 'a {
+        macs.filter_map(|mac| Some((mac, self.devices.get(mac)?)))
+            .flat_map(move |(mac, device)| {
+                device
+                    .ipv4
+                    .iter()
+                    .copied()
+                    .filter(move |ip| self.by_ip.get(ip) == Some(mac))
+            })
+    }
+
+    /// The addresses that are exempt now, sorted, each once: each address of an exempt device in
+    /// the inventory that the device claimed last, but for the router's and the Pi's own, which
+    /// are never exempt.
+    fn exempt_now(&self) -> Vec<Ipv4Addr> {
+        let mut addrs: Vec<Ipv4Addr> = self
+            .claimed_by(self.exempt_config.iter().chain(&self.exempt_pushed))
+            .filter(|&ip| !self.is_router_or_pi(ip))
+            .collect();
+        addrs.sort_unstable();
+        addrs.dedup();
+        addrs
+    }
+
+    /// The addresses that are fully blocked now, sorted, each once: the router's and the Pi's own,
+    /// and each address of a device on a block list in the inventory that the device claimed
+    /// last. The router's and the Pi's come first, so that a cut of the set could never drop them.
+    fn blocked_now(&self) -> Vec<Ipv4Addr> {
+        let mut addrs: Vec<Ipv4Addr> = [Some(self.gateway), self.own_ip]
+            .into_iter()
+            .flatten()
+            .chain(self.claimed_by(self.block_config.iter().chain(&self.block_pushed)))
+            .collect();
+        addrs.sort_unstable();
+        addrs.dedup();
+        addrs
+    }
+
+    /// Works out the exempt and the fully blocked addresses again, and publishes each set that
+    /// changed, and the count of the addresses that are not blocked. It looks at the devices of
+    /// the four lists alone, at most 256 of four addresses each.
+    fn refresh_exempt(&mut self) {
+        let now = self.exempt_now();
+        if now != self.exempt_published {
+            self.exemption.listed().replace(&now);
+            self.exempt_published = now;
+        }
+        let now = self.blocked_now();
+        if now != self.blocked_published {
+            self.exemption.blocked().replace(&now);
+            self.blocked_published = now;
+        }
+        self.publish_unblocked();
+    }
+
+    /// Publishes how many addresses of the index are not fully blocked: each address that a
+    /// device claimed last counts once. It looks up the blocked addresses alone, at most 514.
+    fn publish_unblocked(&self) {
+        let blocked = self
+            .blocked_published
+            .iter()
+            .filter(|ip| self.by_ip.contains_key(ip))
+            .count();
+        self.exemption
+            .set_unblocked(self.by_ip.len().saturating_sub(blocked));
+    }
+
+    /// Publishes the mode in force.
+    fn publish_mode(&self) {
+        self.exemption.set_by_default(self.exempt_default());
     }
 
     /// Fixes the gateway's MAC on the first ARP that claims its address from an address that can
@@ -434,6 +758,19 @@ impl Devices {
         if !self.is_device(mac) {
             return;
         }
+        // The published addresses change only if the address passes to this device from another,
+        // and this one or the one before it is on a list, or a device that leaves the inventory is
+        // (which `forget` sees to). An address that the device claimed last already is in its
+        // list, so claiming it again changes nothing, which is the usual case. Any new claim may
+        // change the count of the addresses that are not blocked.
+        let (claimed, listed_touched) = match ip.map(|ip| self.by_ip.get(&ip)) {
+            None => (false, false),
+            Some(Some(&before)) if before == mac => (false, false),
+            Some(before) => (
+                true,
+                self.is_listed(mac) || before.is_some_and(|&before| self.is_listed(before)),
+            ),
+        };
         let (mono, unix) = (self.clock)();
         self.first_seen.get_or_insert(mono);
         self.sightings += 1;
@@ -469,6 +806,11 @@ impl Devices {
             }
             device.ipv4.push(ip);
             self.by_ip.insert(ip, mac);
+        }
+        if listed_touched {
+            self.refresh_exempt();
+        } else if claimed {
+            self.publish_unblocked();
         }
         self.judge(mac);
     }
@@ -538,7 +880,8 @@ impl Devices {
         }
     }
 
-    /// Takes `mac` out of the inventory, and the addresses that lead to it out of the index.
+    /// Takes `mac` out of the inventory, and the addresses that lead to it out of the index and,
+    /// if it is on a list, out of the published sets.
     fn forget(&mut self, mac: Mac) {
         if let Some(device) = self.devices.remove(&mac) {
             for ip in device.ipv4 {
@@ -546,8 +889,25 @@ impl Devices {
                     self.by_ip.remove(&ip);
                 }
             }
+            if self.is_listed(mac) {
+                self.refresh_exempt();
+            } else {
+                self.publish_unblocked();
+            }
         }
     }
+}
+
+/// The first `cap` different MACs of `macs`.
+fn first_different(macs: Vec<Mac>, cap: usize) -> HashSet<Mac> {
+    let mut set = HashSet::new();
+    for mac in macs {
+        if set.len() >= cap {
+            break;
+        }
+        set.insert(mac);
+    }
+    set
 }
 
 /// Calls `call` with the inventory locked, then raises the alerts that it made through `sink`
@@ -574,6 +934,8 @@ pub fn with_devices<R>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use crate::dns::exempt::AddrSet;
 
     use std::ops::{Deref, DerefMut};
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -1507,6 +1869,454 @@ mod tests {
         assert_eq!(devices.view().known_list, KnownList::Learned);
         assert!(devices.known.contains(&mac(5)));
         assert!(devices.known.contains(&mac(9)));
+    }
+
+    /// An inventory for a network whose router is 192.0.2.1 and where the Pi is 192.0.2.2, the
+    /// clock it uses, and the exempt set that it keeps for the DNS side.
+    fn exempt_setup() -> (Rig, FakeClock, Arc<Exemption>) {
+        let clock = FakeClock::new();
+        let addrs = Arc::new(Exemption::new());
+        let devices = Devices::new(Some(own()), ip(1), clock.as_clock())
+            .with_exemption(addrs.clone())
+            .with_own_ip(ip(2));
+        (Rig::around(devices), clock, addrs)
+    }
+
+    /// The hosts `192.0.2.<host>` of the exempt set, in order, of those that can be in it here.
+    fn exempt_hosts(exemption: &Exemption) -> Vec<u8> {
+        hosts_of(exemption.listed())
+    }
+
+    /// The hosts `192.0.2.<host>` of `set`, in order.
+    fn hosts_of(set: &AddrSet) -> Vec<u8> {
+        (0..=255)
+            .filter(|&host| set.contains(IpAddr::V4(ip(host))))
+            .collect()
+    }
+
+    #[test]
+    fn an_exempt_device_has_its_addresses_exempt_once_it_is_heard() {
+        let (mut devices, _, addrs) = exempt_setup();
+        // On the list but not heard yet: it has no address, and nothing is exempt.
+        assert_eq!(devices.set_exempt(macs(&[5])), 1);
+        assert!(addrs.listed().is_empty());
+        devices.on_arp(&arp(mac(5), ip(5)));
+        assert_eq!(exempt_hosts(&addrs), [5]);
+        // A DHCP request for another address adds it; the first one is still the device's.
+        devices.on_dhcp(&dhcp(
+            DHCP_REQUEST,
+            mac(5),
+            Some(ip(6)),
+            Ipv4Addr::UNSPECIFIED,
+            None,
+        ));
+        assert_eq!(exempt_hosts(&addrs), [5, 6]);
+        // A device that is not on the list is not exempt, and a probe adds no address.
+        devices.on_arp(&arp(mac(7), ip(7)));
+        devices.on_arp(&arp(mac(5), Ipv4Addr::UNSPECIFIED));
+        assert_eq!(exempt_hosts(&addrs), [5, 6]);
+    }
+
+    #[test]
+    fn an_address_that_another_device_claims_leaves_the_set_at_once() {
+        let (mut devices, _, addrs) = exempt_setup();
+        devices.set_exempt(macs(&[5]));
+        devices.on_arp(&arp(mac(5), ip(5)));
+        devices.on_arp(&arp(mac(6), ip(5)));
+        assert!(addrs.listed().is_empty());
+        // Claimed back, it is exempt again.
+        devices.on_arp(&arp(mac(5), ip(5)));
+        assert_eq!(exempt_hosts(&addrs), [5]);
+        // A claim by DHCP counts as one by ARP does.
+        devices.on_dhcp(&dhcp(
+            DHCP_REQUEST,
+            mac(6),
+            Some(ip(5)),
+            Ipv4Addr::UNSPECIFIED,
+            None,
+        ));
+        assert!(addrs.listed().is_empty());
+        // When the device that takes it over is exempt too, it stays in the set.
+        devices.set_exempt_config(macs(&[6]));
+        assert_eq!(exempt_hosts(&addrs), [5]);
+        devices.on_arp(&arp(mac(5), ip(5)));
+        assert_eq!(exempt_hosts(&addrs), [5]);
+    }
+
+    #[test]
+    fn a_change_of_either_list_recomputes_the_set() {
+        let (mut devices, _, addrs) = exempt_setup();
+        for n in 5..=7 {
+            devices.on_arp(&arp(mac(n), ip(n)));
+        }
+        assert!(addrs.listed().is_empty());
+        devices.set_exempt(macs(&[5, 6]));
+        assert_eq!(exempt_hosts(&addrs), [5, 6]);
+        devices.set_exempt_config(macs(&[7]));
+        assert_eq!(exempt_hosts(&addrs), [5, 6, 7]);
+        // A pushed list replaces the pushed list and leaves the configuration's alone.
+        devices.set_exempt(macs(&[6]));
+        assert_eq!(exempt_hosts(&addrs), [6, 7]);
+        assert_eq!(devices.set_exempt(Vec::new()), 0);
+        assert_eq!(exempt_hosts(&addrs), [7]);
+        devices.set_exempt_config(Vec::new());
+        assert!(addrs.listed().is_empty());
+    }
+
+    #[test]
+    fn the_view_tells_which_devices_are_exempt_and_lists_both_lists_sorted() {
+        let (mut devices, _, _) = exempt_setup();
+        devices.on_arp(&arp(mac(5), ip(5)));
+        devices.on_arp(&arp(mac(6), ip(6)));
+        devices.set_exempt_config(macs(&[9, 5]));
+        // Duplicates collapse, and a MAC on both lists is listed once.
+        assert_eq!(devices.set_exempt(macs(&[8, 5, 8])), 2);
+        let view = devices.view();
+        assert_eq!(view.exempt_macs, macs(&[5, 8, 9]));
+        let exempt: Vec<(u8, bool)> = view
+            .devices
+            .iter()
+            .map(|d| (d.mac.0[5], d.exempt))
+            .collect();
+        assert_eq!(exempt, [(6, false), (5, true)]);
+        // Exemption says nothing about the known list.
+        assert!(view.devices.iter().all(|d| !d.known));
+    }
+
+    #[test]
+    fn each_list_keeps_its_first_64_different_macs() {
+        let (mut devices, _, addrs) = exempt_setup();
+        let many: Vec<Mac> = (0..70).map(mac2).collect();
+        assert_eq!(devices.set_exempt(many.clone()), MAX_EXEMPT);
+        devices.on_arp(&arp(mac2(63), ip(63)));
+        devices.on_arp(&arp(mac2(64), ip(64)));
+        assert_eq!(exempt_hosts(&addrs), [63]);
+        // The configuration's list is held to the same, apart.
+        let later: Vec<Mac> = (100..170).map(mac2).collect();
+        assert_eq!(devices.set_exempt_config(later), MAX_EXEMPT);
+        assert_eq!(devices.view().exempt_macs.len(), 2 * MAX_EXEMPT);
+    }
+
+    #[test]
+    fn exemption_changes_no_alert() {
+        let (mut devices, _, addrs) = exempt_setup();
+        devices.set_exempt_config(macs(&[2, 3, 5]));
+        devices.set_known(macs(&[2]));
+        // An exempt device that is not known is new all the same.
+        devices.on_arp(&arp(mac(5), ip(5)));
+        assert_eq!(devices.raised(), [new_device(mac(5))]);
+        // And an exempt device that claims the gateway is a spoof all the same.
+        devices.on_arp(&arp(mac(2), ip(1)));
+        devices.on_arp(&arp(mac(3), ip(1)));
+        assert_eq!(
+            devices.raised(),
+            [new_device(mac(5)), spoof(mac(3)), new_device(mac(3))]
+        );
+        // The router's address is never exempt, whoever claims it.
+        assert_eq!(exempt_hosts(&addrs), [5]);
+    }
+
+    #[test]
+    fn the_routers_address_and_the_pis_own_are_never_exempt_whatever_mac_claims_them() {
+        let (mut devices, _, addrs) = exempt_setup();
+        devices.set_exempt(macs(&[5]));
+        devices.on_arp(&arp(mac(5), ip(5)));
+        // The exempt device claims the router's address, as a spoof would, and then the Pi's.
+        devices.on_arp(&arp(mac(5), ip(1)));
+        devices.on_dhcp(&dhcp(
+            DHCP_REQUEST,
+            mac(5),
+            Some(ip(2)),
+            Ipv4Addr::UNSPECIFIED,
+            None,
+        ));
+        assert_eq!(devices.view().devices[0].ipv4, [ip(2), ip(1), ip(5)]);
+        // Its own other address stays exempt, and the two never are.
+        assert_eq!(exempt_hosts(&addrs), [5]);
+        // A plain address that it claims later is added as ever.
+        devices.on_arp(&arp(mac(5), ip(6)));
+        assert_eq!(exempt_hosts(&addrs), [5, 6]);
+        // A list that changes works the set out again the same way.
+        devices.set_exempt(Vec::new());
+        assert!(addrs.listed().is_empty());
+        devices.set_exempt_config(macs(&[5]));
+        assert_eq!(exempt_hosts(&addrs), [5, 6]);
+        // An own address given after the device claimed it leaves the set at once.
+        let clock = FakeClock::new();
+        let late = Arc::new(Exemption::new());
+        let mut devices =
+            Devices::new(Some(own()), ip(1), clock.as_clock()).with_exemption(late.clone());
+        devices.set_exempt(macs(&[5]));
+        devices.on_arp(&arp(mac(5), ip(2)));
+        devices.on_arp(&arp(mac(5), ip(5)));
+        assert_eq!(exempt_hosts(&late), [2, 5]);
+        let _devices = devices.with_own_ip(ip(2));
+        assert_eq!(exempt_hosts(&late), [5]);
+    }
+
+    #[test]
+    fn a_device_that_leaves_the_inventory_or_an_address_takes_it_out_of_the_set() {
+        let (mut devices, _, addrs) = exempt_setup();
+        devices.set_exempt(vec![mac2(0)]);
+        // A fifth address pushes the oldest out of the device, and so out of the set.
+        for host in 10..=14 {
+            devices.on_arp(&arp(mac2(0), ip(host)));
+        }
+        assert_eq!(exempt_hosts(&addrs), [11, 12, 13, 14]);
+        // Pushed out of the inventory by 512 later devices, it has no address at all.
+        for n in 1..=MAX_DEVICES as u16 {
+            devices.on_arp(&arp(mac2(n), ip(200)));
+        }
+        assert!(devices.view().devices.iter().all(|d| d.mac != mac2(0)));
+        assert!(addrs.listed().is_empty());
+        // Heard again, it is exempt again.
+        devices.on_arp(&arp(mac2(0), ip(10)));
+        assert_eq!(exempt_hosts(&addrs), [10]);
+    }
+
+    #[test]
+    fn the_own_mac_and_addresses_that_are_no_device_are_never_exempt() {
+        let (mut devices, _, addrs) = exempt_setup();
+        devices.set_exempt(vec![own(), Mac([0xff; 6]), Mac([0; 6])]);
+        devices.on_arp(&arp(own(), ip(5)));
+        devices.on_arp(&arp(Mac([0xff; 6]), ip(6)));
+        devices.on_arp(&arp(Mac([0; 6]), ip(7)));
+        assert!(addrs.listed().is_empty());
+    }
+
+    #[test]
+    fn the_set_is_read_while_the_inventory_is_locked() {
+        let (mut devices, _, addrs) = exempt_setup();
+        devices.set_exempt(macs(&[5]));
+        devices.on_arp(&arp(mac(5), ip(5)));
+        let inventory = Mutex::new(devices.inner);
+        let _held = inventory.lock().unwrap();
+        // The DNS side touches the set alone, never the inventory, so that lock holds nothing up.
+        assert!(addrs.listed().contains(IpAddr::V4(ip(5))));
+    }
+
+    /// The hosts `192.0.2.<host>` of the fully blocked set, in order.
+    fn blocked_hosts(exemption: &Exemption) -> Vec<u8> {
+        hosts_of(exemption.blocked())
+    }
+
+    #[test]
+    fn the_router_and_the_pi_are_fully_blocked_from_the_start_in_either_mode() {
+        let (mut devices, _, exemption) = exempt_setup();
+        assert!(!exemption.by_default());
+        assert_eq!(blocked_hosts(&exemption), [1, 2]);
+        devices.set_exempt_default_config(true);
+        assert!(exemption.by_default() && devices.exempt_default());
+        assert_eq!(blocked_hosts(&exemption), [1, 2]);
+        // An own address given late joins the set at once, before any device is heard.
+        let clock = FakeClock::new();
+        let late = Arc::new(Exemption::new());
+        let devices =
+            Devices::new(Some(own()), ip(1), clock.as_clock()).with_exemption(late.clone());
+        assert_eq!(blocked_hosts(&late), [1]);
+        let _devices = devices.with_own_ip(ip(2));
+        assert_eq!(blocked_hosts(&late), [1, 2]);
+    }
+
+    #[test]
+    fn a_blocked_device_has_its_addresses_fully_blocked_once_heard_and_only_while_it_claims_them() {
+        let (mut devices, _, exemption) = exempt_setup();
+        devices.set_exempt_default_config(true);
+        assert_eq!(devices.set_block_config(macs(&[5])), 1);
+        // Not heard yet: no address of its own is blocked, so any client is exempt.
+        assert!(exemption.is_exempt(IpAddr::V4(ip(5))));
+        devices.on_arp(&arp(mac(5), ip(5)));
+        assert_eq!(blocked_hosts(&exemption), [1, 2, 5]);
+        assert!(!exemption.is_exempt(IpAddr::V4(ip(5))));
+        assert!(!exemption.is_exempt(IpAddr::V6(ip(5).to_ipv6_mapped())));
+        // Another device takes the address over: it is exempt at once, and back when reclaimed.
+        devices.on_arp(&arp(mac(6), ip(5)));
+        assert_eq!(blocked_hosts(&exemption), [1, 2]);
+        assert!(exemption.is_exempt(IpAddr::V4(ip(5))));
+        devices.on_dhcp(&dhcp(
+            DHCP_REQUEST,
+            mac(5),
+            Some(ip(5)),
+            Ipv4Addr::UNSPECIFIED,
+            None,
+        ));
+        assert!(!exemption.is_exempt(IpAddr::V4(ip(5))));
+        // A blocked device that moves to a new address takes the block with it; the old one,
+        // still its own, stays blocked too.
+        devices.on_arp(&arp(mac(5), ip(9)));
+        assert_eq!(blocked_hosts(&exemption), [1, 2, 5, 9]);
+        // Unknown devices, other addresses and IPv6 clients are exempt.
+        devices.on_arp(&arp(mac(7), ip(7)));
+        for client in [
+            IpAddr::V4(ip(7)),
+            IpAddr::V4(ip(100)),
+            IpAddr::V6("2001:db8::5".parse().unwrap()),
+        ] {
+            assert!(exemption.is_exempt(client), "{client}");
+        }
+        // The router and the Pi are not, whoever claims them.
+        devices.on_arp(&arp(mac(7), ip(2)));
+        assert!(!exemption.is_exempt(IpAddr::V4(ip(1))));
+        assert!(!exemption.is_exempt(IpAddr::V4(ip(2))));
+        // Off the list, its addresses are exempt again.
+        devices.set_block_config(Vec::new());
+        assert_eq!(blocked_hosts(&exemption), [1, 2]);
+    }
+
+    #[test]
+    fn a_pushed_policy_wins_over_the_configurations_mode_and_adds_to_its_block_list() {
+        let (mut devices, _, exemption) = exempt_setup();
+        for n in 5..=8 {
+            devices.on_arp(&arp(mac(n), ip(n)));
+        }
+        devices.set_exempt_config(macs(&[5]));
+        devices.set_block_config(macs(&[6]));
+        // The list mode: only the exempt list counts, and the block list does nothing.
+        assert!(exemption.is_exempt(IpAddr::V4(ip(5))));
+        assert!(!exemption.is_exempt(IpAddr::V4(ip(7))));
+        assert!(!exemption.is_exempt(IpAddr::V4(ip(6))));
+        // A pushed policy turns the mode on at once; both block lists count, the exempt one not.
+        assert_eq!(devices.set_policy(true, macs(&[7, 7, 9])), 2);
+        assert!(exemption.by_default() && devices.exempt_default());
+        assert_eq!(blocked_hosts(&exemption), [1, 2, 6, 7]);
+        for (host, exempt) in [(5, true), (6, false), (7, false), (8, true), (9, true)] {
+            assert_eq!(exemption.is_exempt(IpAddr::V4(ip(host))), exempt, "{host}");
+        }
+        // The pushed mode stays in force whatever the configuration's is set to later.
+        devices.set_exempt_default_config(false);
+        assert!(exemption.by_default());
+        // A policy that turns it off goes back to the exempt list at once.
+        assert_eq!(devices.set_policy(false, Vec::new()), 0);
+        assert!(!exemption.by_default() && !devices.exempt_default());
+        assert!(exemption.is_exempt(IpAddr::V4(ip(5))));
+        assert!(!exemption.is_exempt(IpAddr::V4(ip(8))));
+        // The pushed block list was replaced; the configuration's stays.
+        assert_eq!(blocked_hosts(&exemption), [1, 2, 6]);
+        assert_eq!(devices.view().block_macs, macs(&[6]));
+    }
+
+    #[test]
+    fn the_view_tells_the_mode_the_block_lists_and_who_is_exempt_in_the_mode_in_force() {
+        let (mut devices, _, _) = exempt_setup();
+        devices.on_arp(&arp(mac(5), ip(5)));
+        devices.on_arp(&arp(mac(6), ip(6)));
+        devices.on_arp(&arp(mac(7), ip(1)));
+        devices.set_exempt_config(macs(&[5]));
+        devices.set_block_config(macs(&[9, 6]));
+        devices.set_policy(false, macs(&[6, 8]));
+        let flags = |view: &DevicesView| -> Vec<(u8, bool, bool)> {
+            view.devices
+                .iter()
+                .map(|d| (d.mac.0[5], d.exempt, d.blocked))
+                .collect()
+        };
+        // The list mode: exempt is the exempt list; blocked is the block list, all the same.
+        let view = devices.view();
+        assert!(!view.exempt_default);
+        assert_eq!(view.block_macs, macs(&[6, 8, 9]));
+        assert_eq!(view.exempt_macs, macs(&[5]));
+        assert_eq!(
+            flags(&view),
+            [(7, false, false), (6, false, true), (5, true, false)]
+        );
+        // Exempt by default: all but the blocked device and the one that claims the router.
+        devices.set_policy(true, macs(&[6, 8]));
+        let view = devices.view();
+        assert!(view.exempt_default);
+        assert_eq!(
+            flags(&view),
+            [(7, false, false), (6, false, true), (5, true, false)]
+        );
+        devices.on_arp(&arp(mac(10), ip(10)));
+        assert!(devices.view().devices[0].exempt);
+        // The device that claimed the router's address loses it to another: it is exempt again.
+        devices.on_arp(&arp(mac(11), ip(1)));
+        let view = devices.view();
+        let seven = view.devices.iter().find(|d| d.mac == mac(7)).unwrap();
+        assert!(seven.exempt);
+    }
+
+    #[test]
+    fn the_count_of_exempt_clients_follows_the_addresses_that_are_not_fully_blocked() {
+        let (mut devices, _, exemption) = exempt_setup();
+        devices.set_exempt_config(macs(&[5]));
+        devices.set_block_config(macs(&[6]));
+        for n in 5..=8 {
+            devices.on_arp(&arp(mac(n), ip(n)));
+        }
+        // The list mode counts the exempt addresses.
+        assert_eq!(exemption.exempt_clients(), 1);
+        devices.set_exempt_default_config(true);
+        // Exempt by default: .5, .7 and .8, not the blocked .6.
+        assert_eq!(exemption.exempt_clients(), 3);
+        // The router and the Pi, when heard, are not counted.
+        devices.on_arp(&arp(mac(20), ip(1)));
+        devices.on_arp(&arp(mac(21), ip(2)));
+        assert_eq!(exemption.exempt_clients(), 3);
+        // A new address counts, and one that passes to the blocked device stops counting.
+        devices.on_arp(&arp(mac(7), ip(17)));
+        assert_eq!(exemption.exempt_clients(), 4);
+        devices.on_arp(&arp(mac(6), ip(17)));
+        assert_eq!(exemption.exempt_clients(), 3);
+        // A device pushed out of the inventory takes its addresses out of the count.
+        for n in 100..100 + MAX_DEVICES as u16 {
+            devices.on_arp(&arp(mac2(n), ip(250)));
+        }
+        assert_eq!(exemption.exempt_clients(), 1);
+    }
+
+    #[test]
+    fn each_block_list_keeps_its_first_64_different_macs() {
+        let (mut devices, _, exemption) = exempt_setup();
+        let many: Vec<Mac> = (0..70).map(mac2).collect();
+        assert_eq!(devices.set_policy(true, many.clone()), MAX_BLOCK);
+        devices.on_arp(&arp(mac2(63), ip(63)));
+        devices.on_arp(&arp(mac2(64), ip(64)));
+        assert_eq!(blocked_hosts(&exemption), [1, 2, 63]);
+        let later: Vec<Mac> = (100..170).map(mac2).collect();
+        assert_eq!(devices.set_block_config(later), MAX_BLOCK);
+        assert_eq!(devices.view().block_macs.len(), 2 * MAX_BLOCK);
+        // Every address of every device on both lists fits the set, with the router and the Pi.
+        let blocked: Vec<Mac> = (0..64).map(mac2).chain((100..164).map(mac2)).collect();
+        for (n, &mac) in blocked.iter().enumerate() {
+            for k in 0..MAX_IPV4 {
+                let at = (n * MAX_IPV4 + k) as u16;
+                devices.on_arp(&arp(mac, Ipv4Addr::new(198, 51, (at >> 8) as u8, at as u8)));
+            }
+        }
+        assert_eq!(
+            exemption.blocked().len(),
+            2 * MAX_BLOCK * MAX_IPV4 + 2,
+            "every blocked address is in the set"
+        );
+        assert!(!exemption.is_exempt(IpAddr::V4(ip(1))));
+    }
+
+    #[test]
+    fn a_policy_is_logged_only_when_the_mode_or_the_number_of_blocked_devices_changes() {
+        let (mut devices, _, _) = exempt_setup();
+        devices.set_block_config(macs(&[6]));
+        devices.set_policy(true, macs(&[5]));
+        assert_eq!(devices.policy_logged, Some((true, 2)));
+        // The same policy again tells nothing new.
+        assert_eq!(devices.policy_news(), None);
+        // In the list mode the number of blocked devices is not told, so a new list is no news.
+        devices.set_policy(false, macs(&[5, 7]));
+        assert_eq!(devices.policy_logged, Some((false, 0)));
+        devices.set_policy(false, Vec::new());
+        assert_eq!(devices.policy_news(), None);
+        // The lines tell the mode and a count, and never a MAC.
+        devices.policy_logged = None;
+        assert_eq!(
+            devices.policy_news().as_deref(),
+            Some("watch: exemption policy received: exempt list only")
+        );
+        devices.set_policy(true, macs(&[5, 8]));
+        devices.policy_logged = None;
+        assert_eq!(
+            devices.policy_news().as_deref(),
+            Some("watch: exemption policy received: exempt by default, 3 blocked devices")
+        );
     }
 
     #[test]

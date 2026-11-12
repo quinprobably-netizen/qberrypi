@@ -18,11 +18,13 @@ pub const MOUNT_POINT: &str = "/boot";
 pub const LOG_FILE_CAP: u64 = 1024 * 1024;
 
 /// The configuration the firmware reads; it decides which system starts.
-const ACTIVE_CONFIG: &str = "config.txt";
+pub(crate) const ACTIVE_CONFIG: &str = "config.txt";
 /// The saved copy of Raspberry Pi OS's configuration.
 const PIOS_CONFIG: &str = "config.pios.txt";
-/// The folder that holds qberrypi's own files.
-const OWN_DIR: &str = "qberrypi";
+/// The folder that holds qberrypi's own files on the old layout, where it lies beside Raspberry
+/// Pi OS. On a slot card the folder is the slot's (`slots::Slot::dir`), and the functions that
+/// read or write the files of the folder take its name.
+pub const OWN_DIR: &str = "qberrypi";
 const CONFIG_TEXT: &str = "qberrypi.toml";
 const LOG_FILE: &str = "log.txt";
 
@@ -84,19 +86,27 @@ pub fn restore_pios_config(boot: &Path) -> io::Result<Restore> {
         Err(error) => return Err(error),
     }
 
-    // The file is overwritten where it lies. Renaming a finished copy into
-    // place is not atomic on FAT and would leave a moment with no config.txt.
-    // Opened without truncation, so the file is never zero-length on the way:
-    // the new bytes go over the old ones, and only then is any old tail cut off.
+    overwrite_in_place(&active, &backup)?;
+    Ok(Restore::Restored)
+}
+
+/// Makes `path` hold exactly `bytes`, writing over the old bytes where the file lies.
+///
+/// The file is overwritten in place because renaming a finished copy into place is not
+/// atomic on FAT and would leave a moment with no file. It is opened without truncation, so
+/// it is never zero-length on the way: the new bytes go over the old ones, and only then is
+/// any old tail cut off. The file is made if it is missing (its folder never is), and the
+/// call returns once the bytes are on the card. An error from any step is returned, and may
+/// leave the file with some of the new bytes over the old.
+pub fn overwrite_in_place(path: &Path, bytes: &[u8]) -> io::Result<()> {
     let mut file = File::options()
         .write(true)
         .create(true)
         .truncate(false)
-        .open(&active)?;
-    file.write_all(&backup)?;
-    file.set_len(backup.len() as u64)?;
-    file.sync_all()?;
-    Ok(Restore::Restored)
+        .open(path)?;
+    file.write_all(bytes)?;
+    file.set_len(bytes.len() as u64)?;
+    file.sync_all()
 }
 
 /// Whether a configuration has an uncommented line that selects qberrypi.
@@ -107,9 +117,10 @@ fn selects_qberrypi(config: &[u8]) -> bool {
         .any(|line| line.trim_ascii_start().starts_with(SELECTS_QBERRYPI))
 }
 
-/// Reads `qberrypi/qberrypi.toml`, the system's configuration file.
-pub fn read_config_text(boot: &Path) -> io::Result<String> {
-    fs::read_to_string(boot.join(OWN_DIR).join(CONFIG_TEXT))
+/// Reads `qberrypi.toml`, the system's configuration file, from `dir`, qberrypi's folder on the
+/// boot partition ([`OWN_DIR`], or a slot's).
+pub fn read_config_text(boot: &Path, dir: &str) -> io::Result<String> {
+    fs::read_to_string(boot.join(dir).join(CONFIG_TEXT))
 }
 
 /// The file that holds the API's TLS key and certificate, in qberrypi's folder.
@@ -118,12 +129,13 @@ pub const TLS_FILE: &str = "tls.pem";
 /// The most bytes of `tls.pem` that are read: a key and a certificate take a little over 0.7 KiB.
 pub const TLS_FILE_CAP: u64 = 16 * 1024;
 
-/// Reads `qberrypi/tls.pem`, the API's key and certificate; `None` if there is no such file.
+/// Reads `tls.pem`, the API's key and certificate, from `dir`, qberrypi's folder on the boot
+/// partition ([`OWN_DIR`], or a slot's); `None` if there is no such file.
 ///
 /// A file larger than [`TLS_FILE_CAP`] is an error, and no more than the cap and one byte is read
 /// of it. The bytes are the key's: no error here holds any of them.
-pub fn read_tls(boot: &Path) -> io::Result<Option<Vec<u8>>> {
-    let file = match File::open(boot.join(OWN_DIR).join(TLS_FILE)) {
+pub fn read_tls(boot: &Path, dir: &str) -> io::Result<Option<Vec<u8>>> {
+    let file = match File::open(boot.join(dir).join(TLS_FILE)) {
         Ok(file) => file,
         Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(error),
@@ -139,14 +151,15 @@ pub fn read_tls(boot: &Path) -> io::Result<Option<Vec<u8>>> {
     Ok(Some(bytes))
 }
 
-/// Adds text to the end of `qberrypi/log.txt` and waits until it is on the card.
+/// Adds text to the end of `log.txt` in `dir`, qberrypi's folder on the boot partition
+/// ([`OWN_DIR`], or a slot's), and waits until it is on the card.
 ///
 /// A log already larger than `LOG_FILE_CAP` is emptied first, but only for
 /// text that starts a boot, with `boot_header`: a boot saves its log in
 /// several pieces, and none of them may be cut off from its header. The
-/// `qberrypi` folder is made if it is missing; the mount point itself never is.
-pub fn append_log(boot: &Path, text: &str) -> io::Result<()> {
-    let dir = boot.join(OWN_DIR);
+/// folder is made if it is missing; the mount point itself never is.
+pub fn append_log(boot: &Path, dir: &str, text: &str) -> io::Result<()> {
+    let dir = boot.join(dir);
     match fs::create_dir(&dir) {
         Err(error) if error.kind() != ErrorKind::AlreadyExists => return Err(error),
         _ => {}
@@ -403,13 +416,16 @@ mod tests {
         let d = tmp.path();
         fs::create_dir(d.join("qberrypi")).unwrap();
         write(d, "qberrypi/qberrypi.toml", "hostname = \"example\"\n");
-        assert_eq!(read_config_text(d).unwrap(), "hostname = \"example\"\n");
+        assert_eq!(
+            read_config_text(d, OWN_DIR).unwrap(),
+            "hostname = \"example\"\n"
+        );
     }
 
     #[test]
     fn a_missing_config_text_is_not_found() {
         let tmp = tempfile::tempdir().unwrap();
-        let error = read_config_text(tmp.path()).unwrap_err();
+        let error = read_config_text(tmp.path(), OWN_DIR).unwrap_err();
         assert_eq!(error.kind(), ErrorKind::NotFound);
     }
 
@@ -419,7 +435,7 @@ mod tests {
         let d = tmp.path();
         fs::create_dir(d.join("qberrypi")).unwrap();
         write(d, "qberrypi/qberrypi.toml", b"hostname = \"\xff\"\n");
-        let error = read_config_text(d).unwrap_err();
+        let error = read_config_text(d, OWN_DIR).unwrap_err();
         assert_eq!(error.kind(), ErrorKind::InvalidData);
     }
 
@@ -428,9 +444,9 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let d = tmp.path();
         // Neither the folder nor the file is there, or the folder is and the file is not.
-        assert_eq!(read_tls(d).unwrap(), None);
+        assert_eq!(read_tls(d, OWN_DIR).unwrap(), None);
         fs::create_dir(d.join("qberrypi")).unwrap();
-        assert_eq!(read_tls(d).unwrap(), None);
+        assert_eq!(read_tls(d, OWN_DIR).unwrap(), None);
     }
 
     #[test]
@@ -441,14 +457,17 @@ mod tests {
         // Bytes, not text: the file is not read for its contents here.
         write(d, "qberrypi/tls.pem", b"twenty bytes, no pem");
         assert_eq!(
-            read_tls(d).unwrap().as_deref(),
+            read_tls(d, OWN_DIR).unwrap().as_deref(),
             Some(&b"twenty bytes, no pem"[..])
         );
         // A file of exactly the cap is read; an empty one is a file, not an absent one.
         write(d, "qberrypi/tls.pem", vec![b'x'; TLS_FILE_CAP as usize]);
-        assert_eq!(read_tls(d).unwrap().unwrap().len() as u64, TLS_FILE_CAP);
+        assert_eq!(
+            read_tls(d, OWN_DIR).unwrap().unwrap().len() as u64,
+            TLS_FILE_CAP
+        );
         write(d, "qberrypi/tls.pem", b"");
-        assert_eq!(read_tls(d).unwrap(), Some(Vec::new()));
+        assert_eq!(read_tls(d, OWN_DIR).unwrap(), Some(Vec::new()));
     }
 
     #[test]
@@ -457,7 +476,7 @@ mod tests {
         let d = tmp.path();
         fs::create_dir(d.join("qberrypi")).unwrap();
         write(d, "qberrypi/tls.pem", vec![b'k'; TLS_FILE_CAP as usize + 1]);
-        let error = read_tls(d).unwrap_err();
+        let error = read_tls(d, OWN_DIR).unwrap_err();
         assert_eq!(error.kind(), ErrorKind::InvalidData);
         let text = error.to_string();
         assert!(text.contains("16384"), "{text}");
@@ -469,19 +488,19 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let d = tmp.path();
         fs::create_dir_all(d.join("qberrypi/tls.pem")).unwrap();
-        assert!(read_tls(d).is_err());
+        assert!(read_tls(d, OWN_DIR).is_err());
     }
 
     #[test]
     fn log_appends_then_starts_afresh_over_the_cap() {
         let tmp = tempfile::tempdir().unwrap();
         let d = tmp.path();
-        append_log(d, "one\n").unwrap();
-        append_log(d, "two\n").unwrap();
+        append_log(d, OWN_DIR, "one\n").unwrap();
+        append_log(d, OWN_DIR, "two\n").unwrap();
         assert_eq!(read(d, "qberrypi/log.txt"), "one\ntwo\n");
         write(d, LOG, vec![b'x'; LOG_FILE_CAP as usize + 1]);
         let first_of_a_boot = boot_header(5) + "three\n";
-        append_log(d, &first_of_a_boot).unwrap();
+        append_log(d, OWN_DIR, &first_of_a_boot).unwrap();
         assert_eq!(read(d, "qberrypi/log.txt"), first_of_a_boot);
     }
 
@@ -493,11 +512,11 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let d = tmp.path();
         let first_of_a_boot = boot_header(5) + "banner\n";
-        append_log(d, &first_of_a_boot).unwrap();
+        append_log(d, OWN_DIR, &first_of_a_boot).unwrap();
         let grown = first_of_a_boot + &"x".repeat(LOG_FILE_CAP as usize);
         write(d, LOG, &grown);
 
-        append_log(d, "returning\n").unwrap();
+        append_log(d, OWN_DIR, "returning\n").unwrap();
 
         // Compared by parts: a megabyte in a failure message helps no one.
         let after = read(d, LOG);
@@ -553,17 +572,59 @@ mod tests {
         let d = tmp.path();
         fs::create_dir(d.join("qberrypi")).unwrap();
         write(d, LOG, vec![b'x'; LOG_FILE_CAP as usize]);
-        append_log(d, "more\n").unwrap();
+        append_log(d, OWN_DIR, "more\n").unwrap();
         let text = read(d, LOG);
         assert_eq!(text.len() as u64, LOG_FILE_CAP + 5);
         assert!(text.ends_with("xmore\n"));
     }
 
     #[test]
+    fn a_slots_files_are_read_and_written_in_its_own_folder_and_in_no_other() {
+        let tmp = tempfile::tempdir().unwrap();
+        let d = tmp.path();
+        for dir in ["qberrypi", "qberrypi-a", "qberrypi-b"] {
+            fs::create_dir(d.join(dir)).unwrap();
+            write(d, &format!("{dir}/qberrypi.toml"), format!("# {dir}\n"));
+            write(d, &format!("{dir}/tls.pem"), format!("key of {dir}"));
+        }
+        for dir in ["qberrypi", "qberrypi-a", "qberrypi-b"] {
+            assert_eq!(read_config_text(d, dir).unwrap(), format!("# {dir}\n"));
+            assert_eq!(
+                read_tls(d, dir).unwrap().unwrap(),
+                format!("key of {dir}").into_bytes()
+            );
+        }
+        append_log(d, "qberrypi-b", &(boot_header(5) + "in b\n")).unwrap();
+        append_log(d, "qberrypi-b", "more in b\n").unwrap();
+        assert_eq!(
+            read(d, "qberrypi-b/log.txt"),
+            boot_header(5) + "in b\nmore in b\n"
+        );
+        for other in ["qberrypi/log.txt", "qberrypi-a/log.txt"] {
+            assert!(!d.join(other).exists(), "{other}");
+        }
+    }
+
+    #[test]
+    fn a_slots_folder_that_has_no_such_file_is_not_found_whatever_the_other_slot_holds() {
+        let tmp = tempfile::tempdir().unwrap();
+        let d = tmp.path();
+        fs::create_dir(d.join("qberrypi-a")).unwrap();
+        fs::create_dir(d.join("qberrypi-b")).unwrap();
+        write(d, "qberrypi-a/qberrypi.toml", "# a\n");
+        write(d, "qberrypi-a/tls.pem", "key");
+        assert_eq!(
+            read_config_text(d, "qberrypi-b").unwrap_err().kind(),
+            ErrorKind::NotFound
+        );
+        assert_eq!(read_tls(d, "qberrypi-b").unwrap(), None);
+    }
+
+    #[test]
     fn log_does_not_create_the_mount_point() {
         let tmp = tempfile::tempdir().unwrap();
         let absent = tmp.path().join("absent");
-        assert!(append_log(&absent, "one\n").is_err());
+        assert!(append_log(&absent, OWN_DIR, "one\n").is_err());
         assert!(!absent.exists());
     }
 }

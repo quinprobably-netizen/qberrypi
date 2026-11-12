@@ -92,8 +92,12 @@ pub trait Radio {
     /// A fresh handshake nonce from the kernel's random source.
     fn nonce(&mut self) -> Result<Nonce, RadioError>;
 
-    /// Starts a scan for `ssid`; its end arrives as an event.
-    async fn trigger_scan(&mut self, ssid: &[u8]) -> Result<(), RadioError>;
+    /// Starts a scan for `ssid`, a directed one; its end arrives as an event.
+    ///
+    /// The scan covers every channel when `freqs_mhz` is empty, and only the channels with these centre
+    /// frequencies otherwise. A radio that has no channel at one of them may refuse the request, as
+    /// the kernel does (`EINVAL`): that is an error like any other the command has.
+    async fn trigger_scan(&mut self, ssid: &[u8], freqs_mhz: &[u32]) -> Result<(), RadioError>;
 
     /// The access points the last scan found.
     async fn scan_results(&mut self) -> Result<Vec<Bss>, RadioError>;

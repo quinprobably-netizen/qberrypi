@@ -2,9 +2,36 @@
 //! Raspberry Pi 3 and checks what init did, on the serial console and on the
 //! card.
 //!
-//! Each scenario gets a card image of its own and one boot. The guest has no
-//! display, no network and no device of this machine; its console is a pipe
-//! that is captured, and the card image is its only drive.
+//! Each scenario gets a card image of its own. The guest has no display, no network and no
+//! device of this machine; its console is a pipe that is captured, and the card image is its
+//! only drive. Most scenarios are one boot from a card of the old layout (Raspberry Pi OS beside
+//! qberrypi's folder), started with the build's own kernel, device tree and initramfs.
+//!
+//! # Booting a card with two slots
+//!
+//! QEMU does not run the Pi's boot firmware, which on the board is what finds the kernel: it
+//! reads `config.txt`, or `tryboot.txt` after a restart with `0 tryboot`, takes the slot that its
+//! `os_prefix=` names, and loads that slot's kernel, device tree and initramfs, with that slot's
+//! command line. For a card with two slots (see `CardPlan::Slots`) this harness stands in for
+//! it (`firmware_start`, `SlotFiles`): before each boot it opens the image as the guest left it,
+//! picks the slot the way the firmware does, extracts that slot's three files to a folder of
+//! the scenario's, and gives QEMU the scenario's usual kernel arguments plus the argument
+//! `qberrypi.slot=` that the slot's own `cmdline.txt` holds.
+//!
+//! A scenario of that kind is up to `SlotPlan::boots` boots, one after another on the one image.
+//! A boot ends when the guest restarts the machine, which here means it prints the kernel's
+//! `reboot: Restarting system` and then either QEMU exits or the kernel halts (see
+//! `RESTART_UNCHECKED` for why it halts); the next boot then starts from the image as the guest
+//! left it, so a restart that init asked for is a restart on the card too. The firmware's trial
+//! flag is one-shot: a boot is a `tryboot` boot only if the line the kernel printed for the
+//! last restart says `with command '0 tryboot'` (`restart_was_tryboot`), or, for the first
+//! boot, if the scenario stages a firmware trial. A boot that never asked for a restart ends
+//! the scenario. Each boot keeps its own serial log, `<scenario>-boot-<n>.log`, and the card is
+//! read after each one, so the conditions can say what each boot did to it.
+//!
+//! The firmware itself, and the Pi's restart with `0 tryboot` through its mailbox, are what the
+//! check on the board proves; here the files and the rules of init are exercised on the real
+//! kernel.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -22,9 +49,12 @@ use sha2::{Digest, Sha256};
 
 use qberrypi::bootpart;
 use qberrypi::config::Fault;
+use qberrypi::slots::{self, Marker, Mode, Slot};
 
-use crate::build::{CMDLINE_TXT, CONFIG_TXT, read_build_epoch};
-use crate::sdimage;
+use crate::build::{CMDLINE_TXT, CONFIG_TXT, read_build_epoch, slot_config_txt};
+use crate::image::{card_files, stand_in_firmware};
+use crate::sdimage::{self, Image};
+use crate::slot;
 
 const QEMU: &str = "qemu-system-aarch64";
 
@@ -104,6 +134,15 @@ const RESET_ON_ARMING: &str = "this boot keeps the watchdog driver, and QEMU's r
     the machine the moment init arms the watchdog. It stands for a board that would do the \
     same: by then init must have put Raspberry Pi OS's config.txt back";
 
+/// Printed with the scenarios that boot a card with two slots.
+const BOOTED_LIKE_THE_FIRMWARE: &str = "QEMU does not run the Pi's boot firmware, so this test \
+    stands in for it: before each boot it reads tryboot.txt (after a restart with `0 tryboot`, and \
+    for the first boot of a firmware trial) or config.txt, starts the slot that file's os_prefix \
+    names, and boots the next from the card as the guest left it. That the real firmware takes \
+    `tryboot` the same way is what the check on the Pi proves. QEMU has no Wi-Fi, clock or upstream \
+    for a trial to wait for, so the build whose trial confirms is given the development switches \
+    debug.trial_offline and debug.trial_confirm_secs";
+
 /// Printed with the scenario that asks the DNS and status servers over loopback.
 const NO_NETWORK: &str = "the guest has no network card, so every upstream is unreachable; this \
     boot shows the listeners, the block set and the status server on the real kernel, and that a \
@@ -117,6 +156,12 @@ const SHIPPED_CONSOLE_UNSEEN: &str = "this boot has the kernel arguments of cmdl
     from the card alone";
 
 /// Why a guest that restarts does not end QEMU here, printed with every scenario it applies to.
+///
+/// A scenario that boots a card with two slots more than once does not wait for QEMU either: it
+/// ends the boot itself at the guest's restart request, or at the halt that follows it, and
+/// starts the next boot from the image as the guest left it (see the module's text). Each of those
+/// restarts is checked by the request that the kernel printed, and by what the next boot finds on the
+/// card; only the last one is reported as unchecked.
 const RESTART_UNCHECKED: &str = "QEMU's raspi3b resets the machine the moment the watchdog is \
     armed, so this test boots with the board's watchdog driver left out \
     (initcall_blacklist=bcm2835_wdt_driver_init). That driver is also what restarts the board: \
@@ -189,6 +234,11 @@ dtoverlay=dwc2,dr_mode=host
 enable_uart=0
 ";
 
+/// What the kernel prints for a restart that was asked for with `0 tryboot`, the restart that has
+/// the Pi's firmware read `tryboot.txt` at the next start. The kernel's text for any other
+/// restart ends after `RESTART_REQUESTED`.
+const TRYBOOT_RESTART: &str = "reboot: Restarting system with command '0 tryboot'";
+
 // Where the files the scenarios look at are on the card.
 const ACTIVE_CONFIG: &str = "config.txt";
 const PIOS_CONFIG: &str = "config.pios.txt";
@@ -200,6 +250,11 @@ const TLS_PEM: &str = "qberrypi/tls.pem";
 /// The password of the API in the scenarios that serve it. It is no secret: the card of a QEMU run
 /// is a throwaway, and the hash has a salt of zeros.
 const API_PASSWORD: &[u8] = b"qemu";
+/// The log that a slot's build keeps in its own folder when `debug.log_to_sd` is on.
+const SLOT_LOG: &str = "log.txt";
+/// What `tls.pem` holds in the slots of the scenarios' cards: a sentence, as the stand-in boot
+/// firmware's files are. The configurations have no `[api]` section, so nothing reads it as a key.
+const SLOT_TLS_STAND_IN: &[u8] = b"A stand-in for the API's key: no scenario serves the API.\n";
 
 /// The template the scenarios make their `qberrypi.toml` from, under the repository root.
 const EXAMPLE_CONFIG: &str = "qberrypi.example.toml";
@@ -230,6 +285,11 @@ const NO_UPSTREAM: &str = "dns: no upstream answers";
 const NO_CONSOLE: &str = "/dev/console: No such device (os error 19)";
 /// How the one error begins that a scenario expects: the configuration is not TOML.
 const SYNTAX_ERROR: &str = "qberrypi.toml: (syntax): not valid TOML at line ";
+/// How the error begins that the panic hook logs for a panic, which is a fatal error.
+const TRIAL_PANIC_ERROR: &str = "panic at ";
+/// How the warning begins that a boot logs when it finds the marker of a trial of the other slot:
+/// the trial was rolled back, and this slot is running again.
+const ROLLBACK_WARNING: &str = "update: the trial of build ";
 
 /// How many lines of the serial console a failed scenario shows.
 const SERIAL_TAIL_LINES: usize = 40;
@@ -264,8 +324,25 @@ fn boot_with(
     kernel_args: &str,
     timeout: Duration,
 ) -> Result<Outcome> {
+    boot_logged(
+        boot_folder,
+        image,
+        kernel_args,
+        timeout,
+        &serial_log_of(image),
+    )
+}
+
+/// Like `boot_with`, saving the serial console in `serial_log` instead of beside the image.
+fn boot_logged(
+    boot_folder: &Path,
+    image: &Path,
+    kernel_args: &str,
+    timeout: Duration,
+    serial_log: &Path,
+) -> Result<Outcome> {
     let command = qemu_command(boot_folder, image, kernel_args);
-    let (serial, exited) = run_guest(command, timeout, Some(&serial_log_of(image)))?;
+    let (serial, exited) = run_guest(command, timeout, Some(serial_log))?;
     Ok(Outcome {
         serial,
         exited,
@@ -471,6 +548,18 @@ impl Allowed {
         errors: &[],
         warnings: &[NO_WATCHDOG, NO_LED, NO_PANEL, NO_WLAN],
     };
+    /// What the boot of a build on trial meets when the build panics (`trial_panic`): the panic,
+    /// and what any boot meets in QEMU.
+    const TRIAL_PANICS: Self = Self {
+        errors: &[TRIAL_PANIC_ERROR],
+        warnings: &[NO_WATCHDOG, NO_LED, NO_PANEL, NO_WLAN],
+    };
+    /// What the boot that finds the marker of a trial of the other slot meets: the rollback is a
+    /// warning, and the rest is what any boot meets in QEMU.
+    const ROLLS_BACK: Self = Self {
+        errors: &[],
+        warnings: &[NO_WATCHDOG, NO_LED, NO_PANEL, NO_WLAN, ROLLBACK_WARNING],
+    };
 }
 
 /// Picks out the lines init logged, each as its level and its message.
@@ -526,15 +615,46 @@ struct Scenario {
     note: Option<&'static str>,
     /// The name of its image and its serial log in `out/qemu/`, without the ending.
     file_stem: &'static str,
-    /// The text of `qberrypi/qberrypi.toml` on its card.
+    /// The text of `qberrypi/qberrypi.toml` on its card; on a card with two slots, of slot a's
+    /// `qberrypi.toml`.
     system_config: String,
+    /// How its card is laid out and how often it is booted.
+    card: CardPlan,
     /// Judges the boot; one entry per condition.
     conditions: fn(&Evidence) -> Vec<Condition>,
 }
 
+/// How a scenario's card is laid out, and so how it is booted.
+enum CardPlan {
+    /// The old layout, which is what the build's `config.txt` starts: Raspberry Pi OS's saved
+    /// `config.pios.txt` beside qberrypi's folder. One boot, with the build's own files.
+    OneBoot,
+    /// A card with two slots, as `cargo xtask image` makes it, with an update's trial staged on
+    /// it. Booted like the firmware would, one boot after another (see the module's text).
+    Slots(SlotPlan),
+}
+
+/// A card with two slots, with the trial of an update staged on it.
+///
+/// Both slots hold the build that is tested; the update that staged the trial is the one that
+/// wrote slot b while slot a ran, so slot b is on trial and slot a is the one it came from.
+struct SlotPlan {
+    /// The text of slot b's `qberrypi.toml`; slot a's is the scenario's `system_config`.
+    config_b: String,
+    /// How the update started the trial: for the firmware's `tryboot`, `tryboot.txt` selects slot
+    /// b and `config.txt` still selects slot a; for the software trial `config.txt` selects slot
+    /// b. Either way the marker names slot b, from slot a. The first boot is the one after the
+    /// update's restart.
+    mode: Mode,
+    /// The most boots; the scenario ends sooner if a boot does not ask the machine to restart.
+    boots: usize,
+}
+
 /// What a boot left behind for the conditions to judge.
 struct Evidence {
+    /// The serial console of the boot; of the last one, on a card with two slots.
     serial: String,
+    /// Whether QEMU ended by itself, in the boot; the last one, on a card with two slots.
     exited: bool,
     /// `config.txt` on the card after the boot, or why it cannot be read.
     active_config: Result<Vec<u8>, String>,
@@ -545,12 +665,41 @@ struct Evidence {
     image_after: String,
     /// The build time of the build that was booted.
     build_epoch: u64,
+    /// Each boot of a card with two slots, in order; empty for any other card.
+    boots: Vec<BootEvidence>,
 }
 
 /// One thing that must hold after a boot, and whether it does.
 struct Condition {
     what: String,
     verdict: Verdict,
+}
+
+/// What a line of the serial console says when Bluetooth has started: the kernel's own prefix, the
+/// first device and the Broadcom driver (`serial_has_no_bluetooth`).
+const BLUETOOTH_LINES: [&str; 3] = ["Bluetooth:", "hci0", "btbcm"];
+
+/// What a condition that the guest restarted the machine is about.
+const EXITED: &str = "QEMU exited by itself: the guest restarted the machine";
+
+/// Whether a guest that wrote `serial` restarted the machine, given whether QEMU `exited`.
+///
+/// Without the watchdog driver the last step cannot happen. A guest that got as far as the
+/// kernel taking its restart request and halting is reported as unchecked; one that asked and
+/// neither restarted nor halted, or never asked, fails.
+fn exit_verdict(serial: &str, exited: bool) -> Verdict {
+    let asked = serial.contains(RESTART_REQUESTED);
+    if exited {
+        Verdict::Holds
+    } else if asked && serial.contains(GUEST_HALTED) {
+        Verdict::CannotBeCheckedInQemu(RESTART_UNCHECKED)
+    } else if asked {
+        Verdict::Fails(format!(
+            "the guest asked for a restart, and then neither restarted nor printed `{GUEST_HALTED}`"
+        ))
+    } else {
+        Verdict::Fails("QEMU had to be stopped, and the guest never asked for a restart".into())
+    }
 }
 
 #[derive(Debug, PartialEq)]
@@ -582,22 +731,9 @@ impl Evidence {
     /// got as far as the kernel taking its restart request is then reported
     /// as unchecked; one that never asked fails.
     fn exited(&self) -> Condition {
-        let what = "QEMU exited by itself: the guest restarted the machine";
-        let asked = self.serial.contains(RESTART_REQUESTED);
-        let verdict = if self.exited {
-            Verdict::Holds
-        } else if asked && self.serial.contains(GUEST_HALTED) {
-            Verdict::CannotBeCheckedInQemu(RESTART_UNCHECKED)
-        } else if asked {
-            Verdict::Fails(format!(
-                "the guest asked for a restart, and then neither restarted nor printed `{GUEST_HALTED}`"
-            ))
-        } else {
-            Verdict::Fails("QEMU had to be stopped, and the guest never asked for a restart".into())
-        };
         Condition {
-            what: what.into(),
-            verdict,
+            what: EXITED.into(),
+            verdict: exit_verdict(&self.serial, self.exited),
         }
     }
 
@@ -624,6 +760,22 @@ impl Evidence {
             !self.serial.contains(text),
             || "it does".into(),
         )
+    }
+
+    /// The serial console of no boot has a line of Bluetooth: the kernel's `Bluetooth:`, a device
+    /// `hci0` or the driver `btbcm`. Bluetooth is absent by design (no modules, no firmware, the
+    /// device-tree node disabled), so any such line means something loaded it. Every boot counts
+    /// on a card with two slots, not only the last.
+    fn serial_has_no_bluetooth(&self) -> Condition {
+        let what = "the serial console has no Bluetooth line (`Bluetooth:`, `hci0`, `btbcm`)";
+        let serials =
+            std::iter::once(&self.serial).chain(self.boots.iter().map(|boot| &boot.serial));
+        let line = serials
+            .flat_map(|serial| serial.lines())
+            .find(|line| BLUETOOTH_LINES.iter().any(|text| line.contains(text)));
+        Condition::new(what, line.is_none(), || {
+            format!("it has `{}`", line.unwrap_or_default().trim())
+        })
     }
 
     fn pios_config_is_active(&self) -> Condition {
@@ -714,6 +866,576 @@ impl Evidence {
             "the card image has the SHA-256 it had before the boot",
             self.image_before == self.image_after,
             || format!("before {}, after {}", self.image_before, self.image_after),
+        )
+    }
+}
+
+/// The file the firmware reads its settings from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Settings {
+    /// `config.txt`, at every start but the one that follows a restart with `0 tryboot`.
+    Config,
+    /// `tryboot.txt`, for the one start that follows a restart with `0 tryboot`.
+    Tryboot,
+}
+
+impl Settings {
+    /// The file's name on the card.
+    fn file(self) -> &'static str {
+        match self {
+            Settings::Config => ACTIVE_CONFIG,
+            Settings::Tryboot => slots::TRYBOOT_FILE,
+        }
+    }
+}
+
+/// What the firmware stand-in did for one boot of a card with two slots.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Start {
+    /// The file it read its settings from.
+    read: Settings,
+    /// The slot that file's `os_prefix=` selects, whose files were loaded.
+    slot: Slot,
+}
+
+/// Does what the Pi's boot firmware does to find what to start, on the card in `card`: reads
+/// `tryboot.txt` if `tryboot` says the flag is set (a restart with `0 tryboot` set it, and the
+/// firmware clears it before it starts anything, so it is for one boot only), else `config.txt`,
+/// and takes the slot that the file's one `os_prefix=` line names.
+///
+/// It is an error for the file not to be there (a `tryboot` start with no `tryboot.txt` is not
+/// one this harness knows the firmware's answer to, and no scenario has it), or for it to select
+/// no slot (`slots::selected_slot` says why). The error names the file.
+fn firmware_start(card: &mut Image, tryboot: bool) -> Result<Start> {
+    let read = if tryboot {
+        Settings::Tryboot
+    } else {
+        Settings::Config
+    };
+    let file = read.file();
+    let text = card
+        .find(file)?
+        .ok_or_else(|| anyhow!("the firmware has no {file} on the card to read"))?;
+    let slot = slots::selected_slot(&text).map_err(|reason| anyhow!("{file}: {reason}"))?;
+    Ok(Start { read, slot })
+}
+
+/// Whether the last restart that the kernel announced in `serial` was asked for with `0 tryboot`.
+///
+/// That is the one restart after which the Pi's firmware reads `tryboot.txt`. Only the last
+/// announcement counts (the flag is one-shot), and a serial console with none is a start without
+/// the flag.
+fn restart_was_tryboot(serial: &str) -> bool {
+    serial
+        .lines()
+        .rev()
+        .find(|line| line.contains(RESTART_REQUESTED))
+        .is_some_and(|line| line.contains(TRYBOOT_RESTART))
+}
+
+/// The files of a slot that a boot of it needs, read from the card.
+struct SlotFiles {
+    kernel: Vec<u8>,
+    device_tree: Vec<u8>,
+    initramfs: Vec<u8>,
+    /// The slot's `cmdline.txt`, which names the slot.
+    cmdline: Vec<u8>,
+}
+
+/// Reads the files of `slot` that the firmware loads, and its `cmdline.txt`, from the card.
+///
+/// It is an error for any of the four not to be there; the error names the file and the card.
+fn load_slot(card: &mut Image, slot: Slot) -> Result<SlotFiles> {
+    let mut read = |name: &str| card.read(&format!("{}/{name}", slot.dir()));
+    Ok(SlotFiles {
+        kernel: read(KERNEL)?,
+        device_tree: read(DEVICE_TREE)?,
+        initramfs: read(INITRAMFS)?,
+        cmdline: read("cmdline.txt")?,
+    })
+}
+
+/// The kernel arguments of a boot of `slot`: the machine's own, which QEMU needs, and the argument
+/// `qberrypi.slot=` that the slot's `cmdline.txt` holds.
+///
+/// The slot's `cmdline.txt` is what the firmware gives the kernel on the Pi, so its argument is
+/// the one used, and it is an error for it to be missing, unusable (`Slot::from_cmdline`) or to
+/// name the other slot than the one `os_prefix=` started, which would be a card that
+/// starts one slot and tells it to be the other.
+fn slot_kernel_args(machine: Machine, slot: Slot, cmdline: &[u8]) -> Result<String> {
+    let text = std::str::from_utf8(cmdline)
+        .map_err(|_| anyhow!("{}/cmdline.txt is not text", slot.dir()))?;
+    match Slot::from_cmdline(text) {
+        Ok(Some(named)) if named == slot => {
+            Ok(format!("{} {}", machine.kernel_args(), slot.cmdline_arg()))
+        }
+        Ok(Some(named)) => bail!(
+            "{}/cmdline.txt names slot {named}, not the slot it is the command line of",
+            slot.dir()
+        ),
+        Ok(None) => bail!("{}/cmdline.txt has no qberrypi.slot argument", slot.dir()),
+        Err(reason) => bail!("{}/cmdline.txt: {reason}", slot.dir()),
+    }
+}
+
+/// A folder holding the three files of one boot, named as QEMU is told to load them; it is
+/// removed when this goes away, however that happens.
+struct BootFolder(PathBuf);
+
+impl BootFolder {
+    /// Makes the folder at `path`, replacing one that is left from an earlier run, and writes
+    /// the slot's kernel, device tree and initramfs into it.
+    fn make(path: PathBuf, files: &SlotFiles) -> Result<BootFolder> {
+        match fs::remove_dir_all(&path) {
+            Err(error) if error.kind() != ErrorKind::NotFound => {
+                return Err(error).with_context(|| format!("cannot remove {}", path.display()));
+            }
+            _ => {}
+        }
+        fs::create_dir(&path).with_context(|| format!("cannot create {}", path.display()))?;
+        // From here the folder is removed if anything fails.
+        let folder = BootFolder(path);
+        let loaded = [
+            (KERNEL, &files.kernel),
+            (DEVICE_TREE, &files.device_tree),
+            (INITRAMFS, &files.initramfs),
+        ];
+        for (name, bytes) in loaded {
+            let target = folder.0.join(name);
+            fs::write(&target, bytes)
+                .with_context(|| format!("cannot write {}", target.display()))?;
+        }
+        Ok(folder)
+    }
+}
+
+impl Drop for BootFolder {
+    fn drop(&mut self) {
+        // A folder that is already gone, or cannot be removed, costs only disk in `out/qemu`.
+        let _ = fs::remove_dir_all(&self.0);
+    }
+}
+
+/// What the card holds after one boot of a card with two slots: the files that the boot rules
+/// read and write. A file that cannot be read is the reason, for the conditions to report.
+struct CardAfter {
+    /// The root `config.txt`, which the firmware reads and which selects a slot.
+    config: Result<Vec<u8>, String>,
+    /// `tryboot.txt`, which the firmware reads after a restart with `0 tryboot`; `None` if there is none.
+    tryboot: Result<Option<Vec<u8>>, String>,
+    /// The trial marker; `None` if there is none.
+    marker: Result<Option<Vec<u8>>, String>,
+    /// `log.txt` in the folder of slot a and of slot b; `None` for a slot that has none.
+    logs: [Result<Option<String>, String>; 2],
+}
+
+impl CardAfter {
+    /// Reads those files from the card in `card`.
+    fn read(card: &mut Image) -> CardAfter {
+        fn optional(card: &mut Image, name: &str) -> Result<Option<Vec<u8>>, String> {
+            card.find(name).map_err(|error| format!("{error:#}"))
+        }
+        CardAfter {
+            config: card
+                .read(ACTIVE_CONFIG)
+                .map_err(|error| format!("{error:#}")),
+            tryboot: optional(card, slots::TRYBOOT_FILE),
+            marker: optional(card, slots::MARKER_FILE),
+            logs: [Slot::A, Slot::B].map(|slot| {
+                optional(card, &format!("{}/{SLOT_LOG}", slot.dir()))
+                    .map(|log| log.map(|log| String::from_utf8_lossy(&log).into_owned()))
+            }),
+        }
+    }
+
+    /// The log of `slot`.
+    fn log(&self, slot: Slot) -> &Result<Option<String>, String> {
+        match slot {
+            Slot::A => &self.logs[0],
+            Slot::B => &self.logs[1],
+        }
+    }
+}
+
+/// One boot of a card with two slots: what the firmware stand-in chose, what the guest wrote,
+/// and what the card held afterwards.
+struct BootEvidence {
+    /// The file the stand-in read and the slot it started.
+    start: Start,
+    /// Everything the guest wrote to its serial console in this boot, without carriage returns.
+    serial: String,
+    /// Whether QEMU ended by itself in this boot.
+    exited: bool,
+    /// The card as this boot left it.
+    card: CardAfter,
+}
+
+/// What `run_boots` asks of whatever starts a guest, for one boot.
+struct BootRequest<'a> {
+    /// The folder with the slot's three files, as QEMU is told to load them.
+    boot_folder: &'a Path,
+    /// The kernel arguments of the boot.
+    kernel_args: &'a str,
+    /// Where the boot's serial console is saved.
+    serial_log: &'a Path,
+}
+
+/// Where the serial console of boot `number` (from 1) of a scenario is saved.
+fn slot_boot_log(folder: &Path, stem: &str, number: usize) -> PathBuf {
+    folder.join(format!("{stem}-boot-{number}.log"))
+}
+
+/// Boots the card at `image`, as the firmware would, up to `boots` times, and says how each boot
+/// went; `boot` is what starts a guest (the real one runs QEMU, a test's makes up a guest).
+///
+/// Before each boot the card is opened as the last boot left it and the stand-in decides: the
+/// first boot reads `tryboot.txt` if `first_is_tryboot`, and every later one does if the last
+/// restart that the previous boot announced was a `0 tryboot` one (`restart_was_tryboot`). The
+/// chosen slot's kernel, device tree and initramfs are put in a folder of their own under
+/// `folder` for the boot and the folder is removed after it. The boots stop early after one
+/// that did not ask the machine to restart (and did not exit or halt), as a guest that is
+/// not restarting has no next boot.
+///
+/// It is an error for `boots` to be 0, for the card to give the stand-in no slot to start
+/// (`firmware_start`, `load_slot`, `slot_kernel_args`) and for `boot` to fail; the error says
+/// which boot.
+fn run_boots(
+    image: &Path,
+    folder: &Path,
+    stem: &str,
+    machine: Machine,
+    first_is_tryboot: bool,
+    boots: usize,
+    mut boot: impl FnMut(&BootRequest) -> Result<(String, bool)>,
+) -> Result<Vec<BootEvidence>> {
+    if boots == 0 {
+        bail!("a scenario boots at least once");
+    }
+    let mut records = Vec::new();
+    let mut tryboot = first_is_tryboot;
+    for number in 1..=boots {
+        let (start, args, boot_folder) = {
+            let mut card = Image::open(image)?;
+            let start = firmware_start(&mut card, tryboot)
+                .with_context(|| format!("boot {number} cannot be started"))?;
+            let files = load_slot(&mut card, start.slot)
+                .with_context(|| format!("boot {number} cannot be started"))?;
+            let args = slot_kernel_args(machine, start.slot, &files.cmdline)
+                .with_context(|| format!("boot {number} cannot be started"))?;
+            let path = folder.join(format!("{stem}-boot-{number}"));
+            (start, args, BootFolder::make(path, &files)?)
+        };
+        let log = slot_boot_log(folder, stem, number);
+        let (serial, exited) = boot(&BootRequest {
+            boot_folder: &boot_folder.0,
+            kernel_args: &args,
+            serial_log: &log,
+        })
+        .with_context(|| format!("boot {number} of {stem}"))?;
+        drop(boot_folder);
+
+        let card = CardAfter::read(&mut Image::open(image)?);
+        let restarted =
+            exited || serial.contains(RESTART_REQUESTED) || serial.contains(GUEST_HALTED);
+        tryboot = restart_was_tryboot(&serial);
+        records.push(BootEvidence {
+            start,
+            serial,
+            exited,
+            card,
+        });
+        if !restarted {
+            break;
+        }
+    }
+    Ok(records)
+}
+
+/// The files of a card with two slots with the trial of `plan` staged on it, as an update
+/// leaves it when its restart comes: both slots hold the build in `build` (slot a with
+/// `config_a` as its `qberrypi.toml`, slot b with the plan's), the root `config.txt` selects the
+/// slot the update's restart will start, and the marker names slot b from slot a.
+///
+/// For the firmware's trial that is `tryboot.txt` as a copy of slot b's `config.txt`, with
+/// `config.txt` still selecting slot a; for the software trial it is `config.txt` selecting
+/// slot b and no `tryboot.txt`. The boot firmware's files are stand-ins. `epoch` is the build
+/// time that the marker names.
+fn staged_card_files(
+    build: &slot::Build,
+    plan: &SlotPlan,
+    config_a: &str,
+    epoch: u64,
+) -> Result<Vec<(String, Vec<u8>)>> {
+    let slot_a = build.slot_files(Slot::A, config_a.as_bytes(), SLOT_TLS_STAND_IN);
+    let slot_b = build.slot_files(Slot::B, plan.config_b.as_bytes(), SLOT_TLS_STAND_IN);
+    let selected = match plan.mode {
+        Mode::Tryboot => Slot::A,
+        Mode::Software => Slot::B,
+    };
+    let mut files = card_files(&stand_in_firmware(), &slot_a, &slot_b, selected)?;
+    if plan.mode == Mode::Tryboot {
+        files.push((
+            slots::TRYBOOT_FILE.to_owned(),
+            slot_config_txt(Slot::B).into_bytes(),
+        ));
+    }
+    let marker = Marker {
+        slot: Slot::B,
+        from: Slot::A,
+        build: epoch,
+        mode: plan.mode,
+        started: false,
+        failed: None,
+    };
+    files.push((slots::MARKER_FILE.to_owned(), marker.render().into_bytes()));
+    Ok(files)
+}
+
+impl Evidence {
+    /// The condition `what` about boot `number` (counting from 1): `judge` says whether it holds,
+    /// and what was found if it does not. A scenario that did not boot so often fails it.
+    fn on_boot(
+        &self,
+        number: usize,
+        what: impl std::fmt::Display,
+        judge: impl FnOnce(&BootEvidence) -> Result<(), String>,
+    ) -> Condition {
+        let what = format!("boot {number}: {what}");
+        let verdict = match number
+            .checked_sub(1)
+            .and_then(|index| self.boots.get(index))
+        {
+            None => Verdict::Fails(format!("the scenario booted {} times", self.boots.len())),
+            Some(boot) => match judge(boot) {
+                Ok(()) => Verdict::Holds,
+                Err(found) => Verdict::Fails(found),
+            },
+        };
+        Condition { what, verdict }
+    }
+
+    /// The scenario booted `count` times.
+    fn booted(&self, count: usize) -> Condition {
+        Condition::new(
+            format!("the scenario booted {count} times"),
+            self.boots.len() == count,
+            || format!("it booted {} times", self.boots.len()),
+        )
+    }
+
+    /// The stand-in read `read`'s file for boot `number` and started `slot`.
+    fn boot_started(&self, number: usize, slot: Slot, read: Settings) -> Condition {
+        let expected = Start { read, slot };
+        self.on_boot(
+            number,
+            format!(
+                "the firmware stand-in read {} and started slot {slot}",
+                read.file()
+            ),
+            |boot| match boot.start == expected {
+                true => Ok(()),
+                false => Err(format!(
+                    "it read {} and started slot {}",
+                    boot.start.read.file(),
+                    boot.start.slot
+                )),
+            },
+        )
+    }
+
+    fn boot_serial_has(&self, number: usize, text: &str) -> Condition {
+        self.on_boot(
+            number,
+            format!("the serial console has `{text}`"),
+            |boot| match boot.serial.contains(text) {
+                true => Ok(()),
+                false => Err("it does not".into()),
+            },
+        )
+    }
+
+    fn boot_serial_lacks(&self, number: usize, text: &str) -> Condition {
+        self.on_boot(
+            number,
+            format!("the serial console does not have `{text}`"),
+            |boot| match boot.serial.contains(text) {
+                true => Err("it does".into()),
+                false => Ok(()),
+            },
+        )
+    }
+
+    /// The boot's kernel announced a restart, whichever kind.
+    fn boot_restart_requested(&self, number: usize) -> Condition {
+        self.boot_serial_has(number, RESTART_REQUESTED)
+    }
+
+    /// The boot's restart was a plain one: it did not ask the firmware for another trial.
+    fn boot_restart_is_plain(&self, number: usize) -> Condition {
+        self.boot_serial_lacks(number, TRYBOOT_RESTART)
+    }
+
+    /// The boot's guest restarted the machine, as far as QEMU shows.
+    fn boot_exited(&self, number: usize) -> Condition {
+        let boot = number
+            .checked_sub(1)
+            .and_then(|index| self.boots.get(index));
+        match boot {
+            Some(boot) => Condition {
+                what: format!("boot {number}: {EXITED}"),
+                verdict: exit_verdict(&boot.serial, boot.exited),
+            },
+            None => self.on_boot(number, EXITED, |_| Ok(())),
+        }
+    }
+
+    /// Init complained in boot `number`, on the serial console, of nothing but what `allowed` says.
+    fn boot_no_unexpected_complaint(&self, number: usize, allowed: &Allowed) -> Condition {
+        self.on_boot(
+            number,
+            Self::no_complaint("on the serial console"),
+            |boot| {
+                let unexpected = unexpected_complaints(&boot.serial, allowed);
+                match unexpected.is_empty() {
+                    true => Ok(()),
+                    false => Err(format!("it logged `{}`", unexpected.join("`, `"))),
+                }
+            },
+        )
+    }
+
+    /// After boot `number` the root `config.txt` is `slot`'s own `config.txt`: the slot is selected.
+    fn boot_config_selects(&self, number: usize, slot: Slot) -> Condition {
+        self.on_boot(
+            number,
+            format!("config.txt on the card is slot {slot}'s own: it selects slot {slot}"),
+            |boot| match &boot.card.config {
+                Ok(config) if config == slot_config_txt(slot).as_bytes() => Ok(()),
+                Ok(config) => Err(format!("it is {:?}", String::from_utf8_lossy(config))),
+                Err(error) => Err(error.clone()),
+            },
+        )
+    }
+
+    /// After boot `number` there is no trial marker on the card.
+    fn boot_has_no_marker(&self, number: usize) -> Condition {
+        self.on_boot(
+            number,
+            format!("{} is not on the card", slots::MARKER_FILE),
+            |boot| match &boot.card.marker {
+                Ok(None) => Ok(()),
+                Ok(Some(marker)) => Err(format!(
+                    "it is there: {:?}",
+                    String::from_utf8_lossy(marker)
+                )),
+                Err(error) => Err(error.clone()),
+            },
+        )
+    }
+
+    /// After boot `number` the trial marker is `expected`, as init reads it.
+    fn boot_marker_is(&self, number: usize, expected: &Marker) -> Condition {
+        self.on_boot(
+            number,
+            format!("{} is {expected:?}", slots::MARKER_FILE),
+            |boot| match &boot.card.marker {
+                Ok(Some(bytes)) => {
+                    let parsed = std::str::from_utf8(bytes)
+                        .map_err(|_| "it is not text".to_owned())
+                        .and_then(Marker::parse);
+                    match parsed {
+                        Ok(marker) if marker == *expected => Ok(()),
+                        Ok(marker) => Err(format!("it is {marker:?}")),
+                        Err(reason) => Err(format!("it is unusable: {reason}")),
+                    }
+                }
+                Ok(None) => Err("it is not on the card".into()),
+                Err(error) => Err(error.clone()),
+            },
+        )
+    }
+
+    /// After boot `number` the card's `tryboot.txt` is slot b's own `config.txt` (`staged`), as
+    /// the update left it and no boot touches it, or is not there (`!staged`).
+    fn boot_tryboot_txt(&self, number: usize, staged: bool) -> Condition {
+        let what = match staged {
+            true => format!(
+                "{} is as the update left it: slot b's own config.txt",
+                slots::TRYBOOT_FILE
+            ),
+            false => format!("{} is not on the card", slots::TRYBOOT_FILE),
+        };
+        self.on_boot(number, what, |boot| match (&boot.card.tryboot, staged) {
+            (Ok(Some(text)), true) if text == slot_config_txt(Slot::B).as_bytes() => Ok(()),
+            (Ok(None), false) => Ok(()),
+            (Ok(Some(text)), _) => Err(format!("it is {:?}", String::from_utf8_lossy(text))),
+            (Ok(None), true) => Err("it is gone".into()),
+            (Err(error), _) => Err(error.clone()),
+        })
+    }
+
+    /// After boot `number`, `slot`'s `log.txt` has `text` (`has`) or lacks it, or is not there at all.
+    fn boot_log_has(&self, number: usize, slot: Slot, text: &str) -> Condition {
+        self.on_boot(
+            number,
+            format!("qberrypi-{slot}/log.txt on the card has `{text}`"),
+            |boot| match boot.card.log(slot) {
+                Ok(Some(log)) if log.contains(text) => Ok(()),
+                Ok(Some(_)) => Err("it does not".into()),
+                Ok(None) => Err("there is no such log".into()),
+                Err(error) => Err(error.clone()),
+            },
+        )
+    }
+
+    fn boot_log_lacks(&self, number: usize, slot: Slot, text: &str) -> Condition {
+        self.on_boot(
+            number,
+            format!("qberrypi-{slot}/log.txt on the card does not have `{text}`"),
+            |boot| match boot.card.log(slot) {
+                Ok(Some(log)) if log.contains(text) => Err("it does".into()),
+                Ok(_) => Ok(()),
+                // A log that cannot be read is not shown to be free of it.
+                Err(error) => Err(error.clone()),
+            },
+        )
+    }
+
+    /// After boot `number` there is no `log.txt` in `slot`'s folder: nothing of that slot ran.
+    fn boot_has_no_log(&self, number: usize, slot: Slot) -> Condition {
+        self.on_boot(
+            number,
+            format!("qberrypi-{slot}/ has no log.txt: slot {slot} never ran"),
+            |boot| match boot.card.log(slot) {
+                Ok(None) => Ok(()),
+                Ok(Some(_)) => Err("there is one".into()),
+                Err(error) => Err(error.clone()),
+            },
+        )
+    }
+
+    /// After boot `number`, `slot`'s `log.txt` is of `boots` boots, as many headers, and the last
+    /// names the build that was booted.
+    fn boot_log_is_of_boots(&self, number: usize, slot: Slot, boots: usize) -> Condition {
+        let epoch = self.build_epoch;
+        self.on_boot(
+            number,
+            format!("qberrypi-{slot}/log.txt on the card has {boots} boot headers, which name this build"),
+            |boot| match boot.card.log(slot) {
+                Ok(Some(log)) => {
+                    let headers = log.lines().filter(|l| l.starts_with("==== boot")).count();
+                    let build = bootpart::last_boot_build(log);
+                    match headers == boots && build == Some(epoch) {
+                        true => Ok(()),
+                        false => Err(format!(
+                            "it has {headers}; the last names {}, and this is build {epoch}",
+                            build.map_or("no build".to_owned(), |b| format!("build {b}"))
+                        )),
+                    }
+                }
+                Ok(None) => Err("there is no such log".into()),
+                Err(error) => Err(error.clone()),
+            },
         )
     }
 }
@@ -1008,6 +1730,157 @@ fn no_association_conditions(evidence: &Evidence) -> Vec<Condition> {
     ]
 }
 
+/// The trial whose build confirms itself, as the firmware's trial starts it.
+///
+/// Boot 1 is the one after the update's restart with `0 tryboot`: the stand-in reads `tryboot.txt`
+/// and starts slot b, whose init finds the marker, runs on trial and confirms (the scenario's
+/// configuration waits for nothing and confirms 5 s after init started). The confirm selects slot b
+/// in `config.txt` and deletes the marker. Boot 2 starts from `config.txt`: slot b again, with no
+/// trial under way. Slot a never runs.
+fn trial_confirms_conditions(evidence: &Evidence) -> Vec<Condition> {
+    let build = evidence.build_epoch;
+    let allowed = &Allowed::NO_WATCHDOG_NO_LED;
+    let on_trial = format!("INFO  update: slot b is on trial: build {build}, from slot a");
+    let confirmed = format!("INFO  update: build {build} confirmed on slot b");
+    vec![
+        evidence.booted(2),
+        // Boot 1: the trial runs and confirms.
+        evidence.boot_started(1, Slot::B, Settings::Tryboot),
+        evidence.boot_serial_has(1, &banner_start()),
+        evidence.boot_serial_has(1, &on_trial),
+        evidence.boot_serial_has(1, "INFO  supervisor: started trial"),
+        evidence.boot_serial_has(1, &confirmed),
+        evidence.boot_serial_lacks(1, "rolled back"),
+        evidence.boot_serial_has(1, "INFO  returning"),
+        evidence.boot_restart_requested(1),
+        // A build that has confirmed restarts as any other build does, not for another trial.
+        evidence.boot_restart_is_plain(1),
+        evidence.boot_config_selects(1, Slot::B),
+        evidence.boot_has_no_marker(1),
+        evidence.boot_tryboot_txt(1, true),
+        evidence.boot_no_unexpected_complaint(1, allowed),
+        // Boot 2: slot b is the one `config.txt` selects now, and nothing is on trial.
+        evidence.boot_started(2, Slot::B, Settings::Config),
+        evidence.boot_serial_has(2, &banner_start()),
+        evidence.boot_serial_has(
+            2,
+            "INFO  update: slot b is running, with no trial under way",
+        ),
+        evidence.boot_serial_lacks(2, "is on trial"),
+        evidence.boot_serial_lacks(2, "supervisor: started trial"),
+        evidence.boot_serial_lacks(2, "confirmed on slot"),
+        evidence.boot_serial_has(2, "INFO  returning"),
+        evidence.boot_restart_requested(2),
+        evidence.boot_exited(2),
+        evidence.boot_config_selects(2, Slot::B),
+        evidence.boot_has_no_marker(2),
+        evidence.boot_tryboot_txt(2, true),
+        evidence.boot_no_unexpected_complaint(2, allowed),
+        // The card: slot b kept the log of both boots, with the confirm in it; slot a has none.
+        evidence.boot_log_has(2, Slot::B, &confirmed),
+        evidence.boot_log_is_of_boots(2, Slot::B, 2),
+        evidence.boot_has_no_log(2, Slot::A),
+        evidence.boot_serial_lacks(1, PASSPHRASE),
+        evidence.boot_serial_lacks(2, PASSPHRASE),
+        evidence.boot_log_lacks(2, Slot::B, PASSPHRASE),
+    ]
+}
+
+/// The trial whose build panics, started as the firmware's trial or as the software trial
+/// (`mode`), and the rollback that follows.
+///
+/// Boot 1 starts slot b (from `tryboot.txt`, or, for the software trial, from `config.txt`, which
+/// selects slot b). Its init finds the marker and appends `started` (for the software trial it first
+/// selects slot a in `config.txt`, so a restart boots slot a) and the build panics 3 s after the
+/// supervisor starts, before it can confirm, which restarts the board plainly. Boot 2 starts from
+/// `config.txt`, which selects slot a: it finds the marker of a trial of slot b that started and did
+/// not confirm, reports the rollback and deletes the marker. The card is left selecting slot a.
+fn trial_fails_conditions(evidence: &Evidence, mode: Mode) -> Vec<Condition> {
+    let build = evidence.build_epoch;
+    let allowed_in_trial = &Allowed::TRIAL_PANICS;
+    let (first_read, staged) = match mode {
+        Mode::Tryboot => (Settings::Tryboot, true),
+        Mode::Software => (Settings::Config, false),
+    };
+    let marker = Marker {
+        slot: Slot::B,
+        from: Slot::A,
+        build,
+        mode,
+        started: true,
+        failed: None,
+    };
+    let on_trial = format!("INFO  update: slot b is on trial: build {build}, from slot a");
+    let software =
+        "INFO  update: software trial: config.txt selects slot a again until the trial confirms";
+    let rolled_back = format!(
+        "WARN  update: the trial of build {build} on slot b was rolled back: the trial build \
+         restarted before it confirmed; slot a is running again"
+    );
+    let mut conditions = vec![
+        evidence.booted(2),
+        // Boot 1: slot b on trial, which panics.
+        evidence.boot_started(1, Slot::B, first_read),
+        evidence.boot_serial_has(1, &banner_start()),
+        evidence.boot_serial_has(1, &on_trial),
+        evidence.boot_serial_has(1, "INFO  supervisor: started trial"),
+    ];
+    // What only the software trial does: take the way back before anything can go wrong.
+    conditions.push(match mode {
+        Mode::Software => evidence.boot_serial_has(1, software),
+        Mode::Tryboot => evidence.boot_serial_lacks(1, "software trial"),
+    });
+    conditions.extend([
+        evidence.boot_serial_has(1, "fault: trial panic"),
+        evidence.boot_serial_lacks(1, "confirmed on slot"),
+        evidence.boot_serial_lacks(1, "INFO  returning"),
+        evidence.boot_restart_requested(1),
+        // The panic restarts the board plainly: the firmware's flag is not asked for again.
+        evidence.boot_restart_is_plain(1),
+        // The marker says the trial started, and the card selects slot a, whichever way the trial began.
+        evidence.boot_marker_is(1, &marker),
+        evidence.boot_config_selects(1, Slot::A),
+        evidence.boot_tryboot_txt(1, staged),
+        evidence.boot_no_unexpected_complaint(1, allowed_in_trial),
+        // Boot 2: the firmware has no flag now, and reads `config.txt`, which selects slot a.
+        evidence.boot_started(2, Slot::A, Settings::Config),
+        evidence.boot_serial_has(2, &banner_start()),
+        evidence.boot_serial_has(2, &rolled_back),
+        evidence.boot_serial_lacks(2, "is on trial"),
+        evidence.boot_serial_lacks(2, "supervisor: started trial"),
+        evidence.boot_serial_lacks(2, "fault: trial panic"),
+        evidence.boot_serial_has(2, "INFO  returning"),
+        evidence.boot_restart_requested(2),
+        evidence.boot_exited(2),
+        evidence.boot_config_selects(2, Slot::A),
+        evidence.boot_has_no_marker(2),
+        evidence.boot_tryboot_txt(2, staged),
+        evidence.boot_no_unexpected_complaint(2, &Allowed::ROLLS_BACK),
+        // The card: slot b's log has its panic, slot a's the rollback, one boot each.
+        evidence.boot_log_has(2, Slot::B, "ERROR panic at "),
+        evidence.boot_log_has(2, Slot::B, &on_trial),
+        evidence.boot_log_is_of_boots(2, Slot::B, 1),
+        evidence.boot_log_has(2, Slot::A, &rolled_back),
+        evidence.boot_log_lacks(2, Slot::A, "ERROR panic at "),
+        evidence.boot_log_is_of_boots(2, Slot::A, 1),
+        evidence.boot_serial_lacks(1, PASSPHRASE),
+        evidence.boot_serial_lacks(2, PASSPHRASE),
+        evidence.boot_log_lacks(2, Slot::A, PASSPHRASE),
+        evidence.boot_log_lacks(2, Slot::B, PASSPHRASE),
+    ]);
+    conditions
+}
+
+/// The trial that the firmware starts, whose build panics.
+fn trial_fails_firmware_conditions(evidence: &Evidence) -> Vec<Condition> {
+    trial_fails_conditions(evidence, Mode::Tryboot)
+}
+
+/// The trial that the software starts, whose build panics.
+fn trial_fails_software_conditions(evidence: &Evidence) -> Vec<Condition> {
+    trial_fails_conditions(evidence, Mode::Software)
+}
+
 /// Makes the scenarios from the text of `qberrypi.example.toml`.
 fn scenarios(example: &str) -> Result<Vec<Scenario>> {
     // The supervisor starts the components only after the wait for `wlan0`, 20 s in QEMU, and the
@@ -1081,6 +1954,27 @@ fn scenarios(example: &str) -> Result<Vec<Scenario>> {
     // TOML on the very line that holds the secret, which no message may show.
     let closed = format!("\"{PASSPHRASE}\"");
     let broken = edited(example, &[(&closed, closed.trim_end_matches('"'))])?;
+    // The slots of a trial: a permanent system that keeps its log in its slot's folder and
+    // restarts 40 s in (the services start after the 20 s wait for `wlan0`), which is the
+    // configuration of slot a, and of slot b in the scenario whose trial confirms but for the two
+    // switches that let it: it waits for no Wi-Fi, clock or upstream (QEMU has none), and confirms
+    // 5 s after init started. The builds whose trial fails are not given those: with no Wi-Fi in
+    // QEMU they could not confirm, and the panic comes 3 s after the supervisor starts.
+    let slot_a = edited(
+        example,
+        &[
+            ("log_to_sd = false", "log_to_sd = true"),
+            ("return_after_secs = 0", "return_after_secs = 40"),
+        ],
+    )?;
+    let slot_b_confirms = edited(
+        &slot_a,
+        &[
+            ("trial_confirm_secs = 0", "trial_confirm_secs = 5"),
+            ("trial_offline = false", "trial_offline = true"),
+        ],
+    )?;
+    let slot_b_panics = edited(&slot_a, &[("fault = \"none\"", "fault = \"trial_panic\"")])?;
 
     // What the scenarios are about is in these switches, so they are read back.
     let switches = |text: &str| {
@@ -1111,6 +2005,25 @@ fn scenarios(example: &str) -> Result<Vec<Scenario>> {
         Err(error) => bail!("the broken configuration is refused for something else: {error}"),
         Ok(_) => bail!("the broken configuration is a valid one"),
     }
+    // The trial switches too: what a slot does on trial is in them.
+    let trial_switches = |text: &str| {
+        qberrypi::config::parse(text)
+            .map(|cfg| cfg.debug)
+            .map(|debug| {
+                (
+                    (debug.one_shot, debug.log_to_sd, debug.return_after_secs),
+                    debug.fault,
+                    (debug.trial_confirm_secs, debug.trial_offline),
+                )
+            })
+            .map_err(|error| anyhow!("{EXAMPLE_CONFIG}, edited for a scenario: {error}"))
+    };
+    if trial_switches(&slot_a)? != ((false, true, 40), Fault::None, (0, false))
+        || trial_switches(&slot_b_confirms)? != ((false, true, 40), Fault::None, (5, true))
+        || trial_switches(&slot_b_panics)? != ((false, true, 40), Fault::TrialPanic, (0, false))
+    {
+        bail!("{EXAMPLE_CONFIG} did not take the trial scenarios' debug settings");
+    }
 
     Ok(vec![
         Scenario {
@@ -1119,6 +2032,7 @@ fn scenarios(example: &str) -> Result<Vec<Scenario>> {
             note: None,
             file_stem: "one-shot",
             system_config: one_shot.clone(),
+            card: CardPlan::OneBoot,
             conditions: one_shot_conditions,
         },
         Scenario {
@@ -1127,6 +2041,7 @@ fn scenarios(example: &str) -> Result<Vec<Scenario>> {
             note: None,
             file_stem: "broken-config",
             system_config: broken,
+            card: CardPlan::OneBoot,
             conditions: broken_config_conditions,
         },
         Scenario {
@@ -1135,6 +2050,7 @@ fn scenarios(example: &str) -> Result<Vec<Scenario>> {
             note: None,
             file_stem: "permanent",
             system_config: permanent,
+            card: CardPlan::OneBoot,
             conditions: permanent_conditions,
         },
         Scenario {
@@ -1143,6 +2059,7 @@ fn scenarios(example: &str) -> Result<Vec<Scenario>> {
             note: Some(JUDGED_BY_THE_CARD),
             file_stem: "no-console",
             system_config: one_shot.clone(),
+            card: CardPlan::OneBoot,
             conditions: no_console_conditions,
         },
         Scenario {
@@ -1151,6 +2068,7 @@ fn scenarios(example: &str) -> Result<Vec<Scenario>> {
             note: Some(RESET_ON_ARMING),
             file_stem: "watchdog-resets-on-arming",
             system_config: one_shot.clone(),
+            card: CardPlan::OneBoot,
             conditions: watchdog_conditions,
         },
         Scenario {
@@ -1159,6 +2077,7 @@ fn scenarios(example: &str) -> Result<Vec<Scenario>> {
             note: Some(SHIPPED_CONSOLE_UNSEEN),
             file_stem: "shipped-command-line",
             system_config: one_shot,
+            card: CardPlan::OneBoot,
             conditions: shipped_conditions,
         },
         Scenario {
@@ -1167,6 +2086,7 @@ fn scenarios(example: &str) -> Result<Vec<Scenario>> {
             note: Some(NO_NETWORK),
             file_stem: "dns-without-a-network",
             system_config: dns_selftest,
+            card: CardPlan::OneBoot,
             conditions: dns_selftest_conditions,
         },
         Scenario {
@@ -1175,6 +2095,7 @@ fn scenarios(example: &str) -> Result<Vec<Scenario>> {
             note: None,
             file_stem: "crash-loop",
             system_config: crash_loop,
+            card: CardPlan::OneBoot,
             conditions: crash_loop_conditions,
         },
         Scenario {
@@ -1183,6 +2104,7 @@ fn scenarios(example: &str) -> Result<Vec<Scenario>> {
             note: None,
             file_stem: "panic",
             system_config: panic,
+            card: CardPlan::OneBoot,
             conditions: panic_conditions,
         },
         Scenario {
@@ -1191,6 +2113,7 @@ fn scenarios(example: &str) -> Result<Vec<Scenario>> {
             note: None,
             file_stem: "no-association",
             system_config: no_association,
+            card: CardPlan::OneBoot,
             conditions: no_association_conditions,
         },
         Scenario {
@@ -1199,7 +2122,47 @@ fn scenarios(example: &str) -> Result<Vec<Scenario>> {
             note: None,
             file_stem: "permanent-crash-loop",
             system_config: permanent_crash_loop,
+            card: CardPlan::OneBoot,
             conditions: permanent_crash_loop_conditions,
+        },
+        Scenario {
+            name: "trial confirms",
+            machine: Machine::Usual,
+            note: Some(BOOTED_LIKE_THE_FIRMWARE),
+            file_stem: "trial-confirms",
+            system_config: slot_a.clone(),
+            card: CardPlan::Slots(SlotPlan {
+                config_b: slot_b_confirms,
+                mode: Mode::Tryboot,
+                boots: 2,
+            }),
+            conditions: trial_confirms_conditions,
+        },
+        Scenario {
+            name: "trial fails, firmware",
+            machine: Machine::Usual,
+            note: Some(BOOTED_LIKE_THE_FIRMWARE),
+            file_stem: "trial-fails-firmware",
+            system_config: slot_a.clone(),
+            card: CardPlan::Slots(SlotPlan {
+                config_b: slot_b_panics.clone(),
+                mode: Mode::Tryboot,
+                boots: 2,
+            }),
+            conditions: trial_fails_firmware_conditions,
+        },
+        Scenario {
+            name: "trial fails, software",
+            machine: Machine::Usual,
+            note: Some(BOOTED_LIKE_THE_FIRMWARE),
+            file_stem: "trial-fails-software",
+            system_config: slot_a,
+            card: CardPlan::Slots(SlotPlan {
+                config_b: slot_b_panics,
+                mode: Mode::Software,
+                boots: 2,
+            }),
+            conditions: trial_fails_software_conditions,
         },
     ])
 }
@@ -1259,8 +2222,9 @@ pub fn run_all(root: &Path, jobs: Option<NonZeroUsize>) -> Result<()> {
             let (mut block, held) =
                 scenario_report(scenario.name, scenario.note, &conditions, started.elapsed());
             if !held {
-                let image = folder.join(scenario.file_stem).with_extension("img");
-                block.push_str(&serial_tail(&serial_log_of(&image)));
+                for log in serial_logs(scenario, &folder) {
+                    block.push_str(&serial_tail(&log));
+                }
             }
             Ok((block, held))
         },
@@ -1467,8 +2431,95 @@ fn card_certificate(system_config: &str, now_unix: u64) -> Result<Option<String>
     }
 }
 
-/// Makes a scenario's card in `folder`, boots the build from it and judges the boot.
+/// The serial logs that a scenario's boots saved in `folder`, in the order of the boots: the one
+/// log of a one-boot scenario (which is named even if it was never written), and the logs of the
+/// boots of a card with two slots that took place.
+fn serial_logs(scenario: &Scenario, folder: &Path) -> Vec<PathBuf> {
+    match &scenario.card {
+        CardPlan::OneBoot => {
+            let image = folder.join(scenario.file_stem).with_extension("img");
+            vec![serial_log_of(&image)]
+        }
+        CardPlan::Slots(plan) => (1..=plan.boots)
+            .map(|number| slot_boot_log(folder, scenario.file_stem, number))
+            .filter(|log| log.exists())
+            .collect(),
+    }
+}
+
+/// Makes a scenario's card in `folder`, boots the build from it and judges the boots.
 fn run_scenario(scenario: &Scenario, build: &Build, folder: &Path) -> Result<Vec<Condition>> {
+    match &scenario.card {
+        CardPlan::OneBoot => run_one_boot(scenario, build, folder),
+        CardPlan::Slots(plan) => run_slots(scenario, plan, build, folder),
+    }
+}
+
+/// Makes the card of a scenario with two slots, with its trial staged, boots it as the firmware
+/// would (see the module's text) and judges the boots.
+///
+/// The slots are made from the build in `build.folder`, checked against its `SHA256SUMS` once more.
+/// The evidence's `serial` and `exited` are the last boot's; `system_log` is an error, since this
+/// card has no `qberrypi/log.txt` (each slot has a log of its own, which each boot's evidence holds).
+fn run_slots(
+    scenario: &Scenario,
+    plan: &SlotPlan,
+    build: &Build,
+    folder: &Path,
+) -> Result<Vec<Condition>> {
+    let image = folder.join(scenario.file_stem).with_extension("img");
+    let files = {
+        let slot_build = slot::Build::read(&build.folder)
+            .with_context(|| format!("{}: cannot read the build", scenario.name))?;
+        staged_card_files(&slot_build, plan, &scenario.system_config, build.epoch)?
+    };
+    sdimage::build_sized(&image, sdimage::IMAGE_BYTES, &files)?;
+    drop(files);
+    let image_before = file_sha256(&image)?;
+
+    let boots = run_boots(
+        &image,
+        folder,
+        scenario.file_stem,
+        scenario.machine,
+        plan.mode == Mode::Tryboot,
+        plan.boots,
+        |request| {
+            let outcome = boot_logged(
+                request.boot_folder,
+                &image,
+                request.kernel_args,
+                BOOT_TIMEOUT,
+                request.serial_log,
+            )?;
+            Ok((outcome.serial, outcome.exited))
+        },
+    )?;
+
+    let last = boots.last().context("the scenario did not boot")?;
+    let evidence = Evidence {
+        serial: last.serial.clone(),
+        exited: last.exited,
+        active_config: last.card.config.clone(),
+        system_log: Err("a card with two slots has no qberrypi/log.txt".to_owned()),
+        image_after: file_sha256(&image)?,
+        image_before,
+        build_epoch: build.epoch,
+        boots,
+    };
+    Ok(judged(scenario, &evidence))
+}
+
+/// The conditions of a scenario, and the one that every scenario has besides its own: no Bluetooth
+/// line on any serial console.
+fn judged(scenario: &Scenario, evidence: &Evidence) -> Vec<Condition> {
+    let mut conditions = (scenario.conditions)(evidence);
+    conditions.push(evidence.serial_has_no_bluetooth());
+    conditions
+}
+
+/// Makes the card of a scenario of the old layout, boots the build from it once and judges the boot.
+fn run_one_boot(scenario: &Scenario, build: &Build, folder: &Path) -> Result<Vec<Condition>> {
     let image = folder.join(scenario.file_stem).with_extension("img");
     let certificate = card_certificate(&scenario.system_config, crate::unix_time()?)
         .with_context(|| format!("{}: cannot make the API's certificate", scenario.name))?;
@@ -1501,8 +2552,9 @@ fn run_scenario(scenario: &Scenario, build: &Build, folder: &Path) -> Result<Vec
         build_epoch: build.epoch,
         serial: outcome.serial,
         exited: outcome.exited,
+        boots: Vec::new(),
     };
-    Ok((scenario.conditions)(&evidence))
+    Ok(judged(scenario, &evidence))
 }
 
 /// Lays out a scenario's result, and says whether every condition that can be checked held.
@@ -1869,6 +2921,10 @@ mod tests {
 
     #[test]
     fn the_scenarios_differ_from_the_example_only_in_their_debug_settings() {
+        // The three trial scenarios come after these eleven and have a test of their own.
+        let mut all = scenarios(EXAMPLE).unwrap();
+        assert_eq!(all.len(), 14);
+        all.truncate(11);
         let [
             one_shot,
             broken,
@@ -1881,7 +2937,7 @@ mod tests {
             panic,
             no_association,
             permanent_crash_loop,
-        ] = <[Scenario; 11]>::try_from(scenarios(EXAMPLE).unwrap())
+        ] = <[Scenario; 11]>::try_from(all)
             .unwrap_or_else(|all| panic!("{} scenarios, not eleven", all.len()));
 
         assert_eq!(
@@ -2020,13 +3076,19 @@ mod tests {
                 Machine::Usual,
                 Machine::Usual,
                 Machine::Usual,
+                Machine::Usual,
+                // The trial scenarios.
+                Machine::Usual,
+                Machine::Usual,
                 Machine::Usual
             ]
         );
+        // A scenario that is not on the usual machine says so, and so does one that boots a card
+        // with two slots by standing in for the firmware.
         for scenario in &scenarios {
             assert_eq!(
                 scenario.note.is_some(),
-                scenario.machine != Machine::Usual,
+                scenario.machine != Machine::Usual || matches!(scenario.card, CardPlan::Slots(_)),
                 "{}",
                 scenario.name
             );
@@ -2045,7 +3107,10 @@ mod tests {
                 "crash-loop",
                 "panic",
                 "no-association",
-                "permanent-crash-loop"
+                "permanent-crash-loop",
+                "trial-confirms",
+                "trial-fails-firmware",
+                "trial-fails-software"
             ]
         );
     }
@@ -2314,6 +3379,7 @@ mod tests {
             image_before: "aa".to_owned(),
             image_after: "bb".to_owned(),
             build_epoch: 1_700_000_000,
+            boots: Vec::new(),
         }
     }
 
@@ -2621,6 +3687,70 @@ mod tests {
         let verdict = good_evidence().exited().verdict;
 
         assert_eq!(verdict, Verdict::CannotBeCheckedInQemu(RESTART_UNCHECKED));
+    }
+
+    #[test]
+    fn a_bluetooth_line_on_the_serial_console_fails_the_condition_and_none_holds_it() {
+        assert_eq!(
+            good_evidence().serial_has_no_bluetooth().verdict,
+            Verdict::Holds
+        );
+        for line in [
+            "Bluetooth: Core ver 2.22",
+            "Bluetooth: HCI device and connection manager initialized",
+            "Bluetooth: hci0: BCM: chip id 107",
+            "hci0: command 0x0c03 tx timeout",
+            "btbcm: loaded",
+        ] {
+            let mut evidence = good_evidence();
+            evidence.serial.push_str(&format!("[    2.100] {line}\n"));
+            let Verdict::Fails(why) = evidence.serial_has_no_bluetooth().verdict else {
+                panic!("{line} was let through");
+            };
+            assert!(why.contains(line), "{why}");
+        }
+        // The lines of init's own log that speak of Bluetooth in passing are not the kernel's.
+        let mut evidence = good_evidence();
+        evidence
+            .serial
+            .push_str("[   0.1] INFO  qberrypi-modhelper: bnep: refused\n");
+        assert_eq!(evidence.serial_has_no_bluetooth().verdict, Verdict::Holds);
+    }
+
+    #[test]
+    fn every_boot_of_a_card_with_two_slots_counts_for_the_bluetooth_condition() {
+        let mut evidence = good_trial_confirms_evidence();
+        assert_eq!(evidence.serial_has_no_bluetooth().verdict, Verdict::Holds);
+        // The first boot, and not the last one, which `serial` is.
+        evidence.boots[0]
+            .serial
+            .push_str("[    2.1] Bluetooth: Core ver 2.22\n");
+        assert!(matches!(
+            evidence.serial_has_no_bluetooth().verdict,
+            Verdict::Fails(_)
+        ));
+    }
+
+    #[test]
+    fn every_scenario_is_judged_on_the_bluetooth_condition_besides_its_own() {
+        let all = scenarios(EXAMPLE).unwrap();
+        let what = "the serial console has no Bluetooth line";
+        for scenario in &all {
+            let evidence = good_evidence();
+            let own = (scenario.conditions)(&evidence);
+            assert!(
+                own.iter().all(|c| !c.what.starts_with(what)),
+                "{}",
+                scenario.name
+            );
+            let judged = judged(scenario, &evidence);
+            assert_eq!(judged.len(), own.len() + 1, "{}", scenario.name);
+            assert!(
+                judged.last().unwrap().what.starts_with(what),
+                "{}",
+                scenario.name
+            );
+        }
     }
 
     #[test]
@@ -4043,6 +5173,1263 @@ mod tests {
         assert_stand_ins_are_gone(dir.path(), &[1, 2]);
     }
 
+    // The trial scenarios and the firmware stand-in.
+
+    /// The build time of the fixture build, which the evidence of the trial scenarios names.
+    const EPOCH: u64 = 1_700_000_000;
+
+    /// The text that a build with this build time writes for the slot's log.
+    fn boot_log(lines: &str) -> String {
+        format!("==== boot, build {EPOCH} ====\n{lines}")
+    }
+
+    /// A fixture build (each file holds its own name), in a checkout that is kept as long as it is.
+    fn fixture_build() -> (tempfile::TempDir, slot::Build) {
+        let (root, _) = crate::slot::tests::checkout();
+        let build = slot::Build::read(&root.path().join(slot::BOOT_FOLDER)).unwrap();
+        (root, build)
+    }
+
+    /// A trial of slot b in `mode`, with configurations that are only text.
+    fn plan(mode: Mode) -> SlotPlan {
+        SlotPlan {
+            config_b: "# slot b\n".to_owned(),
+            mode,
+            boots: 2,
+        }
+    }
+
+    /// The files of a card with the trial of `mode` staged on it, made from the fixture build.
+    fn staged_files(mode: Mode) -> Vec<(String, Vec<u8>)> {
+        let (_root, build) = fixture_build();
+        staged_card_files(&build, &plan(mode), "# slot a\n", EPOCH).unwrap()
+    }
+
+    /// Writes a card image holding `files` in `dir`, and gives its path.
+    fn card_at(dir: &Path, files: &[(String, Vec<u8>)]) -> PathBuf {
+        let path = dir.join("card.img");
+        sdimage::build_sized(&path, sdimage::IMAGE_BYTES, files).unwrap();
+        path
+    }
+
+    /// The bytes of the file at `name` in `files`, the last one if it is there twice.
+    fn file<'a>(files: &'a [(String, Vec<u8>)], name: &str) -> Option<&'a [u8]> {
+        files
+            .iter()
+            .rev()
+            .find(|(have, _)| have == name)
+            .map(|(_, bytes)| &bytes[..])
+    }
+
+    #[test]
+    fn a_staged_firmware_trial_is_the_card_an_update_leaves_before_its_restart() {
+        let files = staged_files(Mode::Tryboot);
+
+        // `config.txt` still selects slot a, and `tryboot.txt` is slot b's own, for one boot.
+        assert_eq!(
+            file(&files, "config.txt"),
+            file(&files, "qberrypi-a/config.txt")
+        );
+        assert_eq!(
+            file(&files, "tryboot.txt"),
+            file(&files, "qberrypi-b/config.txt")
+        );
+        assert_eq!(
+            slots::selected_slot(file(&files, "config.txt").unwrap()),
+            Ok(Slot::A)
+        );
+        // The marker is what the updater writes, and init finds it on the row of the firmware's trial.
+        let marker =
+            Marker::parse(std::str::from_utf8(file(&files, slots::MARKER_FILE).unwrap()).unwrap())
+                .unwrap();
+        assert_eq!(
+            marker,
+            Marker {
+                slot: Slot::B,
+                from: Slot::A,
+                build: EPOCH,
+                mode: Mode::Tryboot,
+                started: false,
+                failed: None
+            }
+        );
+        assert_eq!(
+            slots::decide(Slot::B, Slot::A, Some(Ok(marker.clone()))),
+            slots::BootAction::Trial {
+                marker,
+                select_from_first: false
+            }
+        );
+    }
+
+    #[test]
+    fn a_staged_software_trial_selects_slot_b_in_config_txt_and_has_no_tryboot_txt() {
+        let files = staged_files(Mode::Software);
+
+        assert_eq!(
+            file(&files, "config.txt"),
+            file(&files, "qberrypi-b/config.txt")
+        );
+        assert_eq!(file(&files, "tryboot.txt"), None);
+        let marker =
+            Marker::parse(std::str::from_utf8(file(&files, slots::MARKER_FILE).unwrap()).unwrap())
+                .unwrap();
+        assert_eq!(
+            (marker.slot, marker.from, marker.mode),
+            (Slot::B, Slot::A, Mode::Software)
+        );
+        // Init finds it on the row of the software trial: it selects slot a again first.
+        assert_eq!(
+            slots::decide(Slot::B, Slot::B, Some(Ok(marker.clone()))),
+            slots::BootAction::Trial {
+                marker,
+                select_from_first: true
+            }
+        );
+    }
+
+    #[test]
+    fn a_staged_card_holds_both_slots_whole_and_the_boot_firmwares_stand_ins() {
+        let files = staged_files(Mode::Tryboot);
+
+        for slot in [Slot::A, Slot::B] {
+            for name in slots::SLOT_FILES {
+                assert!(
+                    file(&files, &format!("{}/{name}", slot.dir())).is_some(),
+                    "{slot}: {name}"
+                );
+            }
+        }
+        for name in crate::image::FIRMWARE_FILES {
+            assert!(file(&files, name).is_some(), "{name}");
+        }
+        // Each slot has its own configuration, and a stand-in for the key.
+        assert_eq!(
+            file(&files, "qberrypi-a/qberrypi.toml"),
+            Some(&b"# slot a\n"[..])
+        );
+        assert_eq!(
+            file(&files, "qberrypi-b/qberrypi.toml"),
+            Some(&b"# slot b\n"[..])
+        );
+        assert_eq!(file(&files, "qberrypi-b/tls.pem"), Some(SLOT_TLS_STAND_IN));
+        // Both slots hold the same build, and their command lines name them.
+        assert_eq!(
+            file(&files, "qberrypi-a/kernel8.img"),
+            file(&files, "qberrypi-b/kernel8.img")
+        );
+        for slot in [Slot::A, Slot::B] {
+            let cmdline = file(&files, &format!("{}/cmdline.txt", slot.dir())).unwrap();
+            assert_eq!(slots::check_slot_cmdline(cmdline, slot), Ok(()));
+        }
+    }
+
+    #[test]
+    fn the_firmware_reads_config_txt_and_starts_the_slot_it_selects() {
+        for (mode, selected) in [(Mode::Tryboot, Slot::A), (Mode::Software, Slot::B)] {
+            let dir = tempfile::tempdir().unwrap();
+            let image = card_at(dir.path(), &staged_files(mode));
+
+            let start = firmware_start(&mut Image::open(&image).unwrap(), false).unwrap();
+
+            assert_eq!(
+                start,
+                Start {
+                    read: Settings::Config,
+                    slot: selected
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn after_a_tryboot_restart_the_firmware_reads_tryboot_txt_and_starts_the_slot_it_selects() {
+        let dir = tempfile::tempdir().unwrap();
+        let image = card_at(dir.path(), &staged_files(Mode::Tryboot));
+
+        let start = firmware_start(&mut Image::open(&image).unwrap(), true).unwrap();
+
+        // `config.txt` selects slot a on this card; `tryboot.txt` is what this start reads.
+        assert_eq!(
+            start,
+            Start {
+                read: Settings::Tryboot,
+                slot: Slot::B
+            }
+        );
+    }
+
+    #[test]
+    fn a_tryboot_start_with_no_tryboot_txt_is_an_error_that_names_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let image = card_at(dir.path(), &staged_files(Mode::Software));
+
+        let e = firmware_start(&mut Image::open(&image).unwrap(), true).unwrap_err();
+
+        assert!(format!("{e:#}").contains("tryboot.txt"), "{e:#}");
+    }
+
+    #[test]
+    fn a_settings_file_that_selects_no_slot_is_an_error_that_names_the_file() {
+        for (name, text, tryboot) in [
+            ("config.txt", CONFIG_TXT, false),
+            ("config.txt", "arm_64bit=1\n", false),
+            ("tryboot.txt", "os_prefix=qberrypi-c/\n", true),
+        ] {
+            let mut files = staged_files(Mode::Tryboot);
+            files.push((name.to_owned(), text.as_bytes().to_vec()));
+            let dir = tempfile::tempdir().unwrap();
+            let image = card_at(dir.path(), &files);
+
+            let e = firmware_start(&mut Image::open(&image).unwrap(), tryboot).unwrap_err();
+
+            assert!(format!("{e:#}").starts_with(name), "{e:#}");
+        }
+    }
+
+    #[test]
+    fn the_last_restart_that_the_kernel_announced_says_whether_the_flag_is_set() {
+        let plain =
+            "[   42.1] reboot: Restarting system\n[   42.2] Reboot failed -- System halted\n";
+        let tryboot = "[   42.1] reboot: Restarting system with command '0 tryboot'\n\
+                       [   42.2] Reboot failed -- System halted\n";
+        let cases = [
+            (
+                "no restart at all",
+                "[    1.5] Run /init as init process\n",
+                false,
+            ),
+            ("a plain restart", plain, false),
+            ("a restart with `0 tryboot`", tryboot, true),
+            // The flag is one-shot: only the last restart counts.
+            (
+                "a tryboot restart, then a plain one",
+                &format!("{tryboot}{plain}"),
+                false,
+            ),
+            (
+                "a plain restart, then a tryboot one",
+                &format!("{plain}{tryboot}"),
+                true,
+            ),
+            // Another command than the one that sets the flag does not set it.
+            (
+                "a restart with another command",
+                "[    1.5] reboot: Restarting system with command 'recovery'\n",
+                false,
+            ),
+            // Text about tryboot that is not the kernel's announcement does not set it.
+            (
+                "init talking about it",
+                "[   0.5] INFO  update: restarting: with `0 tryboot`\n",
+                false,
+            ),
+        ];
+        for (what, serial, expected) in cases {
+            assert_eq!(restart_was_tryboot(serial), expected, "{what}");
+        }
+    }
+
+    #[test]
+    fn a_slot_boots_with_the_scenarios_arguments_and_the_slot_its_own_cmdline_names() {
+        for slot in [Slot::A, Slot::B] {
+            let cmdline = crate::build::slot_cmdline_txt(slot);
+
+            let args = slot_kernel_args(Machine::Usual, slot, cmdline.as_bytes()).unwrap();
+
+            assert_eq!(args, format!("{KERNEL_ARGS} qberrypi.slot={slot}"));
+        }
+        let shipped = slot_kernel_args(
+            Machine::Shipped,
+            Slot::B,
+            crate::build::slot_cmdline_txt(Slot::B).as_bytes(),
+        )
+        .unwrap();
+        assert!(shipped.ends_with(" qberrypi.slot=b") && shipped.contains(QEMU_NEEDS));
+    }
+
+    #[test]
+    fn a_slot_whose_cmdline_names_no_slot_or_the_other_one_cannot_be_started() {
+        let cmdline = |slot| crate::build::slot_cmdline_txt(slot);
+        for (what, text, expect) in [
+            (
+                "no argument",
+                CMDLINE_TXT.to_owned(),
+                "no qberrypi.slot argument",
+            ),
+            ("the other slot", cmdline(Slot::A), "names slot a"),
+            (
+                "a value that is no slot",
+                "qberrypi.slot=c\n".to_owned(),
+                "neither a nor b",
+            ),
+            (
+                "the argument twice",
+                format!("{}{}", cmdline(Slot::B).trim_end(), " qberrypi.slot=b\n"),
+                "more than once",
+            ),
+        ] {
+            let e = slot_kernel_args(Machine::Usual, Slot::B, text.as_bytes()).unwrap_err();
+
+            let e = format!("{e:#}");
+            assert!(
+                e.contains("qberrypi-b/cmdline.txt") && e.contains(expect),
+                "{what}: {e}"
+            );
+        }
+        let e = slot_kernel_args(Machine::Usual, Slot::B, &[0xff, 0xfe]).unwrap_err();
+        assert!(format!("{e:#}").contains("not text"), "{e:#}");
+    }
+
+    #[test]
+    fn the_slots_files_are_read_from_the_card_and_put_where_qemu_loads_them() {
+        let dir = tempfile::tempdir().unwrap();
+        let image = card_at(dir.path(), &staged_files(Mode::Tryboot));
+        let files = load_slot(&mut Image::open(&image).unwrap(), Slot::B).unwrap();
+
+        // The fixture's files hold their own names.
+        assert_eq!(files.kernel, KERNEL.as_bytes());
+        assert_eq!(files.device_tree, DEVICE_TREE.as_bytes());
+        assert_eq!(files.initramfs, INITRAMFS.as_bytes());
+        assert_eq!(
+            files.cmdline,
+            crate::build::slot_cmdline_txt(Slot::B).as_bytes()
+        );
+        let path = dir.path().join("boot-1");
+        // A folder that an earlier run left is replaced, whatever it holds.
+        fs::create_dir(&path).unwrap();
+        fs::write(path.join("left-over"), "x").unwrap();
+
+        let folder = BootFolder::make(path.clone(), &files).unwrap();
+
+        let mut names: Vec<String> = fs::read_dir(&path)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+            .collect();
+        names.sort();
+        assert_eq!(names, [DEVICE_TREE, INITRAMFS, KERNEL]);
+        assert_eq!(fs::read(path.join(KERNEL)).unwrap(), KERNEL.as_bytes());
+        let command = qemu_command(&folder.0, Path::new("card.img"), KERNEL_ARGS);
+        let args: Vec<&str> = command.get_args().map(|a| a.to_str().unwrap()).collect();
+        assert!(args.contains(&path.join(KERNEL).to_str().unwrap()));
+        drop(folder);
+        assert!(!path.exists(), "the folder of the boot is removed after it");
+    }
+
+    #[test]
+    fn a_slot_that_is_missing_a_file_of_the_boot_cannot_be_loaded() {
+        let mut files = staged_files(Mode::Tryboot);
+        files.retain(|(name, _)| name != "qberrypi-b/initramfs8");
+        let dir = tempfile::tempdir().unwrap();
+        let image = card_at(dir.path(), &files);
+
+        let e = load_slot(&mut Image::open(&image).unwrap(), Slot::B)
+            .err()
+            .unwrap();
+
+        assert!(format!("{e:#}").contains("qberrypi-b/initramfs8"), "{e:#}");
+    }
+
+    #[test]
+    fn the_card_after_a_boot_is_read_with_its_marker_tryboot_txt_and_the_slots_logs() {
+        let mut files = staged_files(Mode::Tryboot);
+        files.push(("qberrypi-b/log.txt".to_owned(), b"the log of b\n".to_vec()));
+        let dir = tempfile::tempdir().unwrap();
+        let image = card_at(dir.path(), &files);
+
+        let card = CardAfter::read(&mut Image::open(&image).unwrap());
+
+        assert_eq!(
+            card.config.as_ref().unwrap(),
+            slot_config_txt(Slot::A).as_bytes()
+        );
+        assert_eq!(
+            card.tryboot.as_ref().unwrap().as_deref(),
+            Some(slot_config_txt(Slot::B).as_bytes())
+        );
+        let marker = card.marker.as_ref().unwrap().as_deref().unwrap();
+        assert!(marker.starts_with(b"slot=b\nfrom=a\n"));
+        assert_eq!(card.logs[0], Ok(None));
+        assert_eq!(card.logs[1], Ok(Some("the log of b\n".to_owned())));
+        assert_eq!(card.log(Slot::B), &card.logs[1]);
+    }
+
+    /// What a made-up guest of `run_boots` says in a boot that restarts plainly.
+    const PLAIN_RESTART: &str = "[   42.1] reboot: Restarting system\n";
+
+    #[test]
+    fn each_boot_starts_from_the_card_as_the_guest_before_it_left_it() {
+        // A software trial: boot 1 starts slot b from `config.txt`; the guest selects slot a
+        // and restarts, so boot 2 starts slot a, which is what the firmware would do.
+        let files = staged_files(Mode::Software);
+        let dir = tempfile::tempdir().unwrap();
+        let image = card_at(dir.path(), &files);
+        let mut asked = Vec::new();
+
+        let boots = run_boots(
+            &image,
+            dir.path(),
+            "t",
+            Machine::Usual,
+            false,
+            2,
+            |request| {
+                asked.push((
+                    request.kernel_args.to_owned(),
+                    request.boot_folder.join(KERNEL).is_file(),
+                    request.serial_log.to_owned(),
+                ));
+                if asked.len() == 1 {
+                    let mut selected = files.clone();
+                    selected.push((
+                        "config.txt".to_owned(),
+                        slot_config_txt(Slot::A).into_bytes(),
+                    ));
+                    card_at(dir.path(), &selected);
+                }
+                Ok((PLAIN_RESTART.to_owned(), false))
+            },
+        )
+        .unwrap();
+
+        let starts: Vec<Start> = boots.iter().map(|boot| boot.start).collect();
+        assert_eq!(
+            starts,
+            [
+                Start {
+                    read: Settings::Config,
+                    slot: Slot::B
+                },
+                Start {
+                    read: Settings::Config,
+                    slot: Slot::A
+                },
+            ]
+        );
+        assert!(asked[0].0.ends_with("qberrypi.slot=b") && asked[1].0.ends_with("qberrypi.slot=a"));
+        assert!(
+            asked.iter().all(|(_, loaded, _)| *loaded),
+            "QEMU is given its three files"
+        );
+        assert_eq!(asked[0].2, dir.path().join("t-boot-1.log"));
+        assert_eq!(asked[1].2, dir.path().join("t-boot-2.log"));
+        // The card that each boot left is read after the boot, so the guest's write shows in both.
+        assert_eq!(
+            boots[0].card.config.as_ref().unwrap(),
+            slot_config_txt(Slot::A).as_bytes()
+        );
+        assert_eq!(
+            boots[1].card.config.as_ref().unwrap(),
+            slot_config_txt(Slot::A).as_bytes()
+        );
+        // The folder of each boot is gone once the boot is.
+        assert!(!dir.path().join("t-boot-1").exists());
+        assert!(!dir.path().join("t-boot-2").exists());
+    }
+
+    #[test]
+    fn the_flag_is_set_for_the_first_boot_of_a_firmware_trial_and_after_a_tryboot_restart_only() {
+        let files = staged_files(Mode::Tryboot);
+        let dir = tempfile::tempdir().unwrap();
+        let image = card_at(dir.path(), &files);
+        let mut said = [
+            // Boot 1 is the first boot of the trial, and its restart is a plain one,
+            PLAIN_RESTART,
+            // so boot 2 reads `config.txt`; its restart is one for another trial, so
+            "[   42.1] reboot: Restarting system with command '0 tryboot'\n",
+            // boot 3 reads `tryboot.txt`.
+            PLAIN_RESTART,
+        ]
+        .into_iter();
+
+        let boots = run_boots(&image, dir.path(), "t", Machine::Usual, true, 3, |_| {
+            Ok((said.next().unwrap().to_owned(), false))
+        })
+        .unwrap();
+
+        let starts: Vec<Start> = boots.iter().map(|boot| boot.start).collect();
+        let (tryboot, config) = (Settings::Tryboot, Settings::Config);
+        assert_eq!(
+            starts,
+            [
+                Start {
+                    read: tryboot,
+                    slot: Slot::B
+                },
+                Start {
+                    read: config,
+                    slot: Slot::A
+                },
+                Start {
+                    read: tryboot,
+                    slot: Slot::B
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn the_boots_end_after_a_guest_that_did_not_restart_or_halt() {
+        let dir = tempfile::tempdir().unwrap();
+        let image = card_at(dir.path(), &staged_files(Mode::Tryboot));
+        let mut said = [
+            PLAIN_RESTART,
+            "[   9.9] INFO  still running when QEMU was stopped\n",
+        ]
+        .into_iter();
+
+        let boots = run_boots(&image, dir.path(), "t", Machine::Usual, true, 4, |_| {
+            Ok((said.next().unwrap().to_owned(), false))
+        })
+        .unwrap();
+
+        // The second boot never asked for a restart, so there is no third.
+        assert_eq!(boots.len(), 2);
+        assert!(boots[1].serial.contains("still running"));
+    }
+
+    #[test]
+    fn a_guest_that_halted_or_that_qemu_ended_has_a_next_boot_too() {
+        for (serial, exited) in [
+            ("[   9.9] Reboot failed -- System halted\n", false),
+            ("[   9.9] INFO  QEMU was reset\n", true),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let image = card_at(dir.path(), &staged_files(Mode::Tryboot));
+
+            let boots = run_boots(&image, dir.path(), "t", Machine::Usual, true, 2, |_| {
+                Ok((serial.to_owned(), exited))
+            })
+            .unwrap();
+
+            assert_eq!(boots.len(), 2, "{serial:?} {exited}");
+        }
+    }
+
+    #[test]
+    fn a_scenario_that_boots_no_time_or_a_boot_that_fails_is_an_error_that_says_which() {
+        let dir = tempfile::tempdir().unwrap();
+        let image = card_at(dir.path(), &staged_files(Mode::Tryboot));
+
+        let none = run_boots(&image, dir.path(), "t", Machine::Usual, true, 0, |_| {
+            Ok((String::new(), false))
+        });
+        assert!(none.err().unwrap().to_string().contains("at least once"));
+
+        let mut boots = 0;
+        let e = run_boots(&image, dir.path(), "t", Machine::Usual, true, 3, |_| {
+            boots += 1;
+            match boots {
+                1 => Ok((PLAIN_RESTART.to_owned(), false)),
+                _ => bail!("qemu-system-aarch64 failed"),
+            }
+        })
+        .err()
+        .unwrap();
+        let e = format!("{e:#}");
+        assert!(
+            e.contains("boot 2 of t") && e.contains("qemu-system-aarch64 failed"),
+            "{e}"
+        );
+        // The folder of the boot that failed is gone too.
+        assert!(!dir.path().join("t-boot-2").exists());
+    }
+
+    #[test]
+    fn a_card_that_gives_the_stand_in_no_slot_stops_the_scenario_before_the_boot() {
+        let mut files = staged_files(Mode::Tryboot);
+        files.push(("config.txt".to_owned(), b"arm_64bit=1\n".to_vec()));
+        let dir = tempfile::tempdir().unwrap();
+        let image = card_at(dir.path(), &files);
+
+        let e = run_boots(&image, dir.path(), "t", Machine::Usual, false, 2, |_| {
+            panic!("no guest is started for a card with no slot to start")
+        })
+        .err()
+        .unwrap();
+
+        let e = format!("{e:#}");
+        assert!(
+            e.contains("boot 1 cannot be started") && e.contains("config.txt"),
+            "{e}"
+        );
+    }
+
+    /// The card after a boot of a card with two slots, as the conditions read it.
+    fn card_after(
+        selected: Slot,
+        tryboot: bool,
+        marker: Option<&Marker>,
+        logs: [Option<String>; 2],
+    ) -> CardAfter {
+        CardAfter {
+            config: Ok(slot_config_txt(selected).into_bytes()),
+            tryboot: Ok(tryboot.then(|| slot_config_txt(Slot::B).into_bytes())),
+            marker: Ok(marker.map(|marker| marker.render().into_bytes())),
+            logs: logs.map(Ok),
+        }
+    }
+
+    /// The serial console of a boot of a card with two slots: init's banner, then `middle`, then
+    /// the kernel's restart request and the halt that follows it in QEMU.
+    fn slot_serial(middle: &str) -> String {
+        format!(
+            "[    1.5] Run /init as init process\n\
+             [   0.001] INFO  qberrypi {} (build {EPOCH})\n\
+             {middle}\
+             [   42.1] reboot: Restarting system\n\
+             [   42.2] Reboot failed -- System halted\n",
+            qberrypi::VERSION
+        )
+    }
+
+    /// What the boot of slot b whose trial confirms writes, in the log and on the console.
+    fn confirming_boot_lines() -> String {
+        format!(
+            "[   0.040] INFO  update: slot b is on trial: build {EPOCH}, from slot a\n\
+             [   0.051] WARN  watchdog: No such file or directory (os error 2)\n\
+             [  20.342] INFO  supervisor: started trial\n\
+             [  21.117] INFO  update: build {EPOCH} confirmed on slot b\n\
+             [  39.994] INFO  returning\n"
+        )
+    }
+
+    /// What the boot that follows on slot b writes: no trial is under way.
+    const RUNNING_BOOT_LINES: &str = "\
+        [   0.041] INFO  update: slot b is running, with no trial under way\n\
+        [  39.996] INFO  returning\n";
+
+    /// The two boots of the scenario whose trial confirms, as they go in QEMU.
+    fn good_trial_confirms_evidence() -> Evidence {
+        let first = confirming_boot_lines();
+        let both = format!("{}{}", boot_log(&first), boot_log(RUNNING_BOOT_LINES));
+        Evidence {
+            boots: vec![
+                BootEvidence {
+                    start: Start {
+                        read: Settings::Tryboot,
+                        slot: Slot::B,
+                    },
+                    serial: slot_serial(&first),
+                    exited: false,
+                    card: card_after(Slot::B, true, None, [None, Some(boot_log(&first))]),
+                },
+                BootEvidence {
+                    start: Start {
+                        read: Settings::Config,
+                        slot: Slot::B,
+                    },
+                    serial: slot_serial(RUNNING_BOOT_LINES),
+                    exited: false,
+                    card: card_after(Slot::B, true, None, [None, Some(both)]),
+                },
+            ],
+            ..good_evidence()
+        }
+    }
+
+    /// The marker of the failing trial, once the trial build has started.
+    fn started_marker(mode: Mode) -> Marker {
+        Marker {
+            slot: Slot::B,
+            from: Slot::A,
+            build: EPOCH,
+            mode,
+            started: true,
+            failed: None,
+        }
+    }
+
+    /// What the boot of slot b whose build panics writes, for a trial started as `mode`.
+    fn panicking_boot_lines(mode: Mode) -> String {
+        let software = match mode {
+            Mode::Software => {
+                "[   0.080] INFO  update: software trial: config.txt selects slot a again until the trial confirms\n"
+            }
+            Mode::Tryboot => "",
+        };
+        format!(
+            "[   0.070] INFO  update: slot b is on trial: build {EPOCH}, from slot a\n\
+             {software}\
+             [  20.494] INFO  supervisor: started trial\n\
+             [  21.638] INFO  update: trial: waiting for wifi, clock, upstream, time\n\
+             [  23.513] ERROR panic at crates/qberrypi/src/fault.rs:298:5: fault: trial panic\n"
+        )
+    }
+
+    /// What the boot on slot a that finds the failed trial writes.
+    fn rolled_back_boot_lines() -> String {
+        format!(
+            "[   0.166] WARN  update: the trial of build {EPOCH} on slot b was rolled back: the \
+             trial build restarted before it confirmed; slot a is running again\n\
+             [  39.992] INFO  returning\n"
+        )
+    }
+
+    /// The two boots of a scenario whose trial, started as `mode`, fails, as they go in QEMU.
+    fn good_trial_fails_evidence(mode: Mode) -> Evidence {
+        let (first, second) = (panicking_boot_lines(mode), rolled_back_boot_lines());
+        let (read, staged) = match mode {
+            Mode::Tryboot => (Settings::Tryboot, true),
+            Mode::Software => (Settings::Config, false),
+        };
+        Evidence {
+            boots: vec![
+                BootEvidence {
+                    start: Start {
+                        read,
+                        slot: Slot::B,
+                    },
+                    serial: slot_serial(&first),
+                    exited: false,
+                    card: card_after(
+                        Slot::A,
+                        staged,
+                        Some(&started_marker(mode)),
+                        [None, Some(boot_log(&first))],
+                    ),
+                },
+                BootEvidence {
+                    start: Start {
+                        read: Settings::Config,
+                        slot: Slot::A,
+                    },
+                    serial: slot_serial(&second),
+                    exited: false,
+                    card: card_after(
+                        Slot::A,
+                        staged,
+                        None,
+                        [Some(boot_log(&second)), Some(boot_log(&first))],
+                    ),
+                },
+            ],
+            ..good_evidence()
+        }
+    }
+
+    #[test]
+    fn a_good_trial_that_confirms_fails_no_condition() {
+        let conditions = trial_confirms_conditions(&good_trial_confirms_evidence());
+
+        assert_eq!(failures(&conditions), [""; 0]);
+        assert_eq!(conditions.len(), 33);
+        // Only the guest's last restart is left unchecked, as in every other scenario.
+        let unchecked: Vec<&str> = conditions
+            .iter()
+            .filter(|c| matches!(c.verdict, Verdict::CannotBeCheckedInQemu(_)))
+            .map(|c| c.what.as_str())
+            .collect();
+        assert_eq!(unchecked, [format!("boot 2: {EXITED}")]);
+    }
+
+    #[test]
+    fn each_thing_wrong_with_the_trial_that_confirms_fails_its_condition() {
+        /// What the failed condition is about, and what makes the evidence wrong.
+        type Wrong = (&'static str, fn(&mut Evidence));
+        let wrong: [Wrong; 20] = [
+            ("the scenario booted 2 times", |e| drop(e.boots.pop())),
+            // The firmware read the wrong file, or started the wrong slot.
+            (
+                "boot 1: the firmware stand-in read tryboot.txt and started slot b",
+                |e| e.boots[0].start.read = Settings::Config,
+            ),
+            (
+                "boot 1: the firmware stand-in read tryboot.txt and started slot b",
+                |e| e.boots[0].start.slot = Slot::A,
+            ),
+            (
+                "boot 2: the firmware stand-in read config.txt and started slot b",
+                |e| e.boots[1].start.read = Settings::Tryboot,
+            ),
+            // Boot 1 was not a trial, or did not confirm, or did not return.
+            (
+                "boot 1: the serial console has `INFO  update: slot b is on trial",
+                |e| e.boots[0].serial = e.boots[0].serial.replace("is on trial", "is running"),
+            ),
+            (
+                "boot 1: the serial console has `INFO  update: build 1700000000 confirmed on slot b`",
+                |e| e.boots[0].serial = e.boots[0].serial.replace("confirmed", "was not confirmed"),
+            ),
+            (
+                "boot 1: the serial console has `INFO  supervisor: started trial`",
+                |e| e.boots[0].serial = e.boots[0].serial.replace("started trial", "started dns"),
+            ),
+            ("boot 1: the serial console has `INFO  returning`", |e| {
+                e.boots[0].serial = e.boots[0].serial.replace("INFO  returning", "")
+            }),
+            (
+                "boot 1: the serial console does not have `reboot: Restarting system with command '0 tryboot'`",
+                |e| {
+                    e.boots[0].serial = e.boots[0].serial.replace(
+                        "reboot: Restarting system",
+                        "reboot: Restarting system with command '0 tryboot'",
+                    )
+                },
+            ),
+            // The confirm did not select slot b, or did not delete the marker.
+            ("boot 1: config.txt on the card is slot b's own", |e| {
+                e.boots[0].card.config = Ok(slot_config_txt(Slot::A).into_bytes())
+            }),
+            ("boot 1: qberrypi-trial.txt is not on the card", |e| {
+                e.boots[0].card.marker = Ok(Some(b"slot=b\n".to_vec()))
+            }),
+            // No boot touches `tryboot.txt`.
+            ("boot 1: tryboot.txt is as the update left it", |e| {
+                e.boots[0].card.tryboot = Ok(None)
+            }),
+            ("boot 2: init logged no ERROR", |e| {
+                e.boots[1]
+                    .serial
+                    .push_str("[  30.000] ERROR log.txt: busy\n")
+            }),
+            // Boot 2 is a trial again, or the card changed in it.
+            (
+                "boot 2: the serial console has `INFO  update: slot b is running, with no trial under way`",
+                |e| {
+                    e.boots[1].serial = e.boots[1].serial.replace(
+                        "is running, with no trial under way",
+                        "is on trial: build 1700000000, from slot a",
+                    )
+                },
+            ),
+            (
+                "boot 2: the serial console does not have `supervisor: started trial`",
+                |e| {
+                    e.boots[1]
+                        .serial
+                        .push_str("[   9.000] INFO  supervisor: started trial\n")
+                },
+            ),
+            ("boot 2: config.txt on the card is slot b's own", |e| {
+                e.boots[1].card.config = Ok(slot_config_txt(Slot::A).into_bytes())
+            }),
+            // The log: both boots are in it, the confirm is, and slot a never wrote one.
+            (
+                "boot 2: qberrypi-b/log.txt on the card has 2 boot headers",
+                |e| e.boots[1].card.logs[1] = Ok(Some(boot_log(RUNNING_BOOT_LINES))),
+            ),
+            (
+                "boot 2: qberrypi-b/log.txt on the card has `INFO  update: build 1700000000 confirmed on slot b`",
+                |e| {
+                    let log = e.boots[1].card.logs[1].as_mut().unwrap().as_mut().unwrap();
+                    *log = log.replace("confirmed", "was not confirmed");
+                },
+            ),
+            (
+                "boot 2: qberrypi-a/ has no log.txt: slot a never ran",
+                |e| e.boots[1].card.logs[0] = Ok(Some(boot_log(RUNNING_BOOT_LINES))),
+            ),
+            (
+                "boot 2: the serial console does not have `example-passphrase`",
+                |e| e.boots[1].serial.push_str(PASSPHRASE),
+            ),
+        ];
+        for (about, spoil) in wrong {
+            let mut evidence = good_trial_confirms_evidence();
+            spoil(&mut evidence);
+
+            let conditions = trial_confirms_conditions(&evidence);
+
+            let failed = failures(&conditions);
+            assert!(
+                failed.iter().any(|what| what.contains(about)),
+                "{about}: {failed:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_good_trial_that_fails_fails_no_condition_whichever_way_it_started() {
+        for (mode, conditions) in [
+            (
+                Mode::Tryboot,
+                trial_fails_firmware_conditions as fn(&Evidence) -> Vec<Condition>,
+            ),
+            (Mode::Software, trial_fails_software_conditions),
+        ] {
+            let conditions = conditions(&good_trial_fails_evidence(mode));
+
+            assert_eq!(failures(&conditions), [""; 0], "{mode:?}");
+            assert_eq!(conditions.len(), 38, "{mode:?}");
+            let unchecked: Vec<&str> = conditions
+                .iter()
+                .filter(|c| matches!(c.verdict, Verdict::CannotBeCheckedInQemu(_)))
+                .map(|c| c.what.as_str())
+                .collect();
+            assert_eq!(unchecked, [format!("boot 2: {EXITED}")], "{mode:?}");
+        }
+    }
+
+    #[test]
+    fn each_thing_wrong_with_a_trial_that_fails_fails_its_condition() {
+        /// What the failed condition is about, and what makes the evidence wrong.
+        type Wrong = (&'static str, fn(&mut Evidence));
+        let wrong: [Wrong; 21] = [
+            ("the scenario booted 2 times", |e| drop(e.boots.pop())),
+            ("boot 1: the firmware stand-in read", |e| {
+                e.boots[0].start.slot = Slot::A
+            }),
+            (
+                "boot 2: the firmware stand-in read config.txt and started slot a",
+                |e| e.boots[1].start.slot = Slot::B,
+            ),
+            // The trial build did not start as a trial, or did not panic, or confirmed or returned.
+            (
+                "boot 1: the serial console has `INFO  update: slot b is on trial",
+                |e| e.boots[0].serial = e.boots[0].serial.replace("is on trial", "is running"),
+            ),
+            ("boot 1: the serial console has `fault: trial panic`", |e| {
+                e.boots[0].serial = e.boots[0].serial.replace("fault: trial panic", "fault")
+            }),
+            (
+                "boot 1: the serial console does not have `confirmed on slot`",
+                |e| {
+                    e.boots[0]
+                        .serial
+                        .push_str("[  22.0] INFO  update: build 1700000000 confirmed on slot b\n")
+                },
+            ),
+            (
+                "boot 1: the serial console does not have `INFO  returning`",
+                |e| e.boots[0].serial.push_str("[  40.0] INFO  returning\n"),
+            ),
+            (
+                "does not have `reboot: Restarting system with command '0 tryboot'`",
+                |e| {
+                    e.boots[0].serial = e.boots[0].serial.replace(
+                        "reboot: Restarting system",
+                        "reboot: Restarting system with command '0 tryboot'",
+                    )
+                },
+            ),
+            // The trial build's init did not mark the marker as started.
+            ("boot 1: qberrypi-trial.txt is Marker", |e| {
+                let mut marker = started_marker(Mode::Tryboot);
+                marker.started = false;
+                e.boots[0].card.marker = Ok(Some(marker.render().into_bytes()))
+            }),
+            // The card was not left selecting slot a, or the marker was not deleted by the rollback.
+            ("boot 1: config.txt on the card is slot a's own", |e| {
+                e.boots[0].card.config = Ok(slot_config_txt(Slot::B).into_bytes())
+            }),
+            ("boot 2: config.txt on the card is slot a's own", |e| {
+                e.boots[1].card.config = Ok(slot_config_txt(Slot::B).into_bytes())
+            }),
+            ("boot 2: qberrypi-trial.txt is not on the card", |e| {
+                e.boots[1].card.marker =
+                    Ok(Some(started_marker(Mode::Tryboot).render().into_bytes()))
+            }),
+            // Boot 2 did not report the rollback, or was a trial itself, or panicked.
+            (
+                "boot 2: the serial console has `WARN  update: the trial of build 1700000000 on slot b was rolled back",
+                |e| e.boots[1].serial = e.boots[1].serial.replace("was rolled back", "was kept"),
+            ),
+            (
+                "boot 2: the serial console does not have `is on trial`",
+                |e| {
+                    e.boots[1].serial.push_str("[   9.000] INFO  update: slot a is on trial: build 1700000000, from slot b\n")
+                },
+            ),
+            (
+                "boot 2: the serial console does not have `fault: trial panic`",
+                |e| {
+                    e.boots[1]
+                        .serial
+                        .push_str("[   9.000] fault: trial panic\n")
+                },
+            ),
+            // The panic is expected in boot 1 only, and so is nothing else.
+            ("boot 2: init logged no ERROR", |e| {
+                e.boots[1]
+                    .serial
+                    .push_str("[   9.000] ERROR panic at x.rs:1:1: boom\n")
+            }),
+            ("boot 1: init logged no ERROR", |e| {
+                e.boots[0]
+                    .serial
+                    .push_str("[   9.000] ERROR log.txt: busy\n")
+            }),
+            ("boot 2: init logged no ERROR", |e| {
+                e.boots[1]
+                    .serial
+                    .push_str("[   9.000] WARN  update: slot a could not be selected again\n")
+            }),
+            // The logs: the panic is in slot b's, the rollback in slot a's.
+            (
+                "boot 2: qberrypi-b/log.txt on the card has `ERROR panic at `",
+                |e| {
+                    let log = e.boots[1].card.logs[1].as_mut().unwrap().as_mut().unwrap();
+                    *log = log.replace("ERROR panic at ", "ERROR panic ");
+                },
+            ),
+            (
+                "boot 2: qberrypi-a/log.txt on the card does not have `ERROR panic at `",
+                |e| {
+                    e.boots[1].card.logs[0]
+                        .as_mut()
+                        .unwrap()
+                        .as_mut()
+                        .unwrap()
+                        .push_str("[ 1.0] ERROR panic at x.rs:1:1: boom\n");
+                },
+            ),
+            (
+                "boot 2: qberrypi-a/log.txt on the card has 1 boot headers",
+                |e| e.boots[1].card.logs[0] = Ok(None),
+            ),
+        ];
+        for mode in [Mode::Tryboot, Mode::Software] {
+            let conditions = match mode {
+                Mode::Tryboot => trial_fails_firmware_conditions as fn(&Evidence) -> Vec<Condition>,
+                Mode::Software => trial_fails_software_conditions,
+            };
+            for (about, spoil) in wrong {
+                let mut evidence = good_trial_fails_evidence(mode);
+                spoil(&mut evidence);
+
+                let failed_conditions = conditions(&evidence);
+
+                let failed = failures(&failed_conditions);
+                assert!(
+                    failed.iter().any(|what| what.contains(about)),
+                    "{mode:?}, {about}: {failed:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_two_ways_to_start_a_trial_are_told_apart_by_what_the_card_and_the_log_show() {
+        // The software trial selects slot a again before anything else, and leaves no tryboot.txt.
+        let mut software_as_firmware = good_trial_fails_evidence(Mode::Software);
+        software_as_firmware.boots[0].start.read = Settings::Tryboot;
+        software_as_firmware.boots[0].card.tryboot =
+            Ok(Some(slot_config_txt(Slot::B).into_bytes()));
+        let conditions = trial_fails_software_conditions(&software_as_firmware);
+        let failed = failures(&conditions);
+        assert!(
+            failed
+                .iter()
+                .any(|w| w.contains("read config.txt and started slot b")),
+            "{failed:?}"
+        );
+        assert!(
+            failed
+                .iter()
+                .any(|w| w.contains("tryboot.txt is not on the card")),
+            "{failed:?}"
+        );
+
+        let mut firmware_as_software = good_trial_fails_evidence(Mode::Tryboot);
+        let software = "[   0.080] INFO  update: software trial: config.txt selects slot a again until the trial confirms\n";
+        firmware_as_software.boots[0].serial.push_str(software);
+        let conditions = trial_fails_firmware_conditions(&firmware_as_software);
+        let failed = failures(&conditions);
+        assert_eq!(
+            failed,
+            ["boot 1: the serial console does not have `software trial`"]
+        );
+
+        let mut no_selection = good_trial_fails_evidence(Mode::Software);
+        no_selection.boots[0].serial = no_selection.boots[0]
+            .serial
+            .replace("selects slot a again", "keeps slot b");
+        let conditions = trial_fails_software_conditions(&no_selection);
+        let failed = failures(&conditions);
+        assert_eq!(failed.len(), 1, "{failed:?}");
+        assert!(
+            failed[0].contains("software trial: config.txt selects slot a again"),
+            "{failed:?}"
+        );
+    }
+
+    #[test]
+    fn a_condition_about_a_boot_that_did_not_happen_fails_with_how_often_the_scenario_booted() {
+        let mut evidence = good_trial_confirms_evidence();
+        evidence.boots.clear();
+
+        let conditions = trial_confirms_conditions(&evidence);
+
+        // Every one of them fails, and none of them panics.
+        assert_eq!(failures(&conditions).len(), conditions.len());
+        let boot_1 = conditions
+            .iter()
+            .find(|c| c.what.starts_with("boot 1:"))
+            .unwrap();
+        assert_eq!(
+            boot_1.verdict,
+            Verdict::Fails("the scenario booted 0 times".into())
+        );
+    }
+
+    #[test]
+    fn a_boot_that_ended_by_itself_has_exited_and_one_that_did_not_restart_fails() {
+        let mut evidence = good_trial_confirms_evidence();
+        evidence.boots[1].exited = true;
+        assert_eq!(evidence.boot_exited(2).verdict, Verdict::Holds);
+
+        evidence.boots[1].exited = false;
+        evidence.boots[1].serial = "[   1.0] INFO  qberrypi\n".to_owned();
+        assert!(matches!(evidence.boot_exited(2).verdict, Verdict::Fails(_)));
+    }
+
+    #[test]
+    fn the_trial_scenarios_boot_a_card_with_two_slots_and_stage_the_trial_of_their_mode() {
+        let all = scenarios(EXAMPLE).unwrap();
+        let trials: Vec<&Scenario> = all.iter().skip(11).collect();
+
+        let names: Vec<&str> = trials.iter().map(|s| s.name).collect();
+        assert_eq!(
+            names,
+            [
+                "trial confirms",
+                "trial fails, firmware",
+                "trial fails, software"
+            ]
+        );
+        let modes: Vec<(Mode, usize)> = trials
+            .iter()
+            .map(|s| match &s.card {
+                CardPlan::Slots(plan) => (plan.mode, plan.boots),
+                CardPlan::OneBoot => panic!("{} boots one card of the old layout", s.name),
+            })
+            .collect();
+        assert_eq!(
+            modes,
+            [(Mode::Tryboot, 2), (Mode::Tryboot, 2), (Mode::Software, 2)]
+        );
+        // No other scenario boots slots.
+        assert!(
+            all.iter()
+                .take(11)
+                .all(|s| matches!(s.card, CardPlan::OneBoot))
+        );
+        for scenario in &trials {
+            assert_eq!(scenario.machine, Machine::Usual, "{}", scenario.name);
+            assert!(scenario.note.is_some());
+        }
+    }
+
+    #[test]
+    fn the_slots_of_a_trial_scenario_differ_from_the_example_only_in_their_debug_settings() {
+        let all = scenarios(EXAMPLE).unwrap();
+        let slot_b = |scenario: &Scenario| match &scenario.card {
+            CardPlan::Slots(plan) => plan.config_b.clone(),
+            CardPlan::OneBoot => unreachable!("{}", scenario.name),
+        };
+        let [confirms, fails_firmware, fails_software] = &all[11..] else {
+            panic!("{} scenarios", all.len());
+        };
+        let slot_a_changes = ["log_to_sd = true", "return_after_secs = 40"];
+
+        // Slot a is a permanent system that keeps its log in its folder and restarts 40 s in.
+        for scenario in [confirms, fails_firmware, fails_software] {
+            assert_eq!(
+                changed(&scenario.system_config),
+                slot_a_changes,
+                "{}",
+                scenario.name
+            );
+        }
+        // Slot b of the trial that confirms waits for nothing and confirms 5 s after init started.
+        assert_eq!(
+            changed(&slot_b(confirms)),
+            [
+                slot_a_changes[0],
+                slot_a_changes[1],
+                "trial_confirm_secs = 5",
+                "trial_offline = true"
+            ]
+        );
+        // Slot b of the two trials that fail panics, and has no way to confirm first: it is not
+        // offline, which QEMU, with no Wi-Fi, never satisfies, and it does not confirm after 5 s.
+        for scenario in [fails_firmware, fails_software] {
+            assert_eq!(
+                changed(&slot_b(scenario)),
+                [
+                    slot_a_changes[0],
+                    slot_a_changes[1],
+                    "fault = \"trial_panic\""
+                ],
+                "{}",
+                scenario.name
+            );
+        }
+        // Read back as the configuration, which is what the scenarios are about.
+        let debug = |text: &str| qberrypi::config::parse(text).unwrap().debug;
+        let (a, b) = (debug(&confirms.system_config), debug(&slot_b(confirms)));
+        assert_eq!(
+            (a.one_shot, a.log_to_sd, a.return_after_secs),
+            (false, true, 40)
+        );
+        assert_eq!(
+            (a.trial_confirm_secs, a.trial_offline, a.fault),
+            (0, false, Fault::None)
+        );
+        assert_eq!(
+            (b.trial_confirm_secs, b.trial_offline, b.fault),
+            (5, true, Fault::None)
+        );
+        assert_eq!(debug(&slot_b(fails_software)).fault, Fault::TrialPanic);
+    }
+
+    #[test]
+    fn a_scenarios_serial_logs_are_the_one_of_an_old_layout_card_and_one_per_boot_for_two_slots() {
+        let all = scenarios(EXAMPLE).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let (one_shot, trial) = (&all[0], &all[11]);
+        fs::write(dir.path().join("trial-confirms-boot-2.log"), "x\n").unwrap();
+
+        // A boot of the old layout has its one log, named even though it was never written.
+        assert_eq!(
+            serial_logs(one_shot, dir.path()),
+            [dir.path().join("one-shot.log")]
+        );
+        // A card with two slots has the logs of the boots that took place, in order.
+        assert_eq!(
+            serial_logs(trial, dir.path()),
+            [dir.path().join("trial-confirms-boot-2.log")]
+        );
+        fs::write(dir.path().join("trial-confirms-boot-1.log"), "y\n").unwrap();
+        assert_eq!(
+            serial_logs(trial, dir.path()),
+            [
+                dir.path().join("trial-confirms-boot-1.log"),
+                dir.path().join("trial-confirms-boot-2.log")
+            ]
+        );
+    }
+
+    #[test]
+    fn the_first_boot_of_each_trial_scenarios_card_is_slot_b_from_the_file_of_its_mode() {
+        // A scenario's card, made as `run_slots` makes it, without the guest: the first boot
+        // starts slot b, from the file the mode of the trial says.
+        let (_root, build) = fixture_build();
+        let all = scenarios(EXAMPLE).unwrap();
+        for scenario in &all[11..] {
+            let CardPlan::Slots(plan) = &scenario.card else {
+                unreachable!("{}", scenario.name)
+            };
+            let files = staged_card_files(&build, plan, &scenario.system_config, EPOCH).unwrap();
+            let dir = tempfile::tempdir().unwrap();
+            let image = card_at(dir.path(), &files);
+
+            let mut card = Image::open(&image).unwrap();
+            let first = firmware_start(&mut card, plan.mode == Mode::Tryboot).unwrap();
+
+            assert_eq!(first.slot, Slot::B, "{}", scenario.name);
+            assert_eq!(
+                first.read,
+                if plan.mode == Mode::Tryboot {
+                    Settings::Tryboot
+                } else {
+                    Settings::Config
+                }
+            );
+            assert!(card.read("qberrypi-b/kernel8.img").is_ok());
+        }
+    }
     /// A boot folder with stand-ins for its files and checksums that match.
     fn boot_folder() -> tempfile::TempDir {
         let dir = tempfile::tempdir().unwrap();
@@ -4066,10 +6453,11 @@ mod tests {
     #[test]
     fn a_boot_folder_that_carries_the_overlay_files_is_checked_with_them() {
         let dir = boot_folder();
-        let overlays: [(&str, &[u8]); 3] = [
+        let overlays: [(&str, &[u8]); 4] = [
             ("ov-README", b"readme"),
             ("ov-overlay_map.dtb", b"map"),
             ("ov-qb-piscreen.dtbo", b"screen"),
+            ("ov-disable-bt.dtbo", b"no bluetooth"),
         ];
         let mut listed: Vec<(&str, &[u8])> = vec![
             (KERNEL, b"kernel"),

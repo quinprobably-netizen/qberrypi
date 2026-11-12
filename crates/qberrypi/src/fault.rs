@@ -18,6 +18,11 @@
 //! [`Mute`], which makes the kernel radio's liveness probe fail as if the firmware did not answer,
 //! for the one hold that finds it armed.
 //!
+//! The two trial faults ([`Fault::TrialPanic`], [`Fault::TrialStall`]) are the panic and the stall
+//! that act only on a boot that is on trial of an update, so that the rollback can be watched:
+//! [`effective`] says which fault a boot acts on, and nothing else asks the configuration for one.
+//! On a boot that is not on trial they are no fault at all.
+//!
 //! For development: `cargo xtask deploy` refuses a permanent system that has one set.
 
 use std::future::{self, Future};
@@ -39,6 +44,10 @@ use crate::wifi::radio::RadioError;
 /// How long the board has run when a provoked failure that waits for it happens: counted from the
 /// supervisor's start, so that the components have been started and the panel has had its time.
 pub const FAULT_AFTER: Duration = Duration::from_secs(10);
+
+/// How long after the supervisor starts that [`Fault::TrialPanic`] panics: short, so that a
+/// trial build fails well before it could confirm itself.
+pub const TRIAL_PANIC_AFTER: Duration = Duration::from_secs(3);
 
 /// How long after the start of the component that [`Fault::DropLink`] waits before it drops the link: the
 /// board has joined by then, and the log has shown it.
@@ -69,7 +78,25 @@ pub fn stall_due(fault: Fault, since_start: Duration) -> bool {
     fault == Fault::Stall && since_start >= FAULT_AFTER
 }
 
+/// The fault that a boot acts on, given the one that `debug.fault` asks for and whether the boot is
+/// on trial of an update.
+///
+/// The two trial faults are no fault on a boot that is not on trial. On one that is, the stall is
+/// the plain [`Fault::Stall`] (the supervisor's tick asks [`stall_due`] with it) and the panic is
+/// [`Fault::TrialPanic`] still, which [`component`] makes a component of. Every other fault is
+/// as asked for, trial or not.
+pub fn effective(fault: Fault, on_trial: bool) -> Fault {
+    match fault {
+        Fault::TrialStall | Fault::TrialPanic if !on_trial => Fault::None,
+        Fault::TrialStall => Fault::Stall,
+        other => other,
+    }
+}
+
 /// The component that provokes `fault`, if it is one: one named `fault`.
+///
+/// `fault` is what [`effective`] gave: [`Fault::TrialPanic`] is a component here without asking
+/// whether the boot is on trial, because [`effective`] has already decided that.
 ///
 /// A crash loop fails at once at every start, so the supervisor gives up after three starts and
 /// the board restarts. A panic comes [`FAULT_AFTER`] after the start: on the board the panic hook
@@ -77,14 +104,16 @@ pub fn stall_due(fault: Fault, since_start: Duration) -> bool {
 /// that panicked. Those two are essential. The two link faults are not, as nothing they provoke
 /// may restart the board: [`DROP_AFTER`] after its start the first drops the Wi-Fi link
 /// ([`drop_link`]) and the second arms the process's [`mute`], and each then waits for ever, so that
-/// the supervisor says nothing more of it. The stall and the link are not components.
+/// the supervisor says nothing more of it. The trial panic is essential like the panic, and comes
+/// [`TRIAL_PANIC_AFTER`] after the start. The stall and the link are not components.
 pub fn component(fault: Fault) -> Option<Component> {
     match fault {
         Fault::CrashLoop => Some(Component::task("fault", true, crash)),
         Fault::Panic => Some(Component::task("fault", true, panic_after_a_while)),
+        Fault::TrialPanic => Some(Component::task("fault", true, trial_panic)),
         Fault::DropLink => Some(dropping_component(DROP_AFTER, || drop_link(WLAN))),
         Fault::MuteProbe => Some(muting_component(mute(), MUTE_AFTER)),
-        Fault::None | Fault::Stall | Fault::NoWifi => None,
+        Fault::None | Fault::Stall | Fault::TrialStall | Fault::NoWifi => None,
     }
 }
 
@@ -263,6 +292,12 @@ async fn panic_after_a_while() -> Ended {
     panic!("fault: panic")
 }
 
+/// Waits [`TRIAL_PANIC_AFTER`] on the runtime's clock, and panics.
+async fn trial_panic() -> Ended {
+    tokio::time::sleep(TRIAL_PANIC_AFTER).await;
+    panic!("fault: trial panic")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -304,6 +339,9 @@ mod tests {
             Fault::NoWifi,
             Fault::DropLink,
             Fault::MuteProbe,
+            // The trial stall stalls as `effective` turns it into `Stall`, and not as it is.
+            Fault::TrialStall,
+            Fault::TrialPanic,
         ] {
             assert!(!stall_due(other, secs(3600)), "{other:?}");
         }
@@ -320,9 +358,59 @@ mod tests {
                 Ended::Failed("provoked".into())
             )
         );
-        for none in [Fault::None, Fault::Stall, Fault::NoWifi] {
+        for none in [Fault::None, Fault::Stall, Fault::NoWifi, Fault::TrialStall] {
             assert!(component(none).is_none(), "{none:?}");
         }
+    }
+
+    #[test]
+    fn the_trial_faults_act_only_on_a_boot_that_is_on_trial() {
+        for fault in [Fault::TrialStall, Fault::TrialPanic] {
+            assert_eq!(effective(fault, false), Fault::None, "{fault:?}");
+            assert!(component(effective(fault, false)).is_none(), "{fault:?}");
+        }
+        // On trial the stall is the plain stall, and the panic is the one that has a component.
+        assert_eq!(effective(Fault::TrialStall, true), Fault::Stall);
+        assert_eq!(effective(Fault::TrialPanic, true), Fault::TrialPanic);
+        assert!(stall_due(
+            effective(Fault::TrialStall, true),
+            Duration::from_secs(10)
+        ));
+        assert!(!stall_due(
+            effective(Fault::TrialStall, false),
+            Duration::from_secs(3600)
+        ));
+        // Every other fault is as it was asked for, trial or not.
+        for fault in [
+            Fault::None,
+            Fault::Stall,
+            Fault::CrashLoop,
+            Fault::Panic,
+            Fault::NoWifi,
+            Fault::DropLink,
+            Fault::MuteProbe,
+        ] {
+            assert_eq!(effective(fault, true), fault, "{fault:?}");
+            assert_eq!(effective(fault, false), fault, "{fault:?}");
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_trial_panic_runs_quietly_for_three_seconds_and_then_panics() {
+        let mut c = component(effective(Fault::TrialPanic, true)).unwrap();
+        assert!(c.essential && c.name == "fault");
+        let task = tokio::spawn((c.start)());
+
+        tokio::time::sleep(TRIAL_PANIC_AFTER - Duration::from_millis(1)).await;
+        assert!(!task.is_finished());
+        tokio::time::sleep(Duration::from_millis(2)).await;
+        let error = task.await.unwrap_err();
+        assert!(error.is_panic());
+        assert_eq!(
+            error.into_panic().downcast_ref::<&str>(),
+            Some(&"fault: trial panic")
+        );
+        assert_eq!(TRIAL_PANIC_AFTER, Duration::from_secs(3));
     }
 
     #[tokio::test(start_paused = true)]
@@ -348,6 +436,7 @@ mod tests {
         let plan = Plan {
             components: vec![component(Fault::CrashLoop).unwrap()],
             return_after: None,
+            restart: None,
             link: None,
         };
         let hooks = Hooks {
@@ -380,6 +469,8 @@ mod tests {
             Fault::Panic,
             Fault::DropLink,
             Fault::MuteProbe,
+            Fault::TrialStall,
+            Fault::TrialPanic,
         ] {
             assert!(link(other).is_none(), "{other:?}");
         }

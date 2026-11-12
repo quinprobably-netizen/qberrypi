@@ -525,6 +525,7 @@ async fn with_station<T>(
     let cfg = JoinCfg {
         ssid: SSID.as_bytes().to_vec(),
         pmk: Pmk::from_passphrase(passphrase, SSID.as_bytes()).expect("a key from the passphrase"),
+        hint_mhz: Vec::new(),
     };
     let statuses = env.statuses.clone();
     let mut report = move |status| statuses.push(status);

@@ -12,3 +12,7 @@ qberrypi.toml
 # Holds the API's TLS private key, made once by `cargo xtask make-cert`; the `*` covers the
 # temporary name it is written under.
 /qberrypi-tls.pem*
+
+# Private outputs (card images and card backups): they hold the Wi-Fi passphrase and the API's
+# key. The folder is made with mode 0700 and its files with 0600.
+/private/

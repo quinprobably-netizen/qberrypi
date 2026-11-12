@@ -1509,6 +1509,7 @@ mod tests {
             associated: true,
             signal_dbm: Some(-63),
             ap: None,
+            freq_mhz: None,
         }
     }
 
