@@ -402,6 +402,17 @@ mod tests {
 
     use hex_literal::hex;
 
+    /// More items than any input of these tests holds: a walk that yields this many has not ended.
+    const MOST: usize = 1000;
+
+    /// How many items `walk` yields. A walk that never ends fails the test here, instead of
+    /// hanging it.
+    fn count_of(walk: impl Iterator) -> usize {
+        let count = walk.take(MOST).count();
+        assert!(count < MOST, "the walk did not end");
+        count
+    }
+
     /// The first golden message: a 16-byte family header and one string.
     fn string_message() -> Vec<u8> {
         MsgBuilder::new(18, NLM_F_REQUEST | NLM_F_ACK)
@@ -518,10 +529,10 @@ mod tests {
 
         // An attribute that claims less than its own header ends the walk
         // instead of repeating forever; so does one that claims too much.
-        assert_eq!(attrs(&hex!("00000100 00000000")).count(), 0);
-        assert_eq!(attrs(&hex!("03000100 00000000")).count(), 0);
-        assert_eq!(attrs(&hex!("10000100 00000000")).count(), 0);
-        assert_eq!(attrs(&hex!("0400010004000200 0300")).count(), 2);
+        assert_eq!(count_of(attrs(&hex!("00000100 00000000"))), 0);
+        assert_eq!(count_of(attrs(&hex!("03000100 00000000"))), 0);
+        assert_eq!(count_of(attrs(&hex!("10000100 00000000"))), 0);
+        assert_eq!(count_of(attrs(&hex!("0400010004000200 0300"))), 2);
     }
 
     #[test]
@@ -549,17 +560,17 @@ mod tests {
         assert_eq!(found[1].payload, &second[16..]);
 
         // The walk ends at a header that does not fit...
-        assert_eq!(messages(&datagram[..datagram.len() - 1]).count(), 1);
-        assert_eq!(messages(&datagram[..first.len() + 15]).count(), 1);
-        assert_eq!(messages(&[]).count(), 0);
+        assert_eq!(count_of(messages(&datagram[..datagram.len() - 1])), 1);
+        assert_eq!(count_of(messages(&datagram[..first.len() + 15])), 1);
+        assert_eq!(count_of(messages(&[])), 0);
         // ...and at one that claims less than a header or more than is there.
         let mut small = first.clone();
         small[..4].copy_from_slice(&15u32.to_ne_bytes());
-        assert_eq!(messages(&small).count(), 0);
+        assert_eq!(count_of(messages(&small)), 0);
         small[..4].copy_from_slice(&0u32.to_ne_bytes());
-        assert_eq!(messages(&small).count(), 0);
+        assert_eq!(count_of(messages(&small)), 0);
         small[..4].copy_from_slice(&u32::MAX.to_ne_bytes());
-        assert_eq!(messages(&small).count(), 0);
+        assert_eq!(count_of(messages(&small)), 0);
     }
 
     #[test]
@@ -667,7 +678,7 @@ mod tests {
             let _ = (attr.mac(), attr.str(), find(bytes, attr.ty));
             if levels > 0 {
                 walk(attr.payload, levels - 1);
-                assert_eq!(attr.nested().count(), attrs(attr.payload).count());
+                assert_eq!(count_of(attr.nested()), count_of(attrs(attr.payload)));
             }
         }
     }

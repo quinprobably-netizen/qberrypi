@@ -738,6 +738,7 @@ impl Dns {
 mod tests {
     use super::testutil::{
         FakeUpstream, FixedOffset, NOW, RecordingSink, Reply, closed_port, ip, ms, threat_set,
+        until,
     };
     use super::*;
 
@@ -819,15 +820,12 @@ mod tests {
         (dns, up, pending)
     }
 
-    /// Waits until no question is out with the upstreams of `dns`, for at most 2 s.
+    /// Waits until no question is out with the upstreams of `dns`.
     async fn until_idle(dns: &Dns) {
-        for _ in 0..200 {
-            if dns.forwards.available_permits() == dns.forward_limit {
-                return;
-            }
-            sleep(ms(10)).await;
-        }
-        panic!("questions stayed out");
+        until("no question to be out", || {
+            dns.forwards.available_permits() == dns.forward_limit
+        })
+        .await;
     }
 
     /// A client of the household.
@@ -1346,8 +1344,11 @@ mod tests {
         until_idle(&dns).await;
         assert_eq!(up.udp_queries(), asked + 4);
 
-        // With nothing out, the bucket alone refuses the next one: it is a fraction of a second
-        // since it was emptied.
+        // With nothing out, the bucket alone refuses the next one. Emptied again just before, so
+        // that a slow host cannot let it earn a token while the four were answered: a token takes
+        // a quarter of a second.
+        let now = tokio::time::Instant::now();
+        while dns.prefetch_bucket.lock().unwrap().take(now) {}
         dns.refresh(last);
         assert_eq!((dns.prefetched(), dns.prefetches_skipped()), (4, 7));
         sleep(ms(100)).await;
@@ -1371,13 +1372,7 @@ mod tests {
         out.pop();
         dns.refresh(prefetches.remove(0));
         assert_eq!((dns.prefetched(), dns.prefetches_skipped()), (1, 1));
-        for _ in 0..100 {
-            if up.udp_queries() == asked + 1 {
-                break;
-            }
-            sleep(ms(10)).await;
-        }
-        assert_eq!(up.udp_queries(), asked + 1);
+        until("the prefetch to be asked", || up.udp_queries() == asked + 1).await;
         drop(out);
     }
 
@@ -1391,13 +1386,7 @@ mod tests {
             ttl(dns.answer(&packet, Transport::Udp).await),
             Some(STALE_TTL)
         );
-        for _ in 0..100 {
-            if up.udp_queries() == 2 {
-                break;
-            }
-            sleep(ms(10)).await;
-        }
-        assert_eq!(up.udp_queries(), 2);
+        until("the stale answer to be renewed", || up.udp_queries() == 2).await;
         assert_eq!((dns.prefetched(), dns.prefetches_skipped()), (0, 0));
     }
 
@@ -1597,13 +1586,10 @@ mod tests {
             ttl(dns.answer(&packet, Transport::Udp).await),
             Some(STALE_TTL)
         );
-        for _ in 0..100 {
-            if up.udp_queries() == 2 && dns.forwards.available_permits() == 1 {
-                break;
-            }
-            sleep(ms(10)).await;
-        }
-        assert_eq!(up.udp_queries(), 2);
+        until("the renewal to be asked and its permit returned", || {
+            up.udp_queries() == 2 && dns.forwards.available_permits() == 1
+        })
+        .await;
         // The renewed answer is a fresh one.
         assert!(ttl(dns.answer(&packet, Transport::Udp).await) > Some(STALE_TTL));
         assert_eq!(up.udp_queries(), 2);
@@ -1721,12 +1707,7 @@ mod tests {
             client::read_answer(&stale, 5).unwrap().v4(),
             [ip("10.0.0.1")]
         );
-        for _ in 0..100 {
-            if !sink.raised().is_empty() {
-                break;
-            }
-            sleep(ms(10)).await;
-        }
+        until("the alert to be raised", || !sink.raised().is_empty()).await;
         assert_eq!(sink.raised(), [rebind_alert("example.com", None)]);
         assert_eq!(up.udp_queries(), 2);
         // What the renewal stored is the zeros.

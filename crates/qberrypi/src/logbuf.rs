@@ -147,6 +147,10 @@ impl Log for Logger {
     fn log(&self, record: &Record) {
         let secs = self.start.elapsed().as_secs_f64();
         let mut line = format_line(secs, record.level(), record.args());
+        #[cfg(test)]
+        if testlog::keep(&line) {
+            return;
+        }
         // Holding the console across both keeps their lines in the same order.
         let mut console = lock(&self.console);
         lock(&self.buf).push(&line);
@@ -172,6 +176,61 @@ fn format_line(secs: f64, level: Level, message: impl fmt::Display) -> String {
 /// Locks a mutex whether or not a thread panicked while holding it.
 fn lock<T: ?Sized>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// A log buffer of a test's own, for the tests that read what the code under test logged.
+///
+/// The `log` crate has one logger for the whole test binary and libtest runs the tests in parallel,
+/// so the buffer that [`install`] returns holds the lines of every test, those of the TLS library
+/// at trace level too, and a test that looks in it can find a line that another test logged.
+/// [`start`] gives the calling thread a buffer of its own instead: from then on the lines that the
+/// thread logs are kept there and nowhere else, and [`text`] reads them. libtest runs every test
+/// on a thread of its own, and the tests that use this run their code on it (a current-thread
+/// runtime), so each sees its own lines only. A line that another thread of the test logs goes
+/// to the shared buffer, as before.
+#[cfg(test)]
+pub(crate) mod testlog {
+    use std::cell::RefCell;
+    use std::io;
+
+    use super::{LOG_CAP_BYTES, LogBuf, install};
+
+    thread_local! {
+        static OWN: RefCell<Option<LogBuf>> = const { RefCell::new(None) };
+    }
+
+    /// Installs the logger, if it is not yet, and gives the calling thread a buffer of its own. A
+    /// thread that has one keeps it, with what it holds.
+    pub(crate) fn start() {
+        install(Box::new(io::sink()));
+        OWN.with(|own| {
+            own.borrow_mut()
+                .get_or_insert_with(|| LogBuf::new(LOG_CAP_BYTES));
+        });
+    }
+
+    /// Everything the calling thread's own buffer holds, oldest line first.
+    ///
+    /// Panics when the thread has none: the test did not call [`start`] before its code logged.
+    pub(crate) fn text() -> String {
+        OWN.with(|own| {
+            own.borrow()
+                .as_ref()
+                .expect("the test did not start a log of its own")
+                .text()
+        })
+    }
+
+    /// Keeps `line` in the calling thread's own buffer and says so; says no when it has none.
+    pub(super) fn keep(line: &str) -> bool {
+        OWN.try_with(|own| {
+            own.borrow_mut()
+                .as_mut()
+                .map(|buf| buf.push(line))
+                .is_some()
+        })
+        .unwrap_or(false)
+    }
 }
 
 #[cfg(test)]
@@ -392,5 +451,31 @@ mod tests {
         // (to a sink); the console's own part is tested on a logger of its own.
         let is_ours = |line: &str| line.starts_with('[') && line.ends_with("] INFO  installed 1");
         assert!(buf.lock().unwrap().take_unsaved().lines().any(is_ours));
+    }
+
+    #[test]
+    fn a_thread_with_a_log_of_its_own_keeps_its_lines_there_and_sees_no_others() {
+        let shared = install(Box::new(io::sink()));
+        testlog::start();
+        log::info!("kept by the thread that started its log");
+        std::thread::spawn(|| log::info!("logged by a thread with no log of its own 5745"))
+            .join()
+            .unwrap();
+
+        let own = testlog::text();
+        assert!(own.contains("] INFO  kept by the thread that started its log\n"));
+        assert!(!own.contains("logged by a thread with no log of its own"));
+        // The other thread's line is in the shared buffer, and the first thread's is not.
+        let shared = shared.lock().unwrap().text();
+        assert!(shared.contains("logged by a thread with no log of its own 5745"));
+        assert!(!shared.contains("kept by the thread that started its log"));
+    }
+
+    #[test]
+    fn starting_a_log_twice_keeps_what_the_first_one_holds() {
+        testlog::start();
+        log::info!("logged before the second start");
+        testlog::start();
+        assert!(testlog::text().contains("logged before the second start"));
     }
 }

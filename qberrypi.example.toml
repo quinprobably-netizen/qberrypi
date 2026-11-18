@@ -55,6 +55,18 @@ tls_name = "dns.quad9.net"  # the name on the upstreams' certificate
 prefetch = false    # renew popular answers shortly before they expire
 # runtime_cpu = 1   # pin the DNS runtime to this core (0-3); core 0 takes the Wi-Fi and SPI interrupts
 
+# What the Pi keeps across a restart. With persist = true the settings the desktop or the panel
+# make (the lists of exempt and blocked devices and the mode, the device labels, the devices it
+# knows, your own allowed and refused names, a PIN set on the panel or by the desktop, the night
+# hours) are kept on the boot partition in qberrypi-state/, once they have been still for 30 s
+# (at most once a minute; at once for RESTART on the panel), and read back at the next start. A save writes only its own two small files, one copy at a time,
+# so pulling the plug is safe. What a configuration file says wins: a saved PIN is dropped when
+# pin_hash below has changed since, and a saved night when night has. Nothing about lookups is
+# kept. false reads, writes and creates nothing (copies already on the card stay there, unread): a
+# restart forgets the settings, and the desktop pushes its own again.
+[state]
+persist = true
+
 [debug]
 one_shot = false          # restore Raspberry Pi OS's config.txt at every boot
 log_to_sd = false         # append the log to qberrypi/log.txt
@@ -79,17 +91,31 @@ trial_offline = false     # development only: a trial confirms with no Wi-Fi, cl
 # touch_bottom = 3900
 # touch_swap_xy = false
 #
+# How light a touch the screen takes, here at its defaults; lower is more sensitive, and lets
+# more stray presses through. touch_xohms is the plate resistance in ohms that the touch driver
+# is told, 10 to 1000 (the overlay's own is 100): the driver reckons a touch's resistance in
+# proportion to it and drops one above 255, so a smaller value takes a lighter touch, and one
+# too small loses the firmest presses. It goes into the slot's config.txt, and a change rides a
+# plain `cargo xtask update` (only the first update onto a build that has this key needs
+# --allow-kernel). touch_min_pressure is the least pressure of a touch, 0 to 254 of
+# the driver's 0 to 255 (higher asks for a firmer press); touch_min_press_ms is the shortest
+# press that is a tap, 10 to 500 ms.
+# touch_xohms = 25
+# touch_min_pressure = 4
+# touch_min_press_ms = 20
+#
 # The night hours: in them the panel shows only the clock, dark, until a touch. "HH-HH" as hours
 # of the day (00 to 23, the two different, from first to second, so "23-07" runs over midnight)
-# or "off" for no night. The default is "23-07". The panel and the desktop can change it for the
-# running boot; this is where it starts.
+# or "off" for no night. The default is "23-07". The panel and the desktop can change it (with
+# [state] persist the change outlasts a restart, until this line changes); this is where it starts.
 # night = "23-07"
 #
 # The PIN that the panel asks for before its strong actions (letting ads pass for good, allowing a
 # name, restarting, turning the lock off). Unset, the lock is off until a PIN is set. The line is
 # made by `cargo xtask hash-pin`, which reads four digits (piped in, never from a terminal or an
 # argument) and prints it; PBKDF2 with 10,000 rounds. A PIN set on the panel or pushed from the desktop
-# lasts until the next restart, then this one is back. The line below is a pattern, not a PIN.
+# lasts until the next restart, then this one is back; with [state] persist it outlasts a restart, as
+# long as this line stays the same. The line below is a pattern, not a PIN.
 # pin_hash = "$pbkdf2-sha256$i=10000$<salt>$<hash>"
 
 # What the watchdog is told to leave alone. Every key is optional, and a file without this
@@ -111,7 +137,8 @@ trial_offline = false     # development only: a trial confirms with no Wi-Fi, cl
 #                 but those on block, the router and the Pi itself, and that includes devices
 #                 never seen before and IPv6 clients. exempt has no effect while it is on, and
 #                 block none while it is off. The desktop client can push the mode and a block
-#                 list of its own, and the pushed mode wins until the Pi restarts. Unset is false.
+#                 list of its own, and the pushed mode wins (it outlasts a restart with
+#                 [state] persist, and otherwise until the Pi restarts). Unset is false.
 #   block         devices, by Ethernet address, that stay fully blocked when exempt_default is
 #                 on. At most 64. A device is known by the address it last claimed, so one that
 #                 has not been heard since the start is not ad-blocked until it is.

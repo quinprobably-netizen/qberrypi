@@ -119,23 +119,36 @@ impl Build {
     /// `config.txt` and `cmdline.txt`, then `config` as `qberrypi.toml` and `tls_pem` as
     /// `tls.pem`.
     ///
-    /// Nothing is checked about `config` and `tls_pem`: [`read_config`] and [`read_tls_pem`]
-    /// check what the owner's files must be, and a caller that makes its own (a test, or the
-    /// rollback drill's edited copy) is trusted to have done the same.
-    pub fn slot_files(&self, slot: Slot, config: &[u8], tls_pem: &[u8]) -> Vec<(String, Vec<u8>)> {
-        SLOT_FILES
+    /// The slot's `config.txt` tells the touch screen's driver the plate resistance that `config`
+    /// sets (`[panel] touch_xohms`), so the two files agree; it is the one key of `config` that
+    /// is read here (`config::touch_xohms`), and a `config` that is not TOML or sets it out of
+    /// range is an error that names the file and quotes none of it. Nothing else is checked about
+    /// `config` and `tls_pem`: [`read_config`] and [`read_tls_pem`] check what the owner's files
+    /// must be, and a caller that makes its own (a test, or the rollback drill's edited copy) is
+    /// trusted to have done the same.
+    pub fn slot_files(
+        &self,
+        slot: Slot,
+        config: &[u8],
+        tls_pem: &[u8],
+    ) -> Result<Vec<(String, Vec<u8>)>> {
+        let text = std::str::from_utf8(config)
+            .map_err(|_| anyhow!("{CONFIG_FILE} is not a valid configuration: it is not text"))?;
+        let xohms = config::touch_xohms(text)
+            .map_err(|error| anyhow!("{CONFIG_FILE} is not a valid configuration: {error}"))?;
+        Ok(SLOT_FILES
             .into_iter()
             .map(|name| {
                 let bytes = match name {
                     "cmdline.txt" => slot_cmdline_txt(slot).into_bytes(),
-                    "config.txt" => slot_config_txt(slot).into_bytes(),
+                    "config.txt" => slot_config_txt(slot, xohms).into_bytes(),
                     CONFIG_FILE => config.to_vec(),
                     TLS_FILE => tls_pem.to_vec(),
                     _ => self.files[name].clone(),
                 };
                 (name.to_owned(), bytes)
             })
-            .collect()
+            .collect())
     }
 }
 
@@ -153,7 +166,7 @@ pub fn slot_files(root: &Path, slot: Slot) -> Result<Vec<(String, Vec<u8>)>> {
     let build = Build::read(&root.join(BOOT_FOLDER))?;
     let config = read_config(root)?;
     let tls_pem = read_tls_pem(root)?;
-    Ok(build.slot_files(slot, config.as_bytes(), &tls_pem))
+    build.slot_files(slot, config.as_bytes(), &tls_pem)
 }
 
 /// Replaces the bytes of one of a slot's files, such as the `qberrypi.toml` of the rollback
@@ -246,6 +259,7 @@ pub fn sha256_hex(data: &[u8]) -> String {
 pub(crate) mod tests {
     use super::*;
     use crate::build::sha256sums;
+    use qberrypi::slots::DEFAULT_TOUCH_XOHMS;
     use std::net::Ipv4Addr;
 
     /// The name and bytes of each file of a fixture build, which hold their own name so that a
@@ -327,7 +341,7 @@ pub(crate) mod tests {
 
             assert_eq!(
                 bytes(&files, "config.txt"),
-                slot_config_txt(slot).as_bytes()
+                slot_config_txt(slot, DEFAULT_TOUCH_XOHMS).as_bytes()
             );
             assert_eq!(
                 bytes(&files, "cmdline.txt"),
@@ -389,6 +403,58 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn a_slots_config_txt_tells_the_touch_driver_the_configurations_plate_resistance() {
+        let (root, _) = checkout();
+        let digest = boot_files_digest(&slot_files(root.path(), Slot::A).unwrap()).unwrap();
+        fs::write(
+            root.path().join(CONFIG_FILE),
+            format!("{CONFIG}\n[panel]\ntouch_xohms = 40\n"),
+        )
+        .unwrap();
+        for slot in [Slot::A, Slot::B] {
+            let files = slot_files(root.path(), slot).unwrap();
+            let config = std::str::from_utf8(bytes(&files, "config.txt")).unwrap();
+            assert_eq!(config, slot_config_txt(slot, 40));
+            assert!(
+                config
+                    .lines()
+                    .any(|l| l == "dtoverlay=qb-piscreen,speed=16000000,rotate=270,xohms=40"),
+                "{config}"
+            );
+            // Still the build's boot files: the update needs no --allow-kernel for it.
+            assert_eq!(boot_files_digest(&files).unwrap(), digest, "{slot}");
+        }
+    }
+
+    #[test]
+    fn a_plate_resistance_out_of_range_or_a_configuration_that_is_not_toml_makes_no_slot() {
+        let (root, _) = checkout();
+        let build = Build::read(&root.path().join(BOOT_FOLDER)).unwrap();
+        for (config, says) in [
+            (
+                format!("{CONFIG}\n[panel]\ntouch_xohms = 5\n"),
+                "panel.touch_xohms",
+            ),
+            (
+                CONFIG.replace(
+                    "passphrase = \"example-passphrase\"",
+                    "passphrase = \"example-passphrase",
+                ),
+                "not valid TOML",
+            ),
+        ] {
+            let e = build
+                .slot_files(Slot::A, config.as_bytes(), b"pem")
+                .unwrap_err();
+            let e = format!("{e:#}");
+            assert!(e.contains(CONFIG_FILE) && e.contains(says), "{e}");
+            assert!(!e.contains("example-passphrase"), "{e}");
+        }
+        let e = build.slot_files(Slot::A, b"\xff\xfe", b"pem").unwrap_err();
+        assert!(format!("{e:#}").contains(CONFIG_FILE), "{e:#}");
+    }
+
+    #[test]
     fn the_digest_changes_with_a_boot_file_and_not_with_the_initramfs_or_the_owners_files() {
         let (root, _) = checkout();
         let files = slot_files(root.path(), Slot::A).unwrap();
@@ -437,7 +503,7 @@ pub(crate) mod tests {
         let (root, _) = checkout();
         let build = Build::read(&root.path().join(BOOT_FOLDER)).unwrap();
 
-        let files = build.slot_files(Slot::B, b"[a]\n", b"pem");
+        let files = build.slot_files(Slot::B, b"[a]\n", b"pem").unwrap();
 
         assert_eq!(names(&files), SLOT_FILES);
         assert_eq!(bytes(&files, "qberrypi.toml"), b"[a]\n");

@@ -122,9 +122,12 @@ mod tests {
         Err(io::Error::from_raw_os_error(code))
     }
 
-    /// A path for a file that only the named test of this process uses.
-    fn temp_path(test: &str) -> PathBuf {
-        std::env::temp_dir().join(format!("qberrypi-kmsg-{test}-{}", std::process::id()))
+    /// A folder that only the calling test uses, with the path of a file in it. The folder, with
+    /// the file, is removed when it is dropped, whether the test ends or fails.
+    fn temp_file(name: &str) -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(name);
+        (dir, path)
     }
 
     fn texts(lines: &[KmsgLine]) -> Vec<&str> {
@@ -215,14 +218,13 @@ mod tests {
 
     #[test]
     fn a_reader_opened_on_a_file_sees_what_is_appended_to_it() {
-        let path = temp_path("reader");
+        let (_dir, path) = temp_file("reader");
         std::fs::write(&path, "6,1,10,-;first\n").unwrap();
         let mut reader = Reader::open(&path).unwrap();
         let first = reader.read_new().unwrap();
         let mut file = OpenOptions::new().append(true).open(&path).unwrap();
         file.write_all(b"6,2,20,-;second\n").unwrap();
         let second = reader.read_new().unwrap();
-        std::fs::remove_file(&path).unwrap();
 
         assert_eq!(texts(&first), ["first"]);
         assert_eq!(texts(&second), ["second"]);
@@ -240,12 +242,9 @@ mod tests {
 
     #[test]
     fn a_reader_reads_a_record_from_an_ordinary_file() {
-        let path = temp_path("file");
+        let (_dir, path) = temp_file("file");
         std::fs::write(&path, "6,1234,5678901,-;brcmfmac: F1 signature read\n").unwrap();
-        let result = Reader::open(&path).unwrap().read_new();
-        std::fs::remove_file(&path).unwrap();
-
-        let lines = result.unwrap();
+        let lines = Reader::open(&path).unwrap().read_new().unwrap();
         assert_eq!(lines.len(), 1);
         assert_eq!(
             (lines[0].level, lines[0].micros, lines[0].text.as_str()),
@@ -257,7 +256,7 @@ mod tests {
     fn a_reader_does_not_wait_for_more_records() {
         // A FIFO with a writer attached behaves as `/dev/kmsg` does once it
         // has been read to the end: a blocking read would wait for more.
-        let path = temp_path("fifo");
+        let (_dir, path) = temp_file("fifo");
         mknodat(CWD, &path, FileType::Fifo, Mode::RUSR | Mode::WUSR, 0).unwrap();
         let mut writer = OpenOptions::new()
             .read(true)
@@ -269,8 +268,7 @@ mod tests {
         let (done, outcome) = mpsc::channel();
         let reader_path = path.clone();
         thread::spawn(move || done.send(Reader::open(&reader_path).and_then(|mut r| r.read_new())));
-        let outcome = outcome.recv_timeout(Duration::from_secs(5));
-        std::fs::remove_file(&path).unwrap();
+        let outcome = outcome.recv_timeout(Duration::from_secs(30));
 
         let lines = outcome
             .expect("the reader waited for more records")

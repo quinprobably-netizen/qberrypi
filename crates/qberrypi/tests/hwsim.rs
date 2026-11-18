@@ -529,7 +529,7 @@ async fn with_station<T>(
     };
     let statuses = env.statuses.clone();
     let mut report = move |status| statuses.push(status);
-    let rejoin = tokio::sync::Notify::new();
+    let rejoin = wifi::RejoinSignal::new();
     let out = tokio::select! {
         never = wifi::run(&mut radio, &cfg, &mut report, &rejoin) => match never {},
         out = session => out,

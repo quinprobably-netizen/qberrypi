@@ -24,6 +24,13 @@
 //! connection, and a refusal says why when the client is still owed an answer. No log line here
 //! names a client, a session or a body: the log is open to the network.
 //!
+//! A connection that has been answered and is to close does not close at once: the TLS close
+//! notice is sent, the write side is shut down, and what the client goes on sending is read and
+//! thrown away for [`Limits::linger`] and [`crate::linger::BYTES`], so that a client that is still
+//! sending the body of a request that was refused reads the refusal and is not sent a reset
+//! first. That time is taken out of the connection's life, not added to it: it ends when the
+//! life does (the update's request has the end of its own time in its place, if that is later).
+//!
 //! One request is read in another way. `POST /api/qbp/update`, which an API that has an update
 //! receiver ([`routes::Api::with_update`]) takes, is recognised from its head: without a valid
 //! session it is a 401 and no byte of its body is read; with one, its body is streamed to the
@@ -34,7 +41,7 @@
 
 use std::future::Future;
 use std::io::{self, BufReader, Read, Write};
-use std::net::{Ipv4Addr, SocketAddr, TcpStream};
+use std::net::{Ipv4Addr, Shutdown, SocketAddr, TcpStream};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -47,6 +54,7 @@ use self::http::{
     Head, ReadError, Reply, Request, read_request_body, read_request_head, write_reply,
 };
 use self::routes::Api;
+use crate::linger;
 use crate::services::blocking;
 use crate::update::receive::{self, Receiver};
 
@@ -114,6 +122,9 @@ pub struct Limits {
     pub upload: Duration,
     /// Each wait for bytes of the update's body, which takes the place of `idle` for it.
     pub upload_idle: Duration,
+    /// How long a connection that has been answered goes on reading what its client sends, before
+    /// it is closed ([`crate::linger`]), at most up to the end of its life.
+    pub linger: Duration,
 }
 
 impl Limits {
@@ -124,6 +135,7 @@ impl Limits {
         life: CONNECTION_LIFE,
         upload: UPLOAD_LIFE,
         upload_idle: UPLOAD_IDLE_WAIT,
+        linger: linger::TIME,
     };
 }
 
@@ -425,11 +437,14 @@ fn connection(
     let mut stream: Stream = BufReader::new(StreamOwned::new(conn, socket));
 
     let mut served = 0;
+    // When the connection's time ends, if it ends with a reply that was written: only then is
+    // there a client that may be reading the reply, and may still be sending, to linger for.
+    let mut linger_until;
     loop {
         let head = match read_request_head(&mut stream) {
             Ok(head) => head,
             Err(error) => {
-                refuse_unreadable(&mut stream, error);
+                linger_until = refuse_unreadable(&mut stream, error).then_some(life_end);
                 break;
             }
         };
@@ -437,74 +452,97 @@ fn connection(
             .receiver()
             .filter(|_| head.method == "POST" && head.target == receive::PATH)
         {
-            upload(&mut stream, api, receiver, &head, limits);
+            linger_until = upload(&mut stream, api, receiver, &head, limits, life_end);
             break;
         }
         let mut request = match read_request_body(&mut stream, head) {
             Ok(request) => request,
             Err(error) => {
-                refuse_unreadable(&mut stream, error);
+                linger_until = refuse_unreadable(&mut stream, error).then_some(life_end);
                 break;
             }
         };
         served += 1;
-        let reply = answer(api, &mut request, peer);
+        let mut reply = answer(api, &mut request, peer);
         // The last request that fits in the connection's life says so: another could not be read
         // within an idle wait.
         let last = request.close
             || served >= MAX_REQUESTS
             || life_end.saturating_duration_since(Instant::now()) < limits.idle;
-        if write_reply(stream.get_mut(), &reply, last).is_err() || last {
+        let written = write_reply(stream.get_mut(), &reply, last);
+        // The reply of a login holds the new session id.
+        reply.body.zeroize();
+        linger_until = written.is_ok().then_some(life_end);
+        if written.is_err() || last {
             break;
         }
     }
     say_goodbye(&mut stream);
+    if let Some(until) = linger_until {
+        drain_client(&mut stream, until, limits.linger);
+    }
 }
 
 /// Answers a request that could not be read, if the client is still owed an answer: a head or a
 /// body over the limits is a 413 and bytes that are no request a 400; a peer that is done, or
-/// stalled, or out of time is owed nothing.
-fn refuse_unreadable(stream: &mut Stream, error: ReadError) {
+/// stalled, or out of time is owed nothing. True if a reply was written.
+fn refuse_unreadable(stream: &mut Stream, error: ReadError) -> bool {
     let reply = match error {
         ReadError::TooLarge => routes::too_large(),
         ReadError::Malformed(_) => routes::malformed(),
-        ReadError::Closed | ReadError::Io(_) => return,
+        ReadError::Closed | ReadError::Io(_) => return false,
     };
-    let _ = write_reply(stream.get_mut(), &reply, true);
+    write_reply(stream.get_mut(), &reply, true).is_ok()
 }
 
 /// Serves `POST /api/qbp/update`, whose head has been read and whose body has not: a request
 /// without a valid session is a 401 and nothing more is read; otherwise `receiver` takes the body
 /// from the stream under the upload's bounds, and the reply is written under a fresh write wait.
 /// The restart that a staged update asks for follows the reply ([`receive::Received`]).
-fn upload(stream: &mut Stream, api: &Api, receiver: &Receiver, head: &Head, limits: Limits) {
+///
+/// If a reply was written, the result is when the connection's time ends, which a lingering close
+/// stays inside: `life_end`, and for a request that was streamed, the end of its time if that is
+/// later, as it takes the place of the connection's life.
+fn upload(
+    stream: &mut Stream,
+    api: &Api,
+    receiver: &Receiver,
+    head: &Head,
+    limits: Limits,
+    life_end: Instant,
+) -> Option<Instant> {
     if !api.has_session(head.sid.as_deref()) {
-        let _ = write_reply(stream.get_mut(), &routes::unauthorized(), true);
-        return;
+        return write_reply(stream.get_mut(), &routes::unauthorized(), true)
+            .is_ok()
+            .then_some(life_end);
     }
-    stream.get_mut().sock.bound(
-        Instant::now() + limits.upload,
-        limits.upload_idle,
-        WRITE_WAIT,
-    );
+    let upload_end = Instant::now() + limits.upload;
+    stream
+        .get_mut()
+        .sock
+        .bound(upload_end, limits.upload_idle, WRITE_WAIT);
     let received = receiver.receive(head, stream);
     // The upload may have used its whole time: the answer to it still gets its own.
     stream
         .get_mut()
         .sock
         .bound(Instant::now() + WRITE_WAIT, limits.idle, WRITE_WAIT);
-    let _ = received.send_then_restart(|reply| write_reply(stream.get_mut(), reply, true));
+    received
+        .send_then_restart(|reply| write_reply(stream.get_mut(), reply, true))
+        .is_ok()
+        .then_some(upload_end.max(life_end))
 }
 
-/// Answers `request`, which came from `peer`, and wipes its body, which may be a password, before
-/// anything else is read.
+/// Answers `request`, which came from `peer`, and wipes what it holds that is secret (its body,
+/// which may be a password, its session id, and its target, which may have a `sid` in its query)
+/// before anything else is read or written.
 ///
 /// What this does not reach: the copies that TLS and the reader hold, which are rustls's
 /// plaintext buffer and the `BufReader`'s, and are overwritten by what follows or freed with the
 /// connection. They are not wiped here, which is a known limit.
 fn answer(api: &Api, request: &mut Request, peer: Ipv4Addr) -> Reply {
     let reply = api.handle(request, peer);
-    request.body.zeroize();
+    request.wipe();
     reply
 }
 
@@ -519,6 +557,26 @@ fn say_goodbye(stream: &mut Stream) {
             break;
         }
     }
+}
+
+/// The end of a connection that was answered, after [`say_goodbye`] has put the close notice
+/// through: the write side is shut down, which puts the end of the stream after the last byte of
+/// the answer, and what the client goes on sending is read off the socket and thrown away, for at
+/// most `wait` and [`linger::BYTES`], until the client closes its side. The socket is closed by
+/// what follows, and with no unread request bytes in it that is an orderly end and not a reset
+/// that could cost the client the answer.
+///
+/// The drain is bounded by `until`, the end of the connection's time, as every read of the
+/// connection is: the time is the connection's own, not more. What is read is not decrypted; it
+/// is wiped, as it may be a password.
+fn drain_client(stream: &mut Stream, until: Instant, wait: Duration) {
+    let tls = stream.get_mut();
+    if tls.sock.stream.shutdown(Shutdown::Write).is_err() {
+        return;
+    }
+    tls.sock
+        .bound(until.min(Instant::now() + wait), wait, WRITE_WAIT);
+    linger::drain(&mut tls.sock, linger::BYTES);
 }
 
 #[cfg(test)]
@@ -638,6 +696,8 @@ mod tests {
             (limits.upload, limits.upload_idle),
             (UPLOAD_LIFE, UPLOAD_IDLE_WAIT)
         );
+        // The lingering close: 2 s, which counts inside the life.
+        assert_eq!(limits.linger, secs(2));
         assert_eq!(places().available_permits(), CONNECTIONS);
     }
 
@@ -1401,5 +1461,190 @@ mod tests {
         // The login was served from the body, and the body is gone.
         assert_eq!(reply.status, 200);
         assert!(request.body.is_empty());
+    }
+
+    // ---- the lingering close ----
+
+    /// How long a job of the API takes, from when one is seen to hold a place to when its place is
+    /// free again: the places are all but the one that waits for an accept when no job runs.
+    /// `None` if a job does not start and end within `within`.
+    async fn a_job_takes(places: &Semaphore, within: Duration) -> Option<Duration> {
+        let began = Instant::now();
+        let idle = CONNECTIONS - 1;
+        while places.available_permits() >= idle {
+            if began.elapsed() >= within {
+                return None;
+            }
+            tokio::time::sleep(5 * MS).await;
+        }
+        let started = Instant::now();
+        while places.available_permits() < idle {
+            if began.elapsed() >= within {
+                return None;
+            }
+            tokio::time::sleep(5 * MS).await;
+        }
+        Some(started.elapsed())
+    }
+
+    /// A listener under `limits` with places that the test keeps, which has taken its first.
+    async fn served_for_lingering(limits: Limits) -> (Served, Arc<Semaphore>) {
+        let places = places();
+        let kept = places.clone();
+        let served =
+            served_by(move |listener, tls, api| serve(listener, tls, api, limits, places)).await;
+        // The listener takes the place that waits for the first accept.
+        while kept.available_permits() >= CONNECTIONS {
+            tokio::time::sleep(5 * MS).await;
+        }
+        (served, kept)
+    }
+
+    /// The head of a request that is refused at once: a body of 100,000 bytes is over the limit.
+    const TOO_LARGE: &[u8] =
+        b"POST /api/auth HTTP/1.1\r\nHost: x\r\nContent-Length: 100000\r\n\r\n";
+    /// A head that is no request at all, which is a 400.
+    const NOT_HTTP: &[u8] = b"GARBAGE\r\n\r\n";
+
+    #[tokio::test]
+    async fn a_client_that_goes_on_sending_after_a_refusal_reads_it_whole() {
+        let (served, _places) = served_for_lingering(small()).await;
+        for (refusal, status) in [(TOO_LARGE, 413), (NOT_HTTP, 400)] {
+            let (addr, client) = (served.addr, pinned_client(&served.cert));
+            let answer = tokio::task::spawn_blocking(move || {
+                let mut connection = Connection::open(addr, client).unwrap();
+                connection.send_raw(refusal).unwrap();
+                // What the client goes on with, 16 KiB in pieces: the server has answered by the
+                // first, and with the connection closed at once, which a reset is, a write would
+                // fail from there on.
+                for piece in 0..16 {
+                    std::thread::sleep(10 * MS);
+                    connection
+                        .send_raw(&[b'a'; 1024])
+                        .unwrap_or_else(|error| panic!("write {piece}: {error}"));
+                }
+                connection.receive().unwrap()
+            })
+            .await
+            .unwrap();
+            assert_eq!((answer.status, answer.close), (status, true));
+        }
+    }
+
+    #[tokio::test]
+    async fn a_client_that_reads_the_refusal_and_closes_does_not_hold_its_place() {
+        // The lingering close waits for the client's end of the stream, and gets it at once.
+        let limits = Limits {
+            linger: Duration::from_secs(5),
+            ..small()
+        };
+        let (served, places) = served_for_lingering(limits).await;
+        let (addr, client) = (served.addr, pinned_client(&served.cert));
+        let answer = tokio::task::spawn_blocking(move || {
+            let mut connection = Connection::open(addr, client).unwrap();
+            connection.send_raw(TOO_LARGE).unwrap();
+            connection.receive().unwrap()
+        });
+        let (took, answer) = tokio::join!(a_job_takes(&places, Duration::from_secs(4)), answer);
+        assert_eq!(answer.unwrap().status, 413);
+        let took = took.expect("the job ends");
+        assert!(took < Duration::from_secs(2), "{took:?}");
+    }
+
+    #[tokio::test]
+    async fn a_client_that_never_stops_sending_is_closed_at_the_time_bound() {
+        // One byte every 50 ms never makes a byte count, so only the time can end it.
+        let limits = Limits {
+            linger: 600 * MS,
+            ..small()
+        };
+        let (served, places) = served_for_lingering(limits).await;
+        let (addr, client) = (served.addr, pinned_client(&served.cert));
+        let began = Instant::now();
+        let sender = tokio::task::spawn_blocking(move || {
+            let mut connection = Connection::open(addr, client).unwrap();
+            connection.send_raw(NOT_HTTP).unwrap();
+            for _ in 0..100 {
+                std::thread::sleep(50 * MS);
+                if connection.send_raw(b"a").is_err() {
+                    break;
+                }
+            }
+        });
+        let took = a_job_takes(&places, Duration::from_secs(5)).await;
+        sender.await.unwrap();
+        let took = took.expect("the job ends");
+        // The bound is counted from the answer, a little after the connection was made.
+        assert!(took >= 500 * MS, "{took:?}");
+        assert!(
+            began.elapsed() < Duration::from_secs(3),
+            "{:?}",
+            began.elapsed()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_client_that_floods_after_a_refusal_is_closed_at_the_byte_bound() {
+        // The time bound is far off: only the 64 KiB can end this within the seconds that the
+        // client sends for. It sends 4 KiB every 5 ms, which no buffer takes in, and finds out
+        // that the server has closed when a write fails.
+        let limits = Limits {
+            linger: Duration::from_secs(30),
+            ..small()
+        };
+        let (served, places) = served_for_lingering(limits).await;
+        let (addr, client) = (served.addr, pinned_client(&served.cert));
+        let sender = tokio::task::spawn_blocking(move || {
+            let mut connection = Connection::open(addr, client).unwrap();
+            connection.send_raw(TOO_LARGE).unwrap();
+            let mut sent = 0;
+            while sent < 1 << 20 && connection.send_raw(&[b'a'; 4096]).is_ok() {
+                sent += 4096;
+                std::thread::sleep(5 * MS);
+            }
+            sent
+        });
+        let took = a_job_takes(&places, Duration::from_secs(10)).await;
+        let sent = sender.await.unwrap();
+        let took = took.expect("the job ends");
+        assert!(took < Duration::from_secs(10), "{took:?}");
+        // The bound counts the bytes of the TLS records, a little more than what was sent, and a
+        // client that finds out a piece or two late has sent that much more than the bound.
+        let bound = linger::BYTES;
+        assert!(
+            (bound - 2 * 4096..bound + 8 * 4096).contains(&sent),
+            "{sent}"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_lingering_close_ends_with_the_connections_life_and_does_not_add_to_it() {
+        let limits = Limits {
+            life: 1500 * MS,
+            linger: Duration::from_secs(30),
+            ..small()
+        };
+        let (served, places) = served_for_lingering(limits).await;
+        let (addr, client) = (served.addr, pinned_client(&served.cert));
+        let began = Instant::now();
+        let sender = tokio::task::spawn_blocking(move || {
+            let mut connection = Connection::open(addr, client).unwrap();
+            connection.send_raw(NOT_HTTP).unwrap();
+            for _ in 0..100 {
+                std::thread::sleep(50 * MS);
+                if connection.send_raw(b"a").is_err() {
+                    break;
+                }
+            }
+        });
+        let took = a_job_takes(&places, Duration::from_secs(10)).await;
+        sender.await.unwrap();
+        took.expect("the job ends");
+        // Counted from the accept, the life is 1.5 s: the 30 s of the linger are not added.
+        let lasted = began.elapsed();
+        assert!(
+            lasted >= 1400 * MS && lasted < Duration::from_secs(4),
+            "{lasted:?}"
+        );
     }
 }

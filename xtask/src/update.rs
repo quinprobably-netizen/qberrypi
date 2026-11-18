@@ -774,7 +774,7 @@ fn update(
     let running = refuse_pi_state(&seen)?;
     let target = running.other();
     let (upload_config, hint_sentence) = with_running_channel(&config_text, seen.freq_mhz);
-    let mut files = build.slot_files(target, upload_config.as_bytes(), &tls_pem);
+    let mut files = build.slot_files(target, upload_config.as_bytes(), &tls_pem)?;
     if let Some(drill) = args.rollback_drill {
         let edited = drill_config(&upload_config, drill)?;
         slot::replace_file(&mut files, CONFIG_FILE, edited.into_bytes())?;
@@ -951,7 +951,7 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::Arc;
 
-    use qberrypi::slots::{self, Marker};
+    use qberrypi::slots::{self, DEFAULT_TOUCH_XOHMS, Marker};
     use qberrypi::update::receive::Receiver;
     use qberrypi::update::{BootCard, CardAccess, Restart, UpdateCtl};
     use serde_json::json;
@@ -1002,7 +1002,7 @@ mod tests {
     /// The digest of the boot files of the fixture build, which the running Pi reports.
     fn digest(root: &Path) -> String {
         let build = Build::read(&root.join(BOOT_FOLDER)).unwrap();
-        slot::boot_files_digest(&build.slot_files(Slot::A, b"", b"")).unwrap()
+        slot::boot_files_digest(&build.slot_files(Slot::A, b"", b"").unwrap()).unwrap()
     }
 
     /// The statistics of a Pi of `build` on `slot`, up for `uptime` seconds, with the update
@@ -1058,7 +1058,7 @@ mod tests {
             let card = tempfile::tempdir().unwrap();
             fs::write(
                 card.path().join("config.txt"),
-                crate::build::slot_config_txt(Slot::A),
+                crate::build::slot_config_txt(Slot::A, DEFAULT_TOUCH_XOHMS),
             )
             .unwrap();
             let ctl = UpdateCtl::new(
@@ -1616,11 +1616,11 @@ mod tests {
         }
         assert_eq!(
             pi.card_file("tryboot.txt"),
-            crate::build::slot_config_txt(Slot::B)
+            crate::build::slot_config_txt(Slot::B, DEFAULT_TOUCH_XOHMS)
         );
         assert_eq!(
             pi.card_file("config.txt"),
-            crate::build::slot_config_txt(Slot::A)
+            crate::build::slot_config_txt(Slot::A, DEFAULT_TOUCH_XOHMS)
         );
         let marker = slots::read_marker(pi.card.path())
             .unwrap()
@@ -1662,6 +1662,43 @@ mod tests {
             assert!(!said.contains(private), "{private}: {said}");
         }
         assert!(!said.contains("example password"), "{said}");
+    }
+
+    #[test]
+    fn another_plate_resistance_for_the_touch_screen_goes_without_allow_kernel() {
+        // The Pi runs a build with the default; the owner's file now sets another.
+        let (root, pem) = ready();
+        let digest = digest(root.path());
+        fs::write(
+            root.path().join(CONFIG_FILE),
+            format!("{}\n[panel]\ntouch_xohms = 40\n", api_config()),
+        )
+        .unwrap();
+        let build = Build::read(&root.path().join(BOOT_FOLDER)).unwrap();
+        let config = fs::read(root.path().join(CONFIG_FILE)).unwrap();
+        let files = build.slot_files(Slot::B, &config, b"pem").unwrap();
+        let seen = Seen::from_stats(&stats(RUNNING, "a", &digest, 1, idle())).unwrap();
+        let candidate = Candidate {
+            build: NEW,
+            boot_files: slot::boot_files_digest(&files).unwrap(),
+        };
+        assert_eq!(
+            refuse_build(&seen, &candidate, &args()).unwrap(),
+            BootFiles::Same
+        );
+
+        // The real receiver takes it too, and the slot's config.txt has the owner's value.
+        let pi = Pi::new(&pem, RUNNING, Some(digest.clone()), script_confirm(&digest));
+        let (result, said) = run_against(root.path(), &args(), PASSWORD, &pi);
+        result.unwrap();
+        assert!(!said.contains("--allow-kernel"), "{said}");
+        let staged = crate::build::slot_config_txt(Slot::B, 40);
+        assert_eq!(pi.card_file("qberrypi-b/config.txt"), staged);
+        assert_eq!(pi.card_file("tryboot.txt"), staged);
+        assert!(
+            staged.contains("dtoverlay=qb-piscreen,speed=16000000,rotate=270,xohms=40\n"),
+            "{staged}"
+        );
     }
 
     #[test]
@@ -1732,7 +1769,7 @@ mod tests {
         result.unwrap();
         assert_eq!(
             pi.card_file("config.txt"),
-            crate::build::slot_config_txt(Slot::B)
+            crate::build::slot_config_txt(Slot::B, DEFAULT_TOUCH_XOHMS)
         );
         assert!(!pi.card.path().join("tryboot.txt").exists());
         let marker = slots::read_marker(pi.card.path())
@@ -2210,7 +2247,7 @@ mod tests {
         // Not a stand-in: the receiver's own parser reads what `update` builds.
         let (root, _) = ready();
         let build = Build::read(&root.path().join(BOOT_FOLDER)).unwrap();
-        let files = build.slot_files(Slot::B, b"[wifi]\n", b"pem");
+        let files = build.slot_files(Slot::B, b"[wifi]\n", b"pem").unwrap();
         let listed: Vec<(&str, &[u8])> = files
             .iter()
             .map(|(n, b)| (n.as_str(), b.as_slice()))

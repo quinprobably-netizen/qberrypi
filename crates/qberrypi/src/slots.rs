@@ -16,7 +16,7 @@ use std::borrow::Cow;
 use std::fmt;
 use std::fs::{self, File};
 use std::io::{self, ErrorKind, Read, Write};
-use std::ops::Range;
+use std::ops::{Range, RangeInclusive};
 use std::os::unix::fs::FileExt;
 use std::path::Path;
 
@@ -44,6 +44,29 @@ const CMDLINE_KEY: &[u8] = b"qberrypi.slot";
 
 /// What a line of `config.txt` starts with when it selects a slot.
 const OS_PREFIX_KEY: &[u8] = b"os_prefix=";
+
+/// The start of the line of `config.txt` that loads the touch screen's overlay: the line is this
+/// alone, or this, a comma and the overlay's parameters.
+const PISCREEN_LINE: &[u8] = b"dtoverlay=qb-piscreen";
+
+/// The parameter of the touch screen's overlay that tells the driver the screen's plate
+/// resistance in ohms (the overlay's `ti,x-plate-ohms`).
+const XOHMS_PARAM: &[u8] = b"xohms";
+
+/// The plate resistance, in ohms, that a slot's `config.txt` tells the touch screen's driver when
+/// the configuration does not say another (`[panel] touch_xohms`).
+///
+/// The driver reckons the resistance of a touch in proportion to this, and drops a touch whose
+/// resistance is above 255: a smaller value takes a lighter touch. The overlay's own is 100;
+/// 25 is a quarter of it, for the lighter touch the owner asked for.
+pub const DEFAULT_TOUCH_XOHMS: u16 = 25;
+
+/// The plate resistances, in ohms, that the configuration and the digest of the boot files take.
+///
+/// The overlay's parameter is 16 bits. Below 10 a firm touch's resistance rounds to 0 in the
+/// driver, which then reports nothing of it; above 1000, ten times the overlay's own, only the
+/// firmest touch would pass.
+pub const TOUCH_XOHMS: RangeInclusive<u16> = 10..=1000;
 
 /// The files of a slot, in the order the update's body carries them.
 ///
@@ -221,6 +244,69 @@ fn os_prefix_value(config: &[u8]) -> Result<Range<usize>, &'static str> {
         found = Some(start + lead + OS_PREFIX_KEY.len()..start + lead + trimmed.len());
     }
     found.ok_or("config.txt has no os_prefix line")
+}
+
+/// Finds the value of the `xohms=` parameter on the line of a `config.txt` that loads the touch
+/// screen's overlay, as a range of the text; `None` when there is no such line or it has no such
+/// parameter.
+///
+/// The line may be indented and may end in whitespace, as an `os_prefix=` line may; a commented
+/// line is not one. A second such line, a second `xohms`, and a value that is not a whole number
+/// in [`TOUCH_XOHMS`] written without a leading zero (the firmware would read one as octal) are
+/// errors, in words that name no value from the file.
+fn xohms_value(config: &[u8]) -> Result<Option<Range<usize>>, &'static str> {
+    let mut line_found = false;
+    let mut found = None;
+    let mut offset = 0;
+    for line in config.split_inclusive(|&byte| byte == b'\n') {
+        let start = offset;
+        offset += line.len();
+        let trimmed = line.trim_ascii();
+        let Some(params) = trimmed.strip_prefix(PISCREEN_LINE) else {
+            continue;
+        };
+        if !(params.is_empty() || params.starts_with(b",")) {
+            continue;
+        }
+        if line_found {
+            return Err("config.txt loads the qb-piscreen overlay more than once");
+        }
+        line_found = true;
+        let mut at = start + (line.len() - line.trim_ascii_start().len()) + PISCREEN_LINE.len();
+        for param in params.split(|&byte| byte == b',') {
+            let param_start = at;
+            at += param.len() + 1;
+            let (name, value) = match param.iter().position(|&byte| byte == b'=') {
+                Some(eq) => (&param[..eq], Some((eq + 1, &param[eq + 1..]))),
+                None => (param, None),
+            };
+            if name != XOHMS_PARAM {
+                continue;
+            }
+            if found.is_some() {
+                return Err("config.txt sets the qb-piscreen overlay's xohms more than once");
+            }
+            let fits = value.is_some_and(|(_, digits)| {
+                !digits.starts_with(b"0")
+                    && digits.iter().all(u8::is_ascii_digit)
+                    && std::str::from_utf8(digits)
+                        .ok()
+                        .and_then(|text| text.parse::<u16>().ok())
+                        .is_some_and(|ohms| TOUCH_XOHMS.contains(&ohms))
+            });
+            match value {
+                Some((skip, digits)) if fits => {
+                    found = Some(param_start + skip..param_start + skip + digits.len());
+                }
+                _ => {
+                    return Err(
+                        "config.txt's xohms for the qb-piscreen overlay is not a whole number from 10 to 1000",
+                    );
+                }
+            }
+        }
+    }
+    Ok(found)
 }
 
 /// The slot that a `config.txt` selects.
@@ -675,26 +761,40 @@ pub fn decide(me: Slot, selected: Slot, marker: Option<Result<Marker, String>>) 
 /// The text of a boot file as the digest takes it: `config.txt` and `cmdline.txt` in the form
 /// they have for slot a, the other files as they are.
 ///
-/// In `config.txt` the value of the `os_prefix=` line is replaced by `qberrypi-a/`, and in
-/// `cmdline.txt` the value of the `qberrypi.slot=` argument by `a`; nothing else changes, byte
-/// for byte. A `config.txt` that does not select a slot, and a `cmdline.txt` without a slot
-/// argument, are errors.
+/// In `config.txt` the value of the `os_prefix=` line is replaced by `qberrypi-a/`, and the value
+/// of the touch screen overlay's `xohms=`, when its line has one, by [`DEFAULT_TOUCH_XOHMS`]: the
+/// plate resistance is the owner's tuning (`[panel] touch_xohms`), not the build's boot path, so
+/// an update that changes only it does not change the boot files. In `cmdline.txt` the value of
+/// the `qberrypi.slot=` argument is replaced by `a`. Nothing else changes, byte for byte. A
+/// `config.txt` that does not select a slot or whose overlay line `xohms_value` refuses, and a
+/// `cmdline.txt` without a slot argument, are errors.
 pub fn slot_a_form<'a>(name: &str, bytes: &'a [u8]) -> Result<Cow<'a, [u8]>, &'static str> {
-    let (span, replacement): (Range<usize>, &[u8]) = match name {
+    let default_xohms = DEFAULT_TOUCH_XOHMS.to_string();
+    let mut spans: Vec<(Range<usize>, &[u8])> = match name {
         "config.txt" => {
             selected_slot(bytes)?;
-            (os_prefix_value(bytes)?, Slot::A.os_prefix().as_bytes())
+            let mut spans = vec![(os_prefix_value(bytes)?, Slot::A.os_prefix().as_bytes())];
+            if let Some(span) = xohms_value(bytes)? {
+                spans.push((span, default_xohms.as_bytes()));
+            }
+            spans
         }
         "cmdline.txt" => match slot_arg(bytes)? {
-            Some((_, span)) => (span, Slot::A.letter().as_bytes()),
+            Some((_, span)) => vec![(span, Slot::A.letter().as_bytes())],
             None => return Err("cmdline.txt has no qberrypi.slot argument"),
         },
         _ => return Ok(Cow::Borrowed(bytes)),
     };
-    let mut form = Vec::with_capacity(bytes.len() + replacement.len());
-    form.extend_from_slice(&bytes[..span.start]);
-    form.extend_from_slice(replacement);
-    form.extend_from_slice(&bytes[span.end..]);
+    // The two spans of `config.txt` are on different lines, so they cannot overlap.
+    spans.sort_by_key(|(span, _)| span.start);
+    let mut form = Vec::with_capacity(bytes.len() + 16);
+    let mut copied = 0;
+    for (span, replacement) in spans {
+        form.extend_from_slice(&bytes[copied..span.start]);
+        form.extend_from_slice(replacement);
+        copied = span.end;
+    }
+    form.extend_from_slice(&bytes[copied..]);
     Ok(Cow::Owned(form))
 }
 
@@ -1818,6 +1918,109 @@ mod tests {
             slot_a_form("config.txt", config).unwrap().as_ref(),
             b"#os_prefix=qberrypi-b/\nos_prefix=qberrypi-a/\n"
         );
+    }
+
+    /// The boot files of the pretend build with the touch screen's overlay line `line` in its
+    /// `config.txt`, before the line that selects the slot.
+    fn build_with_overlay(slot: Slot, line: &str) -> Vec<(String, Vec<u8>)> {
+        let mut files = build(slot);
+        let config = &mut files.iter_mut().find(|(n, _)| n == "config.txt").unwrap().1;
+        *config = format!("{line}\n{}", String::from_utf8(config.clone()).unwrap()).into_bytes();
+        files
+    }
+
+    #[test]
+    fn the_slot_a_form_takes_the_overlays_xohms_as_the_default_and_nothing_else_changes() {
+        let config = b"os_prefix=qberrypi-b/\n  dtoverlay=qb-piscreen,speed=16000000,rotate=270,xohms=40 \r\nx=1\n";
+        assert_eq!(
+            slot_a_form("config.txt", config).unwrap().as_ref(),
+            b"os_prefix=qberrypi-a/\n  dtoverlay=qb-piscreen,speed=16000000,rotate=270,xohms=25 \r\nx=1\n"
+        );
+        // Wherever the parameter is on the line, and before the slot's line too.
+        let config = b"dtoverlay=qb-piscreen,xohms=1000,rotate=270\nos_prefix=qberrypi-a/\n";
+        assert_eq!(
+            slot_a_form("config.txt", config).unwrap().as_ref(),
+            b"dtoverlay=qb-piscreen,xohms=25,rotate=270\nos_prefix=qberrypi-a/\n"
+        );
+        // A line without the parameter, a commented one and another overlay's are left as they are.
+        for config in [
+            &b"os_prefix=qberrypi-a/\ndtoverlay=qb-piscreen,speed=16000000,rotate=270\n"[..],
+            b"os_prefix=qberrypi-a/\ndtoverlay=qb-piscreen\n",
+            b"os_prefix=qberrypi-a/\n#dtoverlay=qb-piscreen,xohms=40\n",
+            b"os_prefix=qberrypi-a/\ndtoverlay=qb-piscreen-two,xohms=40\n",
+            b"os_prefix=qberrypi-a/\ndtoverlay=other,xohms=40\n",
+            b"os_prefix=qberrypi-a/\ndtoverlay=qb-piscreen,xohms_extra=4\n",
+        ] {
+            assert_eq!(
+                slot_a_form("config.txt", config).unwrap().as_ref(),
+                config,
+                "{}",
+                String::from_utf8_lossy(config)
+            );
+        }
+        assert_eq!(DEFAULT_TOUCH_XOHMS, 25);
+        assert!(TOUCH_XOHMS.contains(&DEFAULT_TOUCH_XOHMS));
+    }
+
+    #[test]
+    fn the_digest_is_the_same_whatever_xohms_the_overlay_line_has_in_its_range() {
+        let line =
+            |ohms: &str| format!("dtoverlay=qb-piscreen,speed=16000000,rotate=270,xohms={ohms}");
+        let reference = digest(&build_with_overlay(Slot::A, &line("25"))).unwrap();
+        for ohms in ["10", "11", "40", "100", "999", "1000"] {
+            for slot in [Slot::A, Slot::B] {
+                let files = build_with_overlay(slot, &line(ohms));
+                assert_eq!(digest(&files).unwrap(), reference, "{ohms} {slot}");
+            }
+        }
+        // The rest of the line still counts, and so does a line that has no xohms at all: that is
+        // a build from before the parameter.
+        let other = "dtoverlay=qb-piscreen,speed=8000000,rotate=270,xohms=40";
+        assert_ne!(
+            digest(&build_with_overlay(Slot::A, other)).unwrap(),
+            reference
+        );
+        let without = "dtoverlay=qb-piscreen,speed=16000000,rotate=270";
+        assert_ne!(
+            digest(&build_with_overlay(Slot::A, without)).unwrap(),
+            reference
+        );
+    }
+
+    #[test]
+    fn an_overlay_line_whose_xohms_is_not_one_the_configuration_takes_is_an_error_naming_config_txt()
+     {
+        let line = |params: &str| format!("dtoverlay=qb-piscreen,rotate=270{params}");
+        let not_a_number = "config.txt: config.txt's xohms for the qb-piscreen overlay is not a whole number from 10 to 1000";
+        for params in [
+            ",xohms=9",
+            ",xohms=1001",
+            ",xohms=0",
+            ",xohms=025",
+            ",xohms=",
+            ",xohms",
+            ",xohms=abc",
+            ",xohms=40x",
+            ",xohms=-40",
+            ",xohms=+40",
+            ",xohms=4 0",
+            ",xohms=0x19",
+            ",xohms=99999999999999999999",
+        ] {
+            let error = digest(&build_with_overlay(Slot::A, &line(params))).unwrap_err();
+            assert_eq!(error, not_a_number, "{params}");
+        }
+        assert_eq!(
+            digest(&build_with_overlay(Slot::A, &line(",xohms=40,xohms=40"))).unwrap_err(),
+            "config.txt: config.txt sets the qb-piscreen overlay's xohms more than once"
+        );
+        let twice = format!("{}\n{}", line(",xohms=40"), line(""));
+        assert_eq!(
+            digest(&build_with_overlay(Slot::A, &twice)).unwrap_err(),
+            "config.txt: config.txt loads the qb-piscreen overlay more than once"
+        );
+        // The words of the bounds are the bounds.
+        assert_eq!((*TOUCH_XOHMS.start(), *TOUCH_XOHMS.end()), (10, 1000));
     }
 
     #[test]

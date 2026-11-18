@@ -4,8 +4,9 @@
 //! Init's runtime has one thread, init's main one, and [`BLOCKING_THREADS`] more for work that
 //! blocks. (The Wi-Fi component's netlink sockets each have one more thread beside these, which
 //! does nothing but send what the socket hands it: see `netlink::socket`.) [`prepare`] gives the DNS service, the zone's offset, the clock, the status server,
-//! the list refresh, the watchdog's analysis and device watch and, when the configuration has an
-//! `[api]` section, the Pi-hole API on port 443 as components for the supervisor to run, and, on a boot
+//! the list refresh, the watchdog's analysis and device watch, when the configuration has an
+//! `[api]` section the Pi-hole API on port 443, the saver of the owner's settings (`[state]`, on by
+//! default: see [`crate::state`]) as components for the supervisor to run, and, on a boot
 //! that is on trial of an update, the trial ([`crate::update::trial`]). What they
 //! share (the resolver with its cache and counts, the lists, the clock's channel, the panel's slot,
 //! the watchdog's alerts and device inventory) is made once, by
@@ -37,6 +38,7 @@ use crate::api::live::LiveFacts;
 use crate::api::qbp::QbpWatch;
 use crate::api::routes::Api;
 use crate::api::{self, Limits};
+use crate::bootpart::BOOT_DEV;
 use crate::config::Config;
 use crate::cpu;
 use crate::dns::dot::{DOT_PORT, TlsUpstream};
@@ -51,6 +53,10 @@ use crate::names::{DenyList, OwnerList};
 use crate::panel::lock::PanelState;
 use crate::selftest;
 use crate::sntp::Sntp;
+use crate::state::Saved;
+use crate::state::card::{BootRead, CardUse, CardWriter, Device, Fibmap, NoCardUse};
+use crate::state::saver::{Flusher, Saver};
+use crate::state::store::{Found, Loaded as Restored, NoCopy};
 use crate::status::{self, Status};
 use crate::supervisor::{Component, Ended};
 use crate::sys;
@@ -110,6 +116,36 @@ pub struct Context {
     /// its first step and the boot rules fill it. The statistics read it; the update receiver
     /// and the trial are made from it.
     pub update: Arc<UpdateCtl>,
+    /// What keeps the owner's settings across a restart: what step 3 read of the card's two copies,
+    /// the card's use for saving them, and where init finds the saver to flush it. Not used when
+    /// `cfg.state.persist` is false.
+    pub persist: Persist,
+}
+
+/// What init gives the services to keep the owner's settings on the card (see [`crate::state`]).
+pub struct Persist {
+    /// What step 3 read of the two copies, in the read-only mount that read the configuration:
+    /// the state to restore, and the places and digests a save goes on from. `None` when nothing
+    /// was read (a test, or a boot that does not keep the settings), which a start treats as a card
+    /// with no copy on it.
+    pub boot: Option<&'static BootRead>,
+    /// The card, for the saves: one claim for the raw writes and one writable mount, for the
+    /// creation, once.
+    pub card: Arc<dyn CardUse>,
+    /// Where the shared state puts the saver once it makes it, so that init, which does not make
+    /// the shared state, can flush it on the owner's restart.
+    pub flusher: Arc<Flusher>,
+}
+
+impl Persist {
+    /// A board with no card to keep the settings on: nothing was read, and a save cannot be made.
+    pub fn unused() -> Self {
+        Self {
+            boot: None,
+            card: Arc::new(NoCardUse),
+            flusher: Flusher::new(),
+        }
+    }
 }
 
 /// The one runtime: the current thread, with I/O and time, and a blocking pool of
@@ -177,6 +213,8 @@ struct Shared {
     names: Arc<OwnerList>,
     /// The panel's lock and night hours, which the panel and the API edit.
     panel: Arc<PanelState>,
+    /// The saver of the owner's settings, when the configuration keeps them (`[state] persist`).
+    saver: Option<Arc<Saver>>,
     /// The receiving end of the resolver's feed and the behaviour detectors, until the analysis
     /// component's first start takes them: the feed has one receiver, so there is one analysis.
     analysis: Analysis,
@@ -310,6 +348,7 @@ impl Lazy {
             signal,
             tls_pem: _,
             update,
+            persist,
         } = &self.ctx;
 
         // The set that blocks at the start is the snapshot's rules and the configuration's own
@@ -337,6 +376,16 @@ impl Lazy {
             devices,
             analysis,
         } = make_watch(cfg, &dns);
+        // What the owner set before the last restart comes back before anything serves: the
+        // inventory's share now, the names and the panel's state as they are made. The inventory has
+        // its configuration's lists, the exemption and the Pi's own address by now (`make_watch`).
+        let kept = found_state(cfg, persist.boot);
+        if let Some(found) = kept {
+            devices
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .restore(found.saved.devices.clone());
+        }
         let lists = Lists::new(loaded.state);
         let (clock_set, synced) = watch::channel(false);
         // Once, for as long as the state lives: a restart of the DNS service finds the
@@ -357,6 +406,19 @@ impl Lazy {
         }));
         // The owner's names: one list, which the panel and the API both edit.
         let names = Arc::new(OwnerList::new(SharedResolver::of(&dns)));
+        let names_restored = match kept {
+            Some(found) => match names.restore(found.saved.names.clone()) {
+                Ok(()) => found.saved.names.len(),
+                Err(_) => {
+                    log::warn!(
+                        "state: the {} saved names were refused; starting with none",
+                        found.saved.names.len()
+                    );
+                    0
+                }
+            },
+            None => 0,
+        };
         slot.fill_names(Arc::new(LiveNames {
             list: names.clone(),
             resolver: SharedResolver::of(&dns),
@@ -368,14 +430,32 @@ impl Lazy {
         }));
         // The lock and the night hours: one state, which the panel and the API both edit. It starts
         // from the configuration's PIN and hours, and waits by the DNS task's monotonic clock.
-        let panel = Arc::new(PanelState::new(
-            cfg.panel_boot.pin_hash.clone(),
-            cfg.panel_boot.night,
-            {
+        let panel = Arc::new(
+            PanelState::new(cfg.panel_boot.pin_hash.clone(), cfg.panel_boot.night, {
                 let clock = dns.clone();
                 Arc::new(move || clock.now().mono_secs)
-            },
-        ));
+            })
+            // The LOCK screen says that a PIN outlasts a restart only while saving can work: not at
+            // all when the read of the card found trouble, and no longer once the saver goes off.
+            .with_kept(
+                cfg.state.persist && persist.boot.is_none_or(|read| read.trouble().is_none()),
+            ),
+        );
+        if let Some(found) = kept {
+            panel.restore(found.saved.panel.clone());
+        }
+        log_restored(cfg, persist.boot, names_restored, &panel);
+        let saver = cfg.state.persist.then(|| {
+            let saver = make_saver(
+                persist,
+                update.clone(),
+                devices.clone(),
+                names.clone(),
+                panel.clone(),
+            );
+            persist.flusher.set(saver.clone());
+            saver
+        });
         slot.fill_lock(panel.clone());
         dns.set_lane(slot.lane());
 
@@ -403,9 +483,110 @@ impl Lazy {
             devices,
             names,
             panel,
+            saver,
             analysis,
         }
     }
+}
+
+/// The state a start restores, if the configuration keeps the settings and a whole copy was read.
+fn found_state(cfg: &Config, boot: Option<&'static BootRead>) -> Option<&'static Found> {
+    if !cfg.state.persist {
+        return None;
+    }
+    match boot?.loaded() {
+        Restored::Found(found) => Some(found),
+        Restored::Empty(_) => None,
+    }
+}
+
+/// Says in one INFO line what a start restored from the card, or why it restored nothing: counts
+/// and the copy's letter and sequence only, never a MAC, a label, a name or a hash. Nothing is
+/// said when the configuration keeps nothing or the card was not read.
+///
+/// `names` is how many of the saved names went in (none if the list refused them), and `panel` is
+/// the panel's state after its restore, which says whether a PIN and the night were put back.
+fn log_restored(cfg: &Config, boot: Option<&'static BootRead>, names: usize, panel: &PanelState) {
+    let Some(boot) = boot.filter(|_| cfg.state.persist) else {
+        return;
+    };
+    match boot.loaded() {
+        Restored::Found(found) => {
+            let (saved, now) = (&found.saved, panel.kept_state());
+            let night_kept =
+                saved.panel.night.is_some() && saved.panel.night_config == now.night_config;
+            log::info!(
+                "state: settings restored from copy {} (seq {}): {} ADS PASS, {} blocked, {} labels, {} known, {names} names, {}, {}",
+                found.which.letter(),
+                found.seq,
+                saved.devices.exempt.len(),
+                saved.devices.block.len(),
+                saved.devices.labels.len(),
+                saved.devices.known.len(),
+                if now.pin.is_some() {
+                    "lock kept"
+                } else {
+                    "no lock"
+                },
+                if night_kept { "night kept" } else { "no night" },
+            );
+        }
+        Restored::Empty(NoCopy::Absent) => log::info!("state: no saved settings on the card"),
+        Restored::Empty(NoCopy::NotWhole) => {
+            log::info!("state: neither saved copy is whole; starting empty");
+        }
+    }
+}
+
+/// The saver of the owner's settings, over the three structures that hold them: what a snapshot
+/// copies (each under its own lock and no other, never the resolver's), whether no update is being
+/// received or staged and no trial is on, and the card's two copies as the start read them.
+///
+/// The baseline is the newest whole copy's payload, or, with none, the saver's first snapshot,
+/// which it takes in [`Saver::new`], after the restore. Saving is off from the first when the read
+/// of the card found trouble.
+fn make_saver(
+    persist: &Persist,
+    update: Arc<UpdateCtl>,
+    devices: Arc<Mutex<Devices>>,
+    names: Arc<OwnerList>,
+    panel: Arc<PanelState>,
+) -> Arc<Saver> {
+    let absent;
+    let read = match persist.boot {
+        Some(read) => read,
+        None => {
+            absent = BootRead::absent();
+            &absent
+        }
+    };
+    let baseline = match read.loaded() {
+        Restored::Found(found) => Some(found.payload.clone()),
+        Restored::Empty(_) => None,
+    };
+    let writer = CardWriter::new(
+        persist.card.clone(),
+        Device::block_device(BOOT_DEV),
+        Box::new(Fibmap),
+        read,
+    );
+    let kept = panel.clone();
+    Saver::new(
+        Box::new(move || Saved {
+            devices: devices
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .kept(),
+            names: names.kept(),
+            panel: panel.kept_state(),
+        }),
+        Box::new(move || update.when_idle(|| ()).is_ok()),
+        Box::new(writer),
+        baseline,
+        read.trouble().map(str::to_owned),
+        // Saving off for the boot: the LOCK screen must not go on saying that a PIN outlasts a restart.
+        Box::new(move || kept.stop_keeping()),
+    )
 }
 
 /// What the status server calls for the number of devices that are not on the known list: it
@@ -536,7 +717,9 @@ type MakeService = fn(&Arc<Lazy>) -> Option<Component>;
 /// Every service that the board starts, in the order that it starts them: the DNS service that
 /// answers the household, the zone's offset from UTC, the clock, the status server that tells
 /// both, and the refresh that waits for the clock; then the watchdog's analysis and device watch
-/// and, with an `[api]` section, the API; last, on a boot that is on trial of an update, the trial.
+/// and, with an `[api]` section, the API; then the saver of the owner's settings, which a configuration
+/// that keeps nothing (`[state] persist = false`) does not have; last, on a boot that is on trial of an
+/// update, the trial.
 ///
 /// **This table is where a service is added**: write its `fn <name>_component(lazy: &Arc<Lazy>) ->
 /// Option<Component>` and put it here, in the place in the order where it starts. A function gives
@@ -551,6 +734,7 @@ const SERVICES: &[MakeService] = &[
     analysis_component,
     devices_component,
     api_component,
+    state_component,
     trial_component,
 ];
 
@@ -581,6 +765,16 @@ fn prepare_from(ctx: Context, snapshot: PathBuf) -> Vec<Component> {
             lazy.get().await;
             tokio::task::yield_now().await;
             dns_selftest(lazy.ctx.tls_pem).await;
+        });
+    }
+    // The persistence step, of a boot of its own: the same order protects it (the DNS service is
+    // asked for a blocked name, and has bound by the time it is).
+    if sys::kernel_arg(selftest::PERSIST_ARG) {
+        let lazy = lazy.clone();
+        tokio::spawn(async move {
+            let devices = lazy.get().await.devices.clone();
+            tokio::task::yield_now().await;
+            persist_selftest(&lazy.ctx, devices).await;
         });
     }
 
@@ -719,6 +913,33 @@ fn api_component(lazy: &Arc<Lazy>) -> Option<Component> {
     Some(Component::task("api", false, move || {
         let lazy = lazy.clone();
         async move { api_start(&lazy, on_every_address(api::PORT)).await }
+    }))
+}
+
+/// The saver of the owner's settings, which is not essential: the board's job is DNS, and runs on
+/// without it, forgetting at a restart what the owner set, as it did before settings were kept.
+/// `None` when the configuration keeps nothing (`[state] persist = false`), and then nothing is
+/// logged about it at all, and nothing of the card is read, written or made.
+///
+/// It takes the saver that the shared state made ([`Shared::saver`]) and looks at the state every few
+/// seconds, saving it to the card when it has changed and been left alone for a while
+/// ([`Saver::run_on_pool`]); the writes are jobs of the pool, one at a time. It ends `Absent` when
+/// saving is turned off for the boot (the card did not say where the copies lie, or a write or the
+/// making of the copies failed), with the reason: one WARN line, and it is not started again.
+fn state_component(lazy: &Arc<Lazy>) -> Option<Component> {
+    if !lazy.ctx.cfg.state.persist {
+        return None;
+    }
+    let lazy = lazy.clone();
+    Some(Component::task("state", false, move || {
+        let lazy = lazy.clone();
+        async move {
+            let Some(saver) = lazy.get().await.saver.clone() else {
+                return Ended::Absent("the settings are not kept".to_owned());
+            };
+            let why = saver.run_on_pool().await;
+            Ended::Absent(format!("saving the settings is off for this boot: {why}"))
+        }
     }))
 }
 
@@ -923,6 +1144,34 @@ async fn dns_selftest(tls_pem: Option<&'static [u8]>) {
     log::info!("{line}");
     log::info!("selftest: dns: done");
     log::info!("{}", selftest::vmrss_line());
+}
+
+/// The persistence step of the self-test, for the boot in QEMU that asks for it (see
+/// [`selftest::persist`]): waits for `lo`, then either puts the settings through the API and asks
+/// the owner's restart, which saves them, or says that they came back (and, the first time, puts
+/// other night hours and asks for nothing: the board's saver is to keep them after its quiet, with
+/// no restart to flush). The restart is the panel's own path (`UpdateCtl::request_owner_restart`),
+/// so init's `leave` flushes the saver as it does for the panel's RESTART key.
+async fn persist_selftest(ctx: &Context, devices: Arc<Mutex<Devices>>) {
+    let flags = Path::new(selftest::LO_FLAGS);
+    if !selftest::lo_comes_up(flags, selftest::LO_WAIT).await {
+        log::error!("selftest: lo is not up");
+    }
+    let dns = SocketAddr::from((Ipv4Addr::LOCALHOST, DNS_PORT));
+    let api = SocketAddr::from((Ipv4Addr::LOCALHOST, api::PORT));
+    let step = selftest::persist(
+        api,
+        dns,
+        ctx.tls_pem,
+        selftest::API_PASSWORD,
+        selftest::API_WAIT,
+        devices,
+    )
+    .await;
+    log::info!("{}", step.line);
+    if step.restart && ctx.update.request_owner_restart().is_err() {
+        log::error!("selftest: persist: the owner's restart was refused");
+    }
 }
 
 /// The IPv4 address that a server listens on to be reached by every interface, at `port`.
@@ -1245,6 +1494,7 @@ mod tests {
             signal: SignalCache::new(),
             tls_pem,
             update: UpdateCtl::off(),
+            persist: Persist::unused(),
         };
         (ctx, slot, sender)
     }
@@ -1288,7 +1538,8 @@ mod tests {
                 ("status", true),
                 ("lists", true),
                 ("analysis", false),
-                ("devices", false)
+                ("devices", false),
+                ("state", false)
             ]
         );
         // The example has no `[api]` section, and so no component for it.
@@ -1314,7 +1565,8 @@ mod tests {
                 ("lists", true),
                 ("analysis", false),
                 ("devices", false),
-                ("api", false)
+                ("api", false),
+                ("state", false)
             ]
         );
         // Nothing is made yet, the key included.
@@ -1325,7 +1577,8 @@ mod tests {
     async fn an_api_without_a_tls_file_ends_absent_at_once_and_waits_for_nothing() {
         let (ctx, slot, _sender) = context_with(&api_section(), None);
         let mut components = prepare(ctx);
-        let api = components.pop().unwrap();
+        let at = components.iter().position(|c| c.name == "api").unwrap();
+        let api = components.swap_remove(at);
         assert_eq!(api.name, "api");
         let mut start = api.start;
 
@@ -2409,6 +2662,232 @@ mod tests {
         slot.ack(top.id);
         assert!(slot.top().is_none());
         assert!(shared.alerts.list(0).alerts[0].acked);
+    }
+
+    /// A device address that differs by `n`.
+    fn mac(n: u8) -> crate::watch::frames::Mac {
+        crate::watch::frames::Mac([2, 0, 0, 0, 0, n])
+    }
+
+    /// A well-formed line of a PIN's hash (10,000 rounds) that costs no derivation.
+    const PIN_LINE: &str = "$pbkdf2-sha256$i=10000$0123456789abcdef0123456789abcdef$fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210";
+
+    /// What the owner left on the card: every part of it set.
+    fn left_by_the_owner(cfg: &Config) -> Saved {
+        use crate::panel::lock::Source as PinSource;
+        use crate::state::{SavedDevices, SavedName, SavedPanel, SavedPin};
+        use crate::watch::devices::Label;
+        Saved {
+            devices: SavedDevices {
+                exempt: vec![mac(1)],
+                block: vec![mac(2)],
+                exempt_default: Some(true),
+                labels: vec![(mac(3), Label::new("kitchen").unwrap())],
+                known: vec![mac(1), mac(3)],
+            },
+            names: vec![SavedName {
+                name: "ads.example.org".into(),
+                side: qb_dns::OwnerSide::Refuse,
+                set_unix: Some(1_800_000_000),
+            }],
+            panel: SavedPanel {
+                pin: Some(SavedPin {
+                    source: PinSource::Api,
+                    hash: crate::panel::lock::parse_pin_hash(PIN_LINE).unwrap(),
+                }),
+                pin_config: [0; 32],
+                night: Some((22, 6)),
+                night_config: cfg.panel_boot.night,
+            },
+        }
+    }
+
+    /// A context whose card holds `read`, with `edit` applied to the configuration, and the flusher
+    /// that init would keep.
+    fn context_with_card(
+        read: BootRead,
+        edit: impl FnOnce(&mut Config),
+    ) -> (Context, Arc<Flusher>) {
+        let (mut ctx, _slot, _sender) = context_edited(edit);
+        ctx.persist.boot = Some(Box::leak(Box::new(read)));
+        let flusher = ctx.persist.flusher.clone();
+        (ctx, flusher)
+    }
+
+    #[tokio::test]
+    async fn a_start_puts_the_saved_settings_back_before_any_service_serves() {
+        let (ctx, _) = context_with_card(BootRead::absent(), |_| {});
+        let saved = left_by_the_owner(ctx.cfg);
+        let (ctx, _flusher) = context_with_card(BootRead::with_copy_a(&saved, 12), |_| {});
+        let lazy = Lazy::new(ctx, "/nonexistent/blocklist.zst".into());
+
+        let shared = lazy.get().await;
+
+        let devices = shared.devices.lock().unwrap().kept();
+        assert_eq!(devices, saved.devices);
+        assert_eq!(shared.names.kept(), saved.names);
+        let panel = shared.panel.kept_state();
+        assert_eq!(panel.pin, saved.panel.pin, "the PIN, with its source");
+        assert_eq!(panel.night, Some((22, 6)));
+        // The known list still says it waits, so that the desktop pushes its lists again.
+        assert_eq!(
+            shared.devices.lock().unwrap().view().known_list,
+            KnownList::Waiting
+        );
+        // What was restored is what the saver starts from, so that it saves nothing for it.
+        let saver = shared.saver.as_ref().expect("a saver");
+        saver.flush(Duration::from_millis(10));
+        assert_eq!(saver.off(), None, "nothing was saved, so nothing failed");
+    }
+
+    #[tokio::test]
+    async fn a_card_with_nothing_on_it_starts_empty_and_the_first_snapshot_is_what_a_boot_that_changes_nothing_saves()
+     {
+        let (ctx, flusher) = context_with_card(BootRead::absent(), |_| {});
+        let lazy = Lazy::new(ctx, "/nonexistent/blocklist.zst".into());
+        let shared = lazy.get().await;
+        assert_eq!(shared.names.kept(), []);
+        assert_eq!(shared.devices.lock().unwrap().kept().known, []);
+        // Nothing changed: the restart's flush finds nothing to write, and no card is used.
+        flusher.flush(Duration::from_millis(10));
+        assert_eq!(shared.saver.as_ref().unwrap().off(), None);
+    }
+
+    #[tokio::test]
+    async fn a_change_since_the_start_is_what_the_restarts_flush_goes_to_save() {
+        use crate::panel::lock::LockControl as _;
+
+        let (ctx, flusher) = context_with_card(BootRead::absent(), |_| {});
+        let lazy = Lazy::new(ctx, "/nonexistent/blocklist.zst".into());
+        let shared = lazy.get().await;
+        shared.panel.set_night(Some((1, 2)));
+
+        // This board has no card to lend, so the creation fails and saving goes off: the flush saw
+        // the change in the panel's state, and went as far as the card.
+        flusher.flush(Duration::from_millis(10));
+
+        let off = shared.saver.as_ref().unwrap().off().expect("saving is off");
+        assert!(off.contains("mounted"), "{off}");
+    }
+
+    #[tokio::test]
+    async fn the_lock_says_it_outlasts_a_restart_while_saving_works_and_not_a_moment_after() {
+        use crate::panel::lock::LockControl as _;
+
+        // A card that read well, and a start that keeps the settings: the LOCK screen says so.
+        let (ctx, flusher) = context_with_card(BootRead::absent(), |_| {});
+        let lazy = Lazy::new(ctx, "/nonexistent/blocklist.zst".into());
+        let shared = lazy.get().await;
+        assert!(shared.panel.lock_view().kept);
+
+        // This board has no card to lend, so the creation fails and saving goes off at the flush:
+        // from then on the screen no longer says it.
+        shared.panel.set_night(Some((1, 2)));
+        flusher.flush(Duration::from_millis(10));
+        assert!(shared.saver.as_ref().unwrap().off().is_some());
+        assert!(
+            !shared.panel.lock_view().kept,
+            "saving is off, and a PIN would not outlast a restart"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_card_whose_read_found_trouble_starts_with_the_lock_not_kept_from_the_first_screen() {
+        use crate::panel::lock::LockControl as _;
+
+        let (ctx, _) =
+            context_with_card(BootRead::troubled("copy a: not where it was said"), |_| {});
+        let lazy = Lazy::new(ctx, "/nonexistent/blocklist.zst".into());
+        let shared = lazy.get().await;
+        assert!(
+            !shared.panel.lock_view().kept,
+            "no save will ever be made this boot"
+        );
+        assert_eq!(
+            shared.saver.as_ref().unwrap().off().as_deref(),
+            Some("copy a: not where it was said")
+        );
+        // And with persistence off it is not kept either, as before.
+        let (ctx, _) = context_with_card(BootRead::absent(), |cfg| cfg.state.persist = false);
+        let lazy = Lazy::new(ctx, "/nonexistent/blocklist.zst".into());
+        assert!(!lazy.get().await.panel.lock_view().kept);
+    }
+
+    #[tokio::test]
+    async fn with_persist_off_nothing_is_restored_there_is_no_saver_and_no_component() {
+        let (ctx, _) = context_with_card(BootRead::absent(), |_| {});
+        let saved = left_by_the_owner(ctx.cfg);
+        let (ctx, flusher) = context_with_card(BootRead::with_copy_a(&saved, 3), |cfg| {
+            cfg.state.persist = false;
+        });
+        let lazy = Arc::new(Lazy::new(ctx, "/nonexistent/blocklist.zst".into()));
+        assert!(state_component(&lazy).is_none());
+
+        let shared = lazy.get().await;
+
+        assert_eq!(shared.names.kept(), []);
+        assert_eq!(shared.devices.lock().unwrap().kept().exempt, []);
+        assert_eq!(shared.panel.kept_state().pin, None);
+        assert!(shared.saver.is_none());
+        flusher.flush(Duration::from_millis(10));
+        let lock = shared.panel.lock().view();
+        assert!(
+            !lock.kept,
+            "the LOCK screen says the PIN does not outlast a restart"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_state_component_is_not_essential_and_runs_on_while_saving_is_on() {
+        let (ctx, _) = context_with_card(BootRead::absent(), |_| {});
+        let lazy = Arc::new(Lazy::new(ctx, "/nonexistent/blocklist.zst".into()));
+        let mut state = state_component(&lazy).unwrap();
+        assert_eq!((state.name, state.essential), ("state", false));
+        let running = tokio::spawn((state.start)());
+        for _ in 0..50 {
+            tokio::task::yield_now().await;
+        }
+        assert!(!running.is_finished());
+        running.abort();
+    }
+
+    #[tokio::test]
+    async fn a_card_that_could_not_be_mapped_ends_the_state_component_absent_with_the_reason() {
+        let (ctx, _) =
+            context_with_card(BootRead::troubled("copy a: not where it was said"), |_| {});
+        let lazy = Arc::new(Lazy::new(ctx, "/nonexistent/blocklist.zst".into()));
+        let mut state = state_component(&lazy).unwrap();
+
+        let ended = tokio::time::timeout(Duration::from_secs(10), (state.start)()).await;
+
+        assert_eq!(
+            ended.unwrap(),
+            Ended::Absent(
+                "saving the settings is off for this boot: copy a: not where it was said"
+                    .to_owned()
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn the_savers_snapshot_does_not_wait_for_the_resolvers_lock() {
+        let (ctx, flusher) = context_with_card(BootRead::absent(), |_| {});
+        let lazy = Lazy::new(ctx, "/nonexistent/blocklist.zst".into());
+        let shared = lazy.get().await;
+
+        // Held here, the answer path's lock must not be what the snapshot waits on: the flush
+        // takes one, on its own thread, which fails the test after ten seconds and does not hang it.
+        let resolver = shared.dns.shared();
+        let held = resolver.lock().unwrap();
+        let (done, finished) = std::sync::mpsc::channel();
+        let restart = std::thread::spawn(move || {
+            flusher.flush(Duration::from_millis(10));
+            let _ = done.send(());
+        });
+        let seen = finished.recv_timeout(Duration::from_secs(10));
+        drop(held);
+        seen.expect("the snapshot waited for the resolver");
+        restart.join().unwrap();
     }
 
     #[tokio::test]

@@ -37,7 +37,8 @@
 //! replaces the list that the desktop pushes, and leaves the configuration's `watch.exempt` alone;
 //! `[]` clears it, and the answer is how many different addresses it holds. It fits one body, at
 //! [`MAX_EXEMPT`] addresses, so it is never sent in chunks: more different ones than that are a
-//! 400. The list lives in memory only, and the desktop sends it again after the board starts. In
+//! 400. The list is kept on the card with the owner's other settings (`crate::state`), and the desktop sends it
+//! again after the board starts. In
 //! `GET devices` `exempt_macs` is both lists together, sorted, in lower case, with the addresses
 //! that have not been heard yet.
 //!
@@ -48,7 +49,7 @@
 //! the pushed block list, which sits beside the configuration's `watch.block` as the pushed exempt
 //! list sits beside `watch.exempt`; the answer is the mode and how many different addresses the
 //! pushed block list holds, at most [`MAX_BLOCK`]. Until a policy is pushed the configuration's
-//! `watch.exempt_default` is in force. It lives in memory only, like the exempt list. In
+//! `watch.exempt_default` is in force. It is kept on the card, like the exempt list. In
 //! `GET devices` `exempt_default` is the mode in force and `block_macs` both block lists together,
 //! as `exempt_macs` is; each device has `blocked`, whether it is on a block list, and `exempt`,
 //! whether it is exempt in the mode in force: on an exempt list in the list mode, and in the
@@ -79,7 +80,7 @@
 //!
 //! `PUT devices/labels` sends the desktop's names for its devices, in its order, which the panel
 //! keeps: at most 64 pairs in all, each a MAC and a label of 1 to 24 printable ASCII characters,
-//! chunked with `append` and `complete` as the known list is. The labels live in memory only, and
+//! chunked with `append` and `complete` as the known list is. The labels are kept on the card, and
 //! the desktop sends them again after the board starts.
 //!
 //! `PUT devices/gate` opens the gate of one device for `secs` seconds, 1 to 3600, which lets its
@@ -89,8 +90,8 @@
 //! `full`, and a refusal never repeats the address. Gates live in memory only, are not pushed back
 //! by the desktop and shut by themselves, also when the board restarts.
 //!
-//! The owner's names are the names that the owner allows and refuses (`qb_dns::OwnerNames`), in
-//! memory only: the desktop sends them again after the board starts. `refuse` blocks a name and its
+//! The owner's names are the names that the owner allows and refuses (`qb_dns::OwnerNames`), kept
+//! on the card with the owner's other settings, so they come back after the board starts. `refuse` blocks a name and its
 //! subdomains for every device, ADS PASS ones too; `allow` lets through a name that an ads list or
 //! the configuration's `dns.deny` blocks, never one that a threat list does. Both keys are required
 //! in a body (a list may be empty), and each name is validated as a `dns.deny` entry is: a domain
@@ -106,17 +107,19 @@
 //! resolver's local day, most often first, at most eight; it is empty after midnight until the first
 //! block of the day. A push of the desktop keeps the front panel's entries it names as they are.
 //!
-//! The panel's night hours and lock are one small state, in memory only, which the front panel edits too
+//! The panel's night hours and lock are one small state, kept on the card, which the front panel edits too
 //! (`crate::panel::lock::PanelState`). `GET panel` gives the night hours as `HH-HH` (the hour the
 //! screen goes dark and the hour it wakes, `null` for no night) and whether the lock is on and where its
 //! PIN came from: `"config"` (the slot's `[panel] pin_hash`, which survives a restart), `"api"` (pushed
-//! from here for this boot) or `"panel"` (set on the screen, until the next restart, which is what qnet
-//! tells the owner), `null` while it is off. The hash is never in an answer. `PUT panel` takes `night` and
+//! from here) or `"panel"` (set on the screen), `null` while it is off; a PIN from here or the screen is
+//! kept on the card and outlasts a restart while the configuration's `pin_hash` stays as it was (with
+//! `[state] persist = false`, until the next restart). The hash is never in an answer. `PUT panel` takes `night` and
 //! `pin_hash`, either or both: `night` is `"HH-HH"` (two different hours, 00 to 23) or `null` for none;
 //! `pin_hash` is the hash of a PIN with exactly 10,000 rounds, as `cargo xtask hash-pin` prints it: the
 //! bare `$pbkdf2-sha256$i=10000$<salt>$<hash>`, or the whole line `pin_hash = "<hash>"` (the line ending
 //! and other white space around the line are dropped; see [`lock::parse_pushed_pin_hash`]), or `null`,
-//! which turns the lock off for this boot. The latest set wins for the boot, and qnet pushes its hash
+//! which turns the lock off (until the next restart when the configuration has a hash). The latest set
+//! wins, and qnet pushes its hash
 //! again after each start. A body with neither key, a night that is no `HH-HH`, or a hash that is no line
 //! of a PIN is a 400 and changes nothing, and no answer repeats a piece of the body. The answer is the
 //! state after the change, as `GET` gives it.
@@ -741,7 +744,7 @@ fn panel(state: &PanelState, started: Instant) -> Reply {
     ok(panel_state(state), started)
 }
 
-/// `PUT panel`: sets the night hours, the PIN's hash, or both, for this boot, and answers the state after
+/// `PUT panel`: sets the night hours, the PIN's hash, or both, and answers the state after
 /// the change as `GET` gives it. The body is read and checked whole first: a `night` that is not
 /// `"HH-HH"` (two different hours) or null, a `pin_hash` that is not the hash of a PIN, bare or in the
 /// line `hash-pin` prints ([`lock::parse_pushed_pin_hash`]), or null, or neither key, is a 400 and

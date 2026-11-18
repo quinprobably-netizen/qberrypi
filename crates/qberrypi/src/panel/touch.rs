@@ -11,6 +11,7 @@ use std::os::fd::AsFd;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+use qb_panel::touch::DEFAULT_MIN_PRESS_MS;
 use qb_panel::{Calibration, TouchEvent, to_screen};
 use rustix::event::{PollFd, PollFlags, Timespec};
 use rustix::io::Errno;
@@ -53,12 +54,37 @@ pub(crate) const BTN_TOUCH: u16 = 0x14a;
 /// The largest reading of the touch controller's two axes: they have 12 bits.
 pub const RAW_MAX: u16 = 4095;
 
-/// The least pressure at which a report is a touch, of the driver's 0 to 255.
+/// The least pressure at which a report is a touch, of the driver's 0 to 255, unless the
+/// configuration says another (`[panel] touch_min_pressure`).
 ///
 /// A report with less is a pen on its way up or down, whose readings are
-/// not where the finger is. The value is a guess: it is not measured on the
-/// real panel, and is to be adjusted after the first taps on it.
-pub const MIN_PRESSURE: i32 = 16;
+/// not where the finger is. The driver works out the resistance of the touch
+/// from its readings, in proportion to the plate resistance it is told
+/// (`xohms` on the overlay's line of `config.txt`), drops a touch whose
+/// resistance is above its `ti,pressure-max` of 255, and reports the pressure
+/// as 255 less the resistance; this gate trims the lightest of what it passes.
+/// The value is a guess, lowered from 16 when the owner asked for a lighter
+/// touch: it is not measured on the real panel.
+pub const DEFAULT_MIN_PRESSURE: i32 = 4;
+
+/// How light a touch the panel takes: the least pressure of a touch sample, and the shortest
+/// press that is a tap. The configuration's `[panel]` table sets both.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Sensitivity {
+    /// The least pressure at which a report is a touch sample, of the driver's 0 to 255.
+    pub min_pressure: i32,
+    /// The shortest press that is a tap, in milliseconds.
+    pub min_press_ms: u64,
+}
+
+impl Sensitivity {
+    /// What a configuration that does not say takes: `DEFAULT_MIN_PRESSURE` and
+    /// `qb_panel::touch::DEFAULT_MIN_PRESS_MS`.
+    pub const DEFAULT: Sensitivity = Sensitivity {
+        min_pressure: DEFAULT_MIN_PRESSURE,
+        min_press_ms: DEFAULT_MIN_PRESS_MS,
+    };
+}
 
 /// Finds the touch screen's input device among those in `sys_input` and names its device file in `dev_input`.
 ///
@@ -203,11 +229,14 @@ pub enum Decoded {
 /// the order they were read.
 ///
 /// A report is a *touch sample* while the glass is touched and either
-/// no pressure was ever reported or the last one is at least `MIN_PRESSURE`.
+/// no pressure was ever reported or the last one is at least the decoder's least
+/// pressure (`DEFAULT_MIN_PRESSURE` unless it is made with another).
 /// Only a touch sample is turned into a point: the pen on its way up or down
 /// reads a point that is not where the finger is, and `to_screen` cannot tell.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct Decoder {
+    /// The least pressure at which a report is a touch sample.
+    min_pressure: i32,
     /// The last horizontal reading.
     raw_x: u16,
     /// The last vertical reading.
@@ -222,12 +251,33 @@ pub struct Decoder {
     given: Option<(u16, u16)>,
 }
 
+impl Default for Decoder {
+    /// A decoder whose least pressure is `DEFAULT_MIN_PRESSURE`.
+    fn default() -> Self {
+        Self::new(DEFAULT_MIN_PRESSURE)
+    }
+}
+
 /// A reading held to the 12 bits of the controller.
 pub(crate) fn hold(value: i32) -> u16 {
     u16::try_from(value.clamp(0, i32::from(RAW_MAX))).unwrap_or(RAW_MAX)
 }
 
 impl Decoder {
+    /// A decoder that has seen no event, whose touch samples are the reports of at least `min_pressure`.
+    #[must_use]
+    pub fn new(min_pressure: i32) -> Self {
+        Self {
+            min_pressure,
+            raw_x: 0,
+            raw_y: 0,
+            pressure: None,
+            button: false,
+            down: false,
+            given: None,
+        }
+    }
+
     /// Takes the next event; returns the touch it completes, with the time of the report that completed it.
     ///
     /// - An axis, a pressure or a `BTN_TOUCH` event is only stored.
@@ -279,7 +329,7 @@ impl Decoder {
     /// Whether the glass is touched firmly enough for a report taken now to be a touch sample.
     fn is_sample(&self) -> bool {
         self.pressure
-            .is_none_or(|pressure| pressure >= MIN_PRESSURE)
+            .is_none_or(|pressure| pressure >= self.min_pressure)
     }
 
     /// What the end of a report gives out.
@@ -553,7 +603,7 @@ pub(crate) mod tests {
             key(0, 1),
             abs_x(0, 1125),
             abs_y(0, 2975),
-            pressure(0, MIN_PRESSURE - 1),
+            pressure(0, DEFAULT_MIN_PRESSURE - 1),
             syn(0),
             pressure(30, 1),
             syn(30),
@@ -578,7 +628,7 @@ pub(crate) mod tests {
             // the pen is lifting: the readings run to the corner while the pressure falls
             abs_x(20, 0),
             abs_y(20, 4095),
-            pressure(20, MIN_PRESSURE - 1),
+            pressure(20, DEFAULT_MIN_PRESSURE - 1),
             syn(20),
             // back at the place it was given out at
             abs_x(40, 1125),
@@ -607,11 +657,11 @@ pub(crate) mod tests {
             key(0, 1),
             abs_x(0, 1125),
             abs_y(0, 2975),
-            pressure(0, 10),
+            pressure(0, DEFAULT_MIN_PRESSURE - 2),
             syn(0),
             abs_x(40, 0),
             abs_y(40, 4095),
-            pressure(40, MIN_PRESSURE - 1),
+            pressure(40, DEFAULT_MIN_PRESSURE - 1),
             syn(40),
             key(80, 0),
             pressure(80, 0),
@@ -631,8 +681,47 @@ pub(crate) mod tests {
                 syn(0),
             ])
         };
-        assert_eq!(press(MIN_PRESSURE - 1), []);
-        assert_eq!(press(MIN_PRESSURE), [(0, Touch(Down { x: 120, y: 239 }))]);
+        assert_eq!(press(DEFAULT_MIN_PRESSURE - 1), []);
+        assert_eq!(
+            press(DEFAULT_MIN_PRESSURE),
+            [(0, Touch(Down { x: 120, y: 239 }))]
+        );
+    }
+
+    #[test]
+    fn a_decoder_made_with_another_least_pressure_holds_to_it() {
+        let press = |min_pressure, value| {
+            let mut decoder = Decoder::new(min_pressure);
+            [
+                key(0, 1),
+                abs_x(0, 1125),
+                abs_y(0, 2975),
+                pressure(0, value),
+                syn(0),
+                key(30, 0),
+                pressure(30, 0),
+                syn(30),
+            ]
+            .into_iter()
+            .filter_map(|event| decoder.feed(event, &Calibration::NOMINAL))
+            .collect::<Vec<_>>()
+        };
+        let tap = [(0, Touch(Down { x: 120, y: 239 })), (30, Touch(Up))];
+        // At 0 every pressure the driver reports is a touch.
+        assert_eq!(press(0, 0), tap);
+        for min in [1, 16, 200, 254] {
+            assert_eq!(press(min, min), tap, "{min}");
+            assert_eq!(press(min, min - 1), [], "{min}");
+        }
+        assert_eq!(DEFAULT_MIN_PRESSURE, 4);
+        assert_eq!(Decoder::default().min_pressure, DEFAULT_MIN_PRESSURE);
+        assert_eq!(
+            Sensitivity::DEFAULT,
+            Sensitivity {
+                min_pressure: 4,
+                min_press_ms: 20
+            }
+        );
     }
 
     #[test]

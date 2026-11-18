@@ -13,7 +13,11 @@
 //! [`crate::dns::watched`]). No address of a device is in any answer, and the one line logged here
 //! says where the server listens.
 //!
-//! Nothing here holds a lock across an `.await`: the answer is made first, and then written.
+//! Nothing here holds a lock across an `.await`: the answer is made first, and then written. A
+//! connection that has been answered is closed as [`crate::linger`] says, so that a client that
+//! still has request bytes unread by the server, or a long `/log` to read, is not sent a reset
+//! that costs it the end of the answer. That happens inside [`CLIENT_TIMEOUT`], which counts the
+//! whole connection, and never beyond it.
 
 use std::io::{self, ErrorKind};
 use std::net::{IpAddr, SocketAddr};
@@ -27,6 +31,7 @@ use tokio::sync::{Semaphore, watch};
 
 use crate::dns::upstream::TlsState;
 use crate::dns::{Dns, clients};
+use crate::linger;
 use crate::lists::Lists;
 use crate::live;
 use crate::logbuf::LogBuf;
@@ -37,7 +42,8 @@ pub const PORT: u16 = 80;
 /// The most connections that are served at once. A further one waits in the queue of the listener
 /// until a place is free.
 pub const MAX_CLIENTS: usize = 8;
-/// How long a connection has, from the moment it is taken to the last byte of its answer.
+/// How long a connection has, from the moment it is taken to the end of its close: the answer and
+/// the lingering close ([`crate::linger`]) are both inside it.
 pub const CLIENT_TIMEOUT: Duration = Duration::from_secs(5);
 /// The most bytes that are read from a client: a request line that is longer is answered with 400.
 pub const MAX_REQUEST_LINE: usize = 1024;
@@ -377,13 +383,17 @@ impl Status {
         }
     }
 
-    /// One client's connection, from `peer`: its request line, the answer, and the end.
+    /// One client's connection, from `peer`: its request line, the answer, and the end, which
+    /// lingers ([`linger::close`]). A client that has gone before its request line was read is
+    /// owed no answer and none is written.
     async fn talk(&self, mut stream: TcpStream, peer: IpAddr) -> io::Result<()> {
         let response = match read_request_line(&mut stream).await? {
             Some(line) => self.respond(&String::from_utf8_lossy(&line), peer),
             None => Response::line(400, "bad request"),
         };
-        stream.write_all(&response.to_bytes()).await
+        stream.write_all(&response.to_bytes()).await?;
+        linger::close(stream).await;
+        Ok(())
     }
 }
 
@@ -492,7 +502,7 @@ mod tests {
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
     use qb_dns::ListClass;
-    use tokio::time::timeout;
+    use tokio::time::{sleep, timeout};
 
     use qb_dns::BlockSetBuilder;
 
@@ -508,10 +518,19 @@ mod tests {
     /// a `127.0.0.1` port: room for two clients, which may take 200 ms. Returns it with the
     /// addresses of its server and of the DNS service.
     async fn served(reply: Reply) -> (Status, SocketAddr, SocketAddr) {
+        served_with(reply, ms(200), 4096).await
+    }
+
+    /// [`served`] with connections that may take `timeout`, and a log that holds `log_cap` bytes.
+    async fn served_with(
+        reply: Reply,
+        timeout: Duration,
+        log_cap: usize,
+    ) -> (Status, SocketAddr, SocketAddr) {
         let (dns, dns_addr, upstream) = one(reply).await;
         // The upstream stops answering when it is dropped.
         std::mem::forget(upstream);
-        let mut buf = LogBuf::new(4096);
+        let mut buf = LogBuf::new(log_cap);
         buf.push("one");
         buf.push("two");
         let log: &'static Mutex<LogBuf> = Box::leak(Box::new(Mutex::new(buf)));
@@ -537,7 +556,7 @@ mod tests {
         };
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
         let addr = listener.local_addr().unwrap();
-        tokio::spawn(status.clone().serve_with(listener, 2, ms(200)));
+        tokio::spawn(status.clone().serve_with(listener, 2, timeout));
         (status, addr, dns_addr)
     }
 
@@ -1167,6 +1186,150 @@ mod tests {
                 .0
                 .starts_with("HTTP/1.1 400 ")
         );
+    }
+
+    /// What `stream` gives until the server ends the connection, within `wait`: an error if it
+    /// was reset, which is what a lingering close is there to prevent.
+    async fn read_to_the_end(stream: &mut TcpStream, wait: Duration) -> io::Result<Vec<u8>> {
+        let mut reply = Vec::new();
+        match timeout(wait, stream.read_to_end(&mut reply)).await {
+            Ok(read) => read.map(|_| reply),
+            Err(_) => Err(io::ErrorKind::TimedOut.into()),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_large_log_is_read_whole_by_a_client_that_has_request_bytes_the_server_never_read() {
+        // 3 MiB of log, more than the buffers of both sockets hold, so that the end of the answer
+        // is still on the server's side when it has written the last of it.
+        let (status, http, _dns) =
+            served_with(Reply::Silent, Duration::from_secs(20), 4 << 20).await;
+        let line = "x".repeat(80);
+        {
+            let mut log = status.log.lock().unwrap_or_else(PoisonError::into_inner);
+            for n in 0..(3 << 20) / 90 + 100 {
+                log.push(&format!("{n:08} {line}"));
+            }
+        }
+        let expected = status
+            .log
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .text();
+        assert!(expected.len() > 3 << 20);
+
+        let mut stream = TcpStream::connect(http).await.unwrap();
+        // The server reads the request line and no more: these 8 KiB of header are left unread.
+        let pad = "p".repeat(8000);
+        let request = format!("GET /log HTTP/1.1\r\nHost: x\r\nX-Pad: {pad}\r\n\r\n");
+        stream.write_all(request.as_bytes()).await.unwrap();
+        // The client reads nothing for a while, so that the answer waits in the buffers.
+        sleep(ms(500)).await;
+        let reply = read_to_the_end(&mut stream, Duration::from_secs(15))
+            .await
+            .expect("the answer is read to its end, with no reset");
+        let blank = reply
+            .windows(4)
+            .position(|window| window == b"\r\n\r\n")
+            .expect("a head");
+        assert!(reply.starts_with(b"HTTP/1.1 200 OK\r\n"));
+        assert_eq!(reply.len() - (blank + 4), expected.len());
+        assert!(reply[blank + 4..] == *expected.as_bytes());
+    }
+
+    #[tokio::test]
+    async fn a_client_that_goes_on_sending_after_a_400_still_reads_it_whole() {
+        let (_status, http, _dns) = served_with(Reply::Silent, Duration::from_secs(5), 4096).await;
+        let mut stream = TcpStream::connect(http).await.unwrap();
+        // A line that does not end in 1,100 bytes: the server answers at 1,024, and what the
+        // client goes on with, 16 KiB in pieces, is for it to read and throw away. With the
+        // connection closed at once, which is a reset, a write would fail from there on.
+        stream.write_all(&[b'a'; 1100]).await.unwrap();
+        for piece in 0..16 {
+            sleep(ms(10)).await;
+            stream
+                .write_all(&[b'a'; 1024])
+                .await
+                .unwrap_or_else(|error| panic!("write {piece}: {error}"));
+        }
+        let reply = read_to_the_end(&mut stream, Duration::from_secs(3))
+            .await
+            .expect("the answer is read to its end");
+        assert!(reply.starts_with(b"HTTP/1.1 400 Bad Request\r\n"));
+        assert!(reply.ends_with(b"bad request\n"));
+    }
+
+    #[tokio::test]
+    async fn a_client_that_never_stops_sending_is_closed_at_the_time_bound() {
+        // A byte every 100 ms, which no byte count would stop.
+        let (_status, http, _dns) = served_with(Reply::Silent, Duration::from_secs(20), 4096).await;
+        let mut stream = TcpStream::connect(http).await.unwrap();
+        stream.write_all(&[b'a'; 1100]).await.unwrap();
+        let began = Instant::now();
+        // The client finds out when a write fails: a little after the close.
+        while stream.write_all(b"a").await.is_ok() && began.elapsed() < Duration::from_secs(8) {
+            sleep(ms(100)).await;
+        }
+        let closed = began.elapsed();
+        assert!(
+            (linger::TIME - ms(100)..linger::TIME + Duration::from_secs(2)).contains(&closed),
+            "{closed:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_client_that_floods_is_closed_at_the_byte_bound_long_before_the_time_bound() {
+        // 20 s of time bound, which the 64 KiB beat: the client sends 4 KiB every 5 ms, which no
+        // buffer takes in, and finds out that the server has closed when a write fails.
+        let (_status, http, _dns) = served_with(Reply::Silent, Duration::from_secs(20), 4096).await;
+        let mut stream = TcpStream::connect(http).await.unwrap();
+        // The server reads 1,024 bytes of these for the line, and drains the rest.
+        stream.write_all(&[b'a'; 1100]).await.unwrap();
+        let began = Instant::now();
+        let mut sent = 0;
+        while sent < 1 << 20 && stream.write_all(&[b'a'; 4096]).await.is_ok() {
+            sent += 4096;
+            sleep(ms(5)).await;
+        }
+        // A client that finds out a piece or two late has sent that much more than the bound.
+        let drained = sent + 76;
+        let bound = linger::BYTES;
+        assert!(
+            (bound - 4096..bound + 8 * 4096).contains(&drained),
+            "{drained}"
+        );
+        assert!(
+            began.elapsed() < Duration::from_secs(10),
+            "{:?}",
+            began.elapsed()
+        );
+    }
+
+    #[tokio::test]
+    async fn the_lingering_close_ends_with_the_connections_time_and_does_not_add_to_it() {
+        // Each connection has 600 ms in all, and the linger is 2 s: it is cut at 600 ms.
+        let (_status, http, _dns) = served_with(Reply::Silent, ms(600), 4096).await;
+        let mut stream = TcpStream::connect(http).await.unwrap();
+        stream.write_all(&[b'a'; 1100]).await.unwrap();
+        let began = Instant::now();
+        while stream.write_all(b"a").await.is_ok() && began.elapsed() < Duration::from_secs(8) {
+            sleep(ms(50)).await;
+        }
+        let closed = began.elapsed();
+        assert!((ms(550)..ms(1500)).contains(&closed), "{closed:?}");
+    }
+
+    #[tokio::test]
+    async fn a_client_that_reads_its_answer_and_closes_does_not_hold_its_place_for_the_linger() {
+        // One place for 5 s: a second client is served as soon as the first has gone.
+        let (_status, http, _dns) = served_with(Reply::Silent, Duration::from_secs(5), 4096).await;
+        let began = Instant::now();
+        for _ in 0..5 {
+            let (head, body) = get(http, "GET /log HTTP/1.1\r\n\r\n").await;
+            assert!(head.starts_with("HTTP/1.1 200 OK\r\n"));
+            assert_eq!(body, b"one\ntwo\n");
+        }
+        assert!(began.elapsed() < linger::TIME, "{:?}", began.elapsed());
     }
 
     #[tokio::test]

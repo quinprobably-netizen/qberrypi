@@ -150,6 +150,87 @@ pub fn sync() {
     rustix::fs::sync();
 }
 
+/// The request that asks which size of block a file system counts in (`FIGETBSZ`, `_IO(0x00, 2)`):
+/// it writes one `int`. The number says nothing of the data's size, as with every request that
+/// predates the encoded ones.
+const FIGETBSZ: libc::Ioctl = 2;
+
+/// The request that asks where a block of a file lies on the device (`FIBMAP`, `_IO(0x00, 1)`):
+/// it takes the block's number in the file and puts the block's number on the device in its place.
+/// The kernel answers it only to a caller with the privilege to read a device's raw layout, which
+/// PID 1 has.
+const FIBMAP: libc::Ioctl = 1;
+
+/// The size, in bytes, of the blocks that the file system `file` lies on counts in: what
+/// [`fs_block_of`] numbers its blocks by.
+///
+/// For a FAT file system this is its sector size (512 bytes on an SD card), not its cluster size.
+/// Fails with the kernel's error on a file whose file system does not answer, and with
+/// `InvalidData` for a size of 0.
+pub fn fs_block_size(file: &File) -> io::Result<u32> {
+    let mut size: c_int = 0;
+    // SAFETY: `FIGETBSZ` writes one `int` through the pointer, which is to `size`, an `int` that
+    // outlives the call; the descriptor stays open because `file` is borrowed for the call.
+    let result = unsafe { libc::ioctl(file.as_raw_fd(), FIGETBSZ, &raw mut size) };
+    if result < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    match u32::try_from(size) {
+        Ok(size) if size > 0 => Ok(size),
+        _ => Err(io::Error::new(
+            ErrorKind::InvalidData,
+            "the file system says its block size is not positive",
+        )),
+    }
+}
+
+/// Where block number `logical` of `file` lies on the device, as a block number of the size
+/// [`fs_block_size`] says (so that the byte offset is the number times that size). It is the
+/// number of the block of the partition the file system is mounted from, not of the whole disk.
+///
+/// A block that has no place on the device (a hole) is the number 0, which the caller must not
+/// take for a place: the first block of a partition is its boot sector, which no file occupies.
+/// Fails with the kernel's error where the file system cannot tell (`FIBMAP` is not offered by
+/// every file system), and with `InvalidInput` for a `logical` that does not fit the request's
+/// `int`.
+pub fn fs_block_of(file: &File, logical: u32) -> io::Result<u32> {
+    let mut block = c_int::try_from(logical).map_err(|_| {
+        io::Error::new(
+            ErrorKind::InvalidInput,
+            "the block number does not fit the request",
+        )
+    })?;
+    // SAFETY: `FIBMAP` reads one `int` through the pointer and writes one back, which is to
+    // `block`, an `int` that outlives the call; the descriptor stays open because `file` is
+    // borrowed for the call.
+    let result = unsafe { libc::ioctl(file.as_raw_fd(), FIBMAP, &raw mut block) };
+    if result < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    u32::try_from(block).map_err(|_| {
+        io::Error::new(
+            ErrorKind::InvalidData,
+            "the file system gave a negative block number",
+        )
+    })
+}
+
+/// The logical block size, in bytes, of the block device `file` is open on (`BLKSSZGET`): the unit
+/// that reads and writes at the device must start and end on when they bypass the page cache
+/// (`O_DIRECT`), 512 or 4096 for a card.
+///
+/// Fails with the kernel's error on a file that is not a block device (a plain file answers
+/// `ENOTTY`), and with `InvalidData` for a size of 0.
+pub fn block_logical_size(file: &File) -> io::Result<u32> {
+    match rustix::fs::ioctl_blksszget(file)? {
+        0 => Err(io::Error::new(
+            ErrorKind::InvalidData,
+            "the device says its logical block size is 0",
+        )),
+        size => Ok(size),
+    }
+}
+
 /// Inserts a module file into the kernel, with the given parameters.
 ///
 /// A module the kernel already has is `ErrorKind::AlreadyExists`.
@@ -848,6 +929,33 @@ mod tests {
     use rustix::net::RecvFlags;
 
     const SELFTEST: &str = "qberrypi.selftest";
+
+    #[test]
+    fn a_file_system_says_its_block_size_and_the_block_request_answers_or_refuses_cleanly() {
+        let file = tempfile::tempfile().unwrap();
+        file.set_len(8192).unwrap();
+        let size = fs_block_size(&file).unwrap();
+        assert!(size >= 512 && size.is_power_of_two(), "{size}");
+        // The block request is for the privileged and for file systems that map their blocks: on
+        // a host it is a number or the kernel's refusal, and the proof that it works on a FAT
+        // partition is the board's own (the QEMU scenarios).
+        match fs_block_of(&file, 0) {
+            Ok(_) => {}
+            Err(error) => assert!(error.raw_os_error().is_some(), "{error}"),
+        }
+        // A block number that does not fit the request's `int` is refused before the call.
+        assert_eq!(
+            fs_block_of(&file, u32::MAX).unwrap_err().kind(),
+            ErrorKind::InvalidInput
+        );
+    }
+
+    #[test]
+    fn a_plain_file_has_no_logical_block_size_to_ask_for() {
+        let file = tempfile::tempfile().unwrap();
+        let error = block_logical_size(&file).unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(libc::ENOTTY), "{error}");
+    }
 
     #[test]
     fn the_tryboot_restart_gives_the_kernel_the_firmwares_command() {

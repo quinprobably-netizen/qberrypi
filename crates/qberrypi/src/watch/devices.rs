@@ -59,10 +59,19 @@
 //! way, in either mode, so that turning the mode on finds them ready. The mode in force is the
 //! pushed one once a policy has been pushed since the start, and the configuration's until then.
 //!
+//! What the owner pushed outlasts a restart when it is kept on the card: [`Devices::kept`] gives
+//! the pushed lists, the pushed mode, the labels and the known set, and [`Devices::restore`] takes
+//! them back at the start, before anything is heard. A restored known set stands in for the
+//! desktop's list when none comes: a device on it is known from the first sighting, and when the
+//! ten minutes pass with no list the held newcomers are raised, not learned. The state stays
+//! `Waiting` through a restore, so that the API still says so and the desktop pushes its lists
+//! again as it does after any restart.
+//!
 //! Nothing here logs but counts and the mode: the devices on a known list that came, the devices
-//! learned, the devices on an exempt list that came, the labels that came, and the mode and number
-//! of blocked devices of a policy that came and changed them. A MAC, an address, a host name or a
-//! label never reaches a log line from this file.
+//! learned, the devices of a restored known set that stood in for a list that never came, the
+//! devices on an exempt list that came, the labels that came, and the mode and number of blocked
+//! devices of a policy that came and changed them. A MAC, an address, a host name or a label never
+//! reaches a log line from this file.
 
 use std::collections::{HashMap, HashSet};
 use std::fmt;
@@ -75,6 +84,7 @@ use tokio::sync::Notify;
 use super::frames::{Arp, DHCP_DISCOVER, DHCP_REQUEST, Dhcp, HOSTNAME_MAX, Mac};
 use crate::alerts::{Alert, AlertSink, Severity};
 use crate::dns::exempt::{self, Exemption};
+use crate::state::SavedDevices;
 
 /// How many devices the inventory holds; past that the one seen longest ago goes.
 pub const MAX_DEVICES: usize = 512;
@@ -535,6 +545,9 @@ pub struct Devices {
     state: KnownList,
     /// The MACs that are not new.
     known: HashSet<Mac>,
+    /// Whether `known` was restored from the card and is not empty, so that it stands in for the
+    /// desktop's list if none comes ([`Devices::tick`]). Cleared when a list comes.
+    restored: bool,
     /// The known list that is being sent in chunks and has not come whole, which replaces `known`
     /// with the last chunk; `None` when no list is on its way.
     staged: Option<HashSet<Mac>>,
@@ -605,6 +618,7 @@ impl Devices {
             first_seen: None,
             state: KnownList::Waiting,
             known: HashSet::new(),
+            restored: false,
             staged: None,
             devices: HashMap::new(),
             by_ip: HashMap::new(),
@@ -947,6 +961,74 @@ impl Devices {
         kept
     }
 
+    /// What is kept of the inventory ([`SavedDevices`]): the pushed exempt and block lists, the
+    /// pushed mode (`None` while no policy has been pushed), the labels in the desktop's order,
+    /// and the known set. The three sets come sorted, each MAC once, so that the same state is
+    /// always the same copy. The configuration's lists, the gates, the staged chunks of a push
+    /// and the devices heard are not kept. It copies at most 64 + 64 + 64 + 1024 MACs and 64
+    /// labels, and takes no lock of its own.
+    pub fn kept(&self) -> SavedDevices {
+        let sorted = |set: &HashSet<Mac>| {
+            let mut macs: Vec<Mac> = set.iter().copied().collect();
+            macs.sort_unstable();
+            macs
+        };
+        SavedDevices {
+            exempt: sorted(&self.exempt_pushed),
+            block: sorted(&self.block_pushed),
+            exempt_default: self.default_pushed,
+            labels: self.labels.clone(),
+            known: sorted(&self.known),
+        }
+    }
+
+    /// Takes back what [`Devices::kept`] gave, at the start, before anything is heard or pushed:
+    /// the pushed lists, the pushed mode, the labels and the known set replace what the inventory
+    /// holds, capped as the setters cap (the first [`MAX_EXEMPT`] and [`MAX_BLOCK`] different
+    /// MACs, the first [`MAX_LABELS`] labels with each MAC once, the first [`MAX_KNOWN`] different
+    /// known MACs). The sets the DNS side reads and the mode are republished as a push does.
+    ///
+    /// It logs nothing, and leaves the known list `Waiting`: the API still says `waiting`, and the
+    /// desktop, which treats a Pi that waits as one that restarted, pushes its lists again. A
+    /// device on the restored known set is known from its first sighting. If the set is not empty
+    /// it also stands in for the desktop's list: when [`LEARN_AFTER_SECS`] pass with none, the
+    /// held newcomers are raised and not learned ([`Devices::tick`]). An empty set stands in for
+    /// nothing, and the learning is as ever.
+    ///
+    /// The revision moves by one if the pushed lists, the mode or the labels end up other than
+    /// they were, as any change of them does, and not otherwise: a restore of the same state
+    /// changes nothing, and the known set has no part in the revision. At a start nobody has read
+    /// the revision yet, and it is a number of this boot's own already.
+    pub fn restore(&mut self, saved: SavedDevices) {
+        let exempt = first_different(saved.exempt, MAX_EXEMPT);
+        let block = first_different(saved.block, MAX_BLOCK);
+        let mut labels: Vec<(Mac, Label)> = Vec::new();
+        for (mac, label) in saved.labels {
+            if labels.len() >= MAX_LABELS {
+                break;
+            }
+            if !labels.iter().any(|(held, _)| *held == mac) {
+                labels.push((mac, label));
+            }
+        }
+        let changed = exempt != self.exempt_pushed
+            || block != self.block_pushed
+            || saved.exempt_default != self.default_pushed
+            || labels != self.labels;
+        if changed {
+            self.rev += 1;
+        }
+        self.exempt_pushed = exempt;
+        self.block_pushed = block;
+        self.default_pushed = saved.exempt_default;
+        self.labels = labels;
+        self.known = first_different(saved.known, MAX_KNOWN);
+        self.restored = !self.known.is_empty();
+        // The blocked set is up to date before the mode that reads it is turned on.
+        self.refresh_exempt();
+        self.publish_mode();
+    }
+
     /// Sets the Pi's own hardware address, which is never a device, and drops it from the
     /// inventory if it got in.
     pub fn set_own_mac(&mut self, mac: Mac) {
@@ -1050,22 +1132,9 @@ impl Devices {
         // A list that says what the one before did is not news for the log.
         let news = self.state != KnownList::Received || self.known.len() != kept;
         self.known = set;
+        self.restored = false;
         self.state = KnownList::Received;
-        for mac in std::mem::take(&mut self.held) {
-            if !self.known.contains(&mac) {
-                self.raise_new_device(mac);
-            }
-        }
-        let mut unlisted: Vec<(u64, Mac)> = self
-            .devices
-            .iter()
-            .filter(|(mac, device)| device.alerted_at.is_none() && !self.known.contains(mac))
-            .map(|(&mac, device)| (device.seen, mac))
-            .collect();
-        unlisted.sort_unstable();
-        for (_, mac) in unlisted {
-            self.raise_new_device(mac);
-        }
+        self.raise_unknown();
         if news {
             log::info!("watch: known list of {kept} devices received");
         }
@@ -1075,12 +1144,27 @@ impl Devices {
     /// Does what is due by now: if no known list has come [`LEARN_AFTER_SECS`] after the first
     /// device was seen, every device seen so far joins the known set, silently, and the held
     /// alerts are dropped. With no device seen there is nothing to learn, and nothing happens.
+    ///
+    /// When the known set was restored from the card ([`Devices::restore`]) it stands in for the
+    /// desktop's list instead: the devices that are not on it are raised, the held ones and any
+    /// never alerted, as a list that came would raise them, none is learned, and the state becomes
+    /// `Learned` all the same. One line says how many devices the restored set had.
     pub fn tick(&mut self) {
         let (mono, _) = (self.clock)();
         let Some(first) = self.first_seen else {
             return;
         };
         if self.state != KnownList::Waiting || mono < first.saturating_add(LEARN_AFTER_SECS) {
+            return;
+        }
+        if self.restored {
+            self.restored = false;
+            self.state = KnownList::Learned;
+            self.raise_unknown();
+            log::info!(
+                "watch: no known list came; the saved one of {} devices stands",
+                self.known.len()
+            );
             return;
         }
         // What chunks of a list have put in the set stays; the devices heard join it.
@@ -1587,6 +1671,27 @@ impl Devices {
                     self.raise_new_device(mac);
                 }
             }
+        }
+    }
+
+    /// Decides the held alerts against the known set as it is now: those for MACs on it are
+    /// dropped and the others raised, then every device in the inventory that is not on it and was
+    /// never alerted is raised too, the one seen first first.
+    fn raise_unknown(&mut self) {
+        for mac in std::mem::take(&mut self.held) {
+            if !self.known.contains(&mac) {
+                self.raise_new_device(mac);
+            }
+        }
+        let mut unlisted: Vec<(u64, Mac)> = self
+            .devices
+            .iter()
+            .filter(|(mac, device)| device.alerted_at.is_none() && !self.known.contains(mac))
+            .map(|(&mac, device)| (device.seen, mac))
+            .collect();
+        unlisted.sort_unstable();
+        for (_, mac) in unlisted {
+            self.raise_new_device(mac);
         }
     }
 
@@ -2608,6 +2713,261 @@ mod tests {
         assert_eq!(devices.view().known_list, KnownList::Learned);
         assert!(devices.known.contains(&mac(5)));
         assert!(devices.known.contains(&mac(9)));
+    }
+
+    /// What the kept state of an inventory holds: pushed lists of 5 and 6 (exempt) and 7 (blocked),
+    /// the exempt-by-default mode, two labels in an order that is not the MACs', and the known
+    /// MACs 9 and 5.
+    fn some_kept() -> SavedDevices {
+        SavedDevices {
+            exempt: macs(&[5, 6]),
+            block: macs(&[7]),
+            exempt_default: Some(true),
+            labels: vec![(mac(6), label("Phone")), (mac(5), label("Desk PC"))],
+            known: macs(&[5, 9]),
+        }
+    }
+
+    #[test]
+    fn what_is_kept_restores_into_another_inventory_and_is_kept_again_as_it_was() {
+        let (mut first, _) = setup();
+        first.set_exempt(macs(&[6, 5, 6]));
+        first.set_policy(true, macs(&[7]));
+        first.load_labels(
+            vec![(mac(6), label("Phone")), (mac(5), label("Desk PC"))],
+            false,
+            true,
+        );
+        first.set_known(macs(&[9, 5]));
+        let kept = first.kept();
+        assert_eq!(kept, some_kept());
+
+        let (mut second, _) = setup();
+        second.restore(kept.clone());
+        assert_eq!(second.kept(), kept);
+        // A state with nothing pushed is kept as nothing, and the mode as none.
+        let (empty, _) = setup();
+        assert_eq!(empty.kept(), SavedDevices::default());
+        assert_eq!(empty.kept().exempt_default, None);
+        // The configuration's lists are not part of it.
+        let (mut configured, _) = setup();
+        configured.set_exempt_config(macs(&[5]));
+        configured.set_block_config(macs(&[6]));
+        configured.set_exempt_default_config(true);
+        assert_eq!(configured.kept(), SavedDevices::default());
+    }
+
+    #[test]
+    fn a_restored_state_is_what_a_push_would_have_made_of_the_view() {
+        let (mut devices, _) = setup();
+        devices.restore(some_kept());
+        let view = devices.view();
+        assert_eq!(view.exempt_pushed, macs(&[5, 6]));
+        assert_eq!(view.block_pushed, macs(&[7]));
+        assert!(view.exempt_default);
+        hear_all(&mut devices, &[5, 6]);
+        let view = devices.view();
+        let label_of = |last: u8| {
+            let device = view.devices.iter().find(|d| d.mac == mac(last)).unwrap();
+            (
+                device.label.as_deref().map(str::to_owned),
+                device.label_rank,
+            )
+        };
+        assert_eq!(label_of(6), (Some("Phone".into()), Some(0)));
+        assert_eq!(label_of(5), (Some("Desk PC".into()), Some(1)));
+    }
+
+    #[test]
+    fn a_restore_publishes_the_exempt_list_and_the_mode_to_the_dns_side() {
+        let (mut devices, _, exemption) = exempt_setup();
+        hear_all(&mut devices, &[5, 6, 7]);
+        // The list mode: nothing pushed yet, nothing exempt.
+        assert!(exempt_hosts(&exemption).is_empty() && !exemption.by_default());
+        devices.restore(SavedDevices {
+            exempt: macs(&[5, 6]),
+            block: macs(&[7]),
+            exempt_default: Some(false),
+            ..SavedDevices::default()
+        });
+        assert_eq!(exempt_hosts(&exemption), [5, 6]);
+        assert_eq!(blocked_hosts(&exemption), [1, 2, 7]);
+        assert!(!exemption.by_default() && !devices.exempt_default());
+        // The mode of a restored policy is the one in force, as a pushed one is.
+        devices.restore(SavedDevices {
+            exempt_default: Some(true),
+            block: macs(&[7]),
+            ..SavedDevices::default()
+        });
+        assert!(exemption.by_default() && devices.exempt_default());
+        assert!(exempt_hosts(&exemption).is_empty());
+        assert_eq!(blocked_hosts(&exemption), [1, 2, 7]);
+        assert!(!exemption.is_exempt(IpAddr::V4(ip(7))));
+        assert!(exemption.is_exempt(IpAddr::V4(ip(5))));
+        // A restore of no policy gives the mode back to the configuration's.
+        devices.restore(SavedDevices::default());
+        assert!(!exemption.by_default());
+        assert_eq!(blocked_hosts(&exemption), [1, 2]);
+    }
+
+    #[test]
+    fn a_restore_leaves_the_known_list_waiting_and_raises_nothing() {
+        let (mut devices, _) = setup();
+        devices.restore(some_kept());
+        let view = devices.view();
+        assert_eq!(view.known_list, KnownList::Waiting);
+        assert_eq!(view.known_list.as_str(), "waiting");
+        // Nothing waits to be taken: a restore raises no alert.
+        assert_eq!(devices.raised(), []);
+        // The log lines that a push makes are still due for the first push.
+        assert!(!devices.exempt_received && devices.policy_logged.is_none());
+    }
+
+    #[test]
+    fn a_restored_known_device_is_never_held_or_raised() {
+        let (mut devices, clock) = setup();
+        devices.restore(SavedDevices {
+            known: macs(&[5, 6]),
+            ..SavedDevices::default()
+        });
+        devices.on_arp(&arp(mac(5), ip(5)));
+        devices.on_arp(&arp(mac(6), ip(6)));
+        assert!(devices.held.is_empty());
+        assert!(devices.view().devices.iter().all(|d| d.known));
+        // A newcomer is held, as before a list comes.
+        devices.on_arp(&arp(mac(7), ip(7)));
+        assert_eq!(devices.held, [mac(7)]);
+        clock.advance(600);
+        devices.tick();
+        // Only the newcomer is raised.
+        assert_eq!(devices.raised(), [new_device(mac(7))]);
+    }
+
+    #[test]
+    fn with_a_restored_set_the_ten_minutes_raise_the_held_newcomers_and_do_not_learn_them() {
+        let (mut devices, clock) = setup();
+        devices.restore(SavedDevices {
+            known: macs(&[5]),
+            ..SavedDevices::default()
+        });
+        devices.on_arp(&arp(mac(5), ip(5)));
+        devices.on_arp(&arp(mac(6), ip(6)));
+        devices.on_arp(&arp(mac(7), ip(7)));
+        clock.advance(599);
+        devices.tick();
+        assert_eq!(devices.view().known_list, KnownList::Waiting);
+        assert_eq!(devices.raised(), []);
+        clock.advance(1);
+        devices.tick();
+        assert_eq!(devices.view().known_list, KnownList::Learned);
+        assert_eq!(devices.raised(), [new_device(mac(6)), new_device(mac(7))]);
+        // They were not learned: the known set is the restored one.
+        assert_eq!(devices.kept().known, macs(&[5]));
+        let known: Vec<(u8, bool)> = {
+            let mut list: Vec<_> = devices
+                .view()
+                .devices
+                .iter()
+                .map(|d| (d.mac.0[5], d.known))
+                .collect();
+            list.sort_unstable();
+            list
+        };
+        assert_eq!(known, [(5, true), (6, false), (7, false)]);
+        // The state is settled: later ticks do nothing, and a newcomer is raised at once.
+        clock.advance(10_000);
+        devices.tick();
+        assert_eq!(devices.raised().len(), 2);
+        devices.on_arp(&arp(mac(8), ip(8)));
+        assert_eq!(devices.raised()[2], new_device(mac(8)));
+    }
+
+    #[test]
+    fn with_no_restored_set_the_ten_minutes_learn_as_they_always_did() {
+        // Nothing restored, and a restore that had no known set: the same.
+        for restored in [false, true] {
+            let (mut devices, clock) = setup();
+            if restored {
+                devices.restore(SavedDevices {
+                    exempt: macs(&[5]),
+                    labels: vec![(mac(5), label("Desk PC"))],
+                    ..SavedDevices::default()
+                });
+            }
+            devices.on_arp(&arp(mac(5), ip(5)));
+            devices.on_arp(&arp(mac(6), ip(6)));
+            clock.advance(600);
+            devices.tick();
+            assert_eq!(devices.view().known_list, KnownList::Learned);
+            assert!(devices.view().devices.iter().all(|d| d.known));
+            assert_eq!(devices.raised(), [], "restored: {restored}");
+        }
+    }
+
+    #[test]
+    fn a_list_from_the_desktop_after_a_restore_is_applied_as_any_list_is() {
+        let (mut devices, clock) = setup();
+        devices.restore(SavedDevices {
+            known: macs(&[5]),
+            ..SavedDevices::default()
+        });
+        devices.on_arp(&arp(mac(5), ip(5)));
+        devices.on_arp(&arp(mac(6), ip(6)));
+        // The desktop's list wins over the restored one, and stops the stand-in.
+        assert_eq!(devices.set_known(macs(&[6])), 1);
+        assert_eq!(devices.view().known_list, KnownList::Received);
+        assert_eq!(devices.raised(), [new_device(mac(5))]);
+        clock.advance(10_000);
+        devices.tick();
+        assert_eq!(devices.view().known_list, KnownList::Received);
+        assert_eq!(devices.raised().len(), 1);
+    }
+
+    #[test]
+    fn a_restore_is_capped_as_the_setters_cap() {
+        let (mut devices, _) = setup();
+        let mut exempt: Vec<Mac> = (0..100).map(mac2).collect();
+        exempt.insert(3, mac2(0));
+        devices.restore(SavedDevices {
+            exempt,
+            block: (0..100).map(mac2).collect(),
+            labels: (0..100)
+                .map(|n| (mac2(n % 70), label("x")))
+                .collect::<Vec<_>>(),
+            known: (0..2000).map(mac2).collect(),
+            exempt_default: None,
+        });
+        let kept = devices.kept();
+        assert_eq!(kept.exempt, (0..64).map(mac2).collect::<Vec<_>>());
+        assert_eq!(kept.block, (0..64).map(mac2).collect::<Vec<_>>());
+        assert_eq!(kept.labels.len(), MAX_LABELS);
+        assert_eq!(kept.known.len(), MAX_KNOWN);
+        // Each MAC of the labels is there once.
+        let mut macs_of: Vec<Mac> = kept.labels.iter().map(|(mac, _)| *mac).collect();
+        macs_of.sort_unstable();
+        macs_of.dedup();
+        assert_eq!(macs_of.len(), MAX_LABELS);
+    }
+
+    #[test]
+    fn a_restore_moves_the_revision_only_when_it_changes_what_a_push_could_change() {
+        let (mut devices, _) = setup();
+        let start = devices.rev();
+        // The known set alone is no part of the revision.
+        devices.restore(SavedDevices {
+            known: macs(&[5]),
+            ..SavedDevices::default()
+        });
+        assert_eq!(devices.rev(), start);
+        devices.restore(some_kept());
+        assert_eq!(devices.rev(), start + 1);
+        // The same again changes nothing.
+        devices.restore(some_kept());
+        assert_eq!(devices.rev(), start + 1);
+        let mut other = some_kept();
+        other.labels.reverse();
+        devices.restore(other);
+        assert_eq!(devices.rev(), start + 2);
     }
 
     /// An inventory for a network whose router is 192.0.2.1 and where the Pi is 192.0.2.2, the

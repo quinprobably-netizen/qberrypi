@@ -43,7 +43,11 @@
 //! among it, and a thread of it may fail as the main one may. The card is used
 //! by one thread at a time (a claim on `BOARD`, which a fatal error's rescue goes by too); the
 //! activity LED goes by the same board, so that nothing is written over what a fatal error
-//! shows; the API adds no use of the card.
+//! shows; the API adds no use of the card. The saver of the owner's settings (`state`, on by default) is
+//! the one component that writes it while the board runs, through the same claim: it mounts the card
+//! only once, to make its two files, and from then on overwrites its own sectors of the partition
+//! device in place (see [`crate::state::card`]); at the owner's restart it saves first, on init's own
+//! thread, before the log.
 
 use std::cell::Cell;
 use std::convert::Infallible;
@@ -60,7 +64,7 @@ use std::thread::{self, ThreadId};
 use std::time::{Duration, Instant};
 
 use log::Level;
-use tokio::sync::{Notify, watch};
+use tokio::sync::watch;
 
 use crate::bootpart::{self, ACTIVE_CONFIG, BOOT_DEV, MOUNT_POINT, OWN_DIR, Restore};
 use crate::config::{self, Config, Fault};
@@ -74,8 +78,10 @@ use crate::net;
 use crate::netlink::Route;
 use crate::netlink::nl80211::Nl80211;
 use crate::panel::{self, Deps, PanelEnd};
-use crate::services::{self, Context};
+use crate::services::{self, Context, Persist};
 use crate::slots::{self, BootAction, Marker, Select, Slot as BootSlot};
+use crate::state::card::{self, BootRead, CardError, CardUse, Device, Fibmap};
+use crate::state::saver::Flusher;
 use crate::supervisor::{self, Component, Ended, Hooks, Plan, Reason};
 use crate::sys::{self, Watchdog};
 use crate::update::{self, BootCard, CardAccess, Cause, Outcome, Restart, UpdateCtl};
@@ -147,6 +153,11 @@ const LOG_LOCK_WAIT: Duration = Duration::from_millis(200);
 /// How often a wait for a lock looks whether it has been let go of.
 const LOCK_POLL: Duration = Duration::from_millis(5);
 
+/// How long the owner's restart waits for the saver's save that is under way, to flush its own.
+///
+/// Short: the watchdog's 15 seconds are shared with the claim's wait and the write itself.
+const FLUSH_WAIT: Duration = Duration::from_secs(3);
+
 /// How long a claim on the card waits for another thread that has it before it gives up.
 ///
 /// A save or a rescue mounts, writes, syncs and unmounts: a few seconds on a slow card. When the
@@ -161,6 +172,10 @@ static CONFIG: OnceLock<Config> = OnceLock::new();
 /// The TLS key and certificate that the card holds as `qberrypi/tls.pem`, from step 3 on: `None`
 /// if there is no such file or it could not be read. It is the API's, and holds a secret.
 static TLS_PEM: OnceLock<Option<Vec<u8>>> = OnceLock::new();
+/// What step 3 read of the owner's two saved copies, in the same read-only mount that read the
+/// configuration: `None` when the configuration keeps nothing (`[state] persist = false`) or did
+/// not load. It is the state that a start restores, and what the saves go on from.
+static STATE_READ: OnceLock<BootRead> = OnceLock::new();
 /// Who has the card and whose fatal error has begun, so that two threads never mount and unmount
 /// the card under each other (the log's saves, the way out and a rescue on another thread) and
 /// the LED shows what a fatal error put there. Held only for a change of that state and for the
@@ -411,6 +426,52 @@ impl BootCard for InitCard {
     }
 }
 
+/// The boot partition as init lends it to the saver of the owner's settings ([`CardUse`]): a claim
+/// for the raw writes, which mounts nothing, and one writable mount, for the creation, which is
+/// [`InitCard`]'s. Each claim is the one every other writer goes by: refused while a fatal error's
+/// rescue has the card, waiting up to `CARD_LOCK_WAIT` for another use. It blocks its thread, so
+/// the saver calls it from the blocking pool, or from init's own thread on the way out.
+struct InitStateCard;
+
+impl CardUse for InitStateCard {
+    fn claimed(&self, work: &mut dyn FnMut()) -> Result<(), CardError> {
+        pet_watchdog();
+        let used = claimed_on(&BOARD, CARD_LOCK_WAIT, &first_fatal, work);
+        pet_watchdog();
+        used
+    }
+
+    fn mounted_writable(&self, work: &mut dyn FnMut(&Path)) -> Result<(), CardError> {
+        pet_watchdog();
+        InitCard
+            .with_boot(CardAccess::Writable, work)
+            .map_err(|error| {
+                if refused_the_card(&error) {
+                    CardError::Refused(error)
+                } else {
+                    CardError::Failed(error)
+                }
+            })
+    }
+}
+
+/// Runs `work` with the card claimed on `board`, as `claim_card` gives it, and lets go of the claim
+/// when `work` is done. The partition is not mounted: `work` writes its own sectors of the device.
+///
+/// A claim that is refused (a fatal error's rescue has the card, or another use has had it for
+/// longer than `wait`) is `CardError::Refused`, and `work` has not run.
+fn claimed_on(
+    board: &Mutex<Board>,
+    wait: Duration,
+    fatal_thread: &dyn Fn() -> Option<ThreadId>,
+    work: &mut dyn FnMut(),
+) -> Result<(), CardError> {
+    let claim = claim_card(board, wait, fatal_thread).map_err(CardError::Refused)?;
+    work();
+    drop(claim);
+    Ok(())
+}
+
 /// Step 2: makes sure the clock does not show a time before this build.
 fn keep_clock_after_build() {
     match sys::clock_at_least(BUILD_EPOCH) {
@@ -453,42 +514,74 @@ fn load_config(card: &mut dyn Card) -> Result<Config, String> {
 
 /// `load_config`, with the place that keeps the TLS file in the caller's hands.
 ///
-/// Both files are read in the one read-only mount. The TLS file is kept whether or not the
-/// configuration has an `[api]` section: what to do with it is the API's to decide. One that
-/// cannot be read is logged, without a byte of it, and kept as none; the configuration still
-/// loads, because the API is not what the system is for. A configuration that does not load
-/// keeps nothing.
+/// The files are read in the one read-only mount (see `read_boot_files`). The TLS file is kept
+/// whether or not the configuration has an `[api]` section: what to do with it is the API's to
+/// decide. One that cannot be read is logged, without a byte of it, and kept as none; the
+/// configuration still loads, because the API is not what the system is for. A configuration that
+/// does not load keeps nothing.
 fn load_config_into(
     card: &mut dyn Card,
     tls: &OnceLock<Option<Vec<u8>>>,
 ) -> Result<Config, String> {
-    let (text, pem) = with_card(card, Access::ReadOnly, |boot| {
-        (
-            bootpart::read_config_text(boot, OWN_DIR),
-            bootpart::read_tls(boot, OWN_DIR),
-        )
+    let files = with_card(card, Access::ReadOnly, |boot| {
+        read_boot_files(boot, OWN_DIR)
     })
     .map_err(|error| format!("mounting {BOOT_DEV}: {error}"))?;
-    finish_config(text, pem, tls)
+    finish_config(files, tls)
 }
 
-/// Parses what was read of the configuration, and keeps the TLS file in `tls` once the
-/// configuration has loaded (see `load_config_into`).
-fn finish_config(
-    text: io::Result<String>,
+/// What step 3 reads of the card in its one read-only mount, for `finish_config`.
+struct BootFiles {
+    /// The configuration, read and parsed: the fatal message if it did not load.
+    config: Result<Config, String>,
+    /// The API's key and certificate: none if there is no such file.
     pem: io::Result<Option<Vec<u8>>>,
-    tls: &OnceLock<Option<Vec<u8>>>,
-) -> Result<Config, String> {
-    let text = text.map_err(|error| format!("qberrypi.toml: {error}"))?;
-    // The parser's errors name the file themselves.
-    let cfg = config::parse(&text).map_err(|error| error.to_string())?;
-    let pem = pem.unwrap_or_else(|error| {
+    /// The two saved copies, as `card::read_at_boot` found them, when the configuration loaded and
+    /// keeps the settings (`[state] persist`); otherwise nothing of them is read.
+    state: Option<BootRead>,
+}
+
+/// Reads, in the mount that is open at `boot`, the configuration of the folder `dir` (and parses
+/// it), the TLS file beside it and, when the configuration keeps the settings, the two saved
+/// copies of the folder that lies beside the slots, both read whole and mapped
+/// (`card::read_at_boot`).
+///
+/// The configuration is parsed here, in the mount, because the switch that says whether to read the
+/// copies is in it; a configuration that does not parse is reported later, by `finish_config`, so
+/// that what the callers do first (the boot rules of a slot card) still comes first. The copies cost
+/// two reads of about 80 KiB. The error text is the one the fatal message carries: the parser's
+/// errors name the file themselves.
+fn read_boot_files(boot: &Path, dir: &str) -> BootFiles {
+    let config = bootpart::read_config_text(boot, dir)
+        .map_err(|error| format!("qberrypi.toml: {error}"))
+        .and_then(|text| config::parse(&text).map_err(|error| error.to_string()));
+    let pem = bootpart::read_tls(boot, dir);
+    let state = config
+        .as_ref()
+        .is_ok_and(|cfg| cfg.state.persist)
+        .then(|| card::read_at_boot(boot, &Device::block_device(BOOT_DEV), &Fibmap));
+    BootFiles { config, pem, state }
+}
+
+/// Keeps what was read besides the configuration, once the configuration has loaded: the TLS file
+/// in `tls` and the saved copies in `STATE_READ` (see `load_config_into`).
+fn finish_config(files: BootFiles, tls: &OnceLock<Option<Vec<u8>>>) -> Result<Config, String> {
+    let cfg = files.config?;
+    let pem = files.pem.unwrap_or_else(|error| {
         log::warn!("tls.pem: {error}; the API will stay off");
         None
     });
     // Whichever is first stays; there is only ever one load of the card.
     let _ = tls.set(pem);
+    if let Some(state) = files.state {
+        let _ = STATE_READ.set(state);
+    }
     Ok(cfg)
+}
+
+/// What step 3 read of the saved copies, from step 3 on: `None` if the configuration keeps nothing.
+fn state_read() -> Option<&'static BootRead> {
+    STATE_READ.get()
 }
 
 /// The most bytes of the root `config.txt` that are read to find which slot it selects.
@@ -532,10 +625,9 @@ fn load_slot_config(
     began: tokio::time::Instant,
 ) -> Result<Config, String> {
     let dir = me.dir();
-    let (text, pem, selected, marker) = with_card_on(board, card, Access::ReadOnly, |boot| {
+    let (files, selected, marker) = with_card_on(board, card, Access::ReadOnly, |boot| {
         (
-            bootpart::read_config_text(boot, dir),
-            bootpart::read_tls(boot, dir),
+            read_boot_files(boot, dir),
             read_selected_slot(boot),
             slots::read_marker(boot),
         )
@@ -548,7 +640,7 @@ fn load_slot_config(
     if applied.restart_now {
         sys::reboot();
     }
-    finish_config(text, pem, tls)
+    finish_config(files, tls)
 }
 
 /// What the boot rules did in step 3, for the caller to log and to act on.
@@ -960,6 +1052,7 @@ fn panel_deps(cfg: &Config, slot: &Arc<Slot>) -> Deps {
         control: slot.clone(),
         calibration: cfg.panel.calibration(),
         calibrate: cfg.debug.calibrate_touch,
+        sensitivity: cfg.panel.sensitivity(),
         lane: slot.lane(),
         alerts: slot.clone(),
         devices: slot.clone(),
@@ -1390,7 +1483,7 @@ async fn serve(
     // it is there from the panel's first frame, for a boot that is on trial.
     slot.fill_system(Arc::new(LiveSystem::new(
         update.clone(),
-        slot.rejoin_notify(),
+        slot.rejoin_signal(),
     )));
     let signal = SignalCache::new();
     // The services and the tick get a receiver of the Wi-Fi's status; the Wi-Fi component owns the sender.
@@ -1405,6 +1498,8 @@ async fn serve(
     // Nothing here waits: the services make what they share when the supervisor starts the first
     // of them, and the Wi-Fi and the panel start beside that.
     let saves = LogSaves::new();
+    // Where the saver of the owner's settings is found once it is made, for the owner's restart.
+    let flusher = Flusher::new();
     // The two trial faults act on a boot that is on trial, and are no fault on any other.
     let fault = fault::effective(cfg.debug.fault, update.trial().is_some());
     let components = components(
@@ -1418,6 +1513,12 @@ async fn serve(
             // The card's `tls.pem`, which `cfg.api` says whether to serve with.
             tls_pem: tls_pem(),
             update: update.clone(),
+            // What step 3 read of the saved copies, and the card to save them on.
+            persist: Persist {
+                boot: state_read(),
+                card: Arc::new(InitStateCard),
+                flusher: flusher.clone(),
+            },
         },
         &BoardParts {
             cfg,
@@ -1456,7 +1557,8 @@ async fn serve(
     };
     let reason = supervisor::run(plan, hooks).await;
     // On `Restart` the card stays claimed, from `leave` to the restart.
-    match leave(cfg, &mut SdCard, log, &reason, &saves, &BOARD) {
+    let keep = || flusher.flush(FLUSH_WAIT);
+    match leave(cfg, &mut SdCard, log, &reason, &saves, &BOARD, &keep) {
         Leaving::Restart => restart_board(&reason),
         Leaving::Park => loop {
             thread::park();
@@ -1746,8 +1848,8 @@ fn wifi_component(parts: &BoardParts) -> Option<Component> {
     let (cfg, log, wlan_present) = (parts.cfg, parts.log, parts.wlan_present);
     let status = parts.status_sender.take()?;
     let saves = parts.saves.clone();
-    // The owner's rejoin is the slot's notify, which outlives each start of this component.
-    let rejoin = parts.slot.rejoin_notify();
+    // The owner's rejoin is the slot's signal, which outlives each start of this component.
+    let rejoin = parts.slot.rejoin_signal();
     Some(Component::task("wifi", true, move || {
         wifi_service(
             cfg,
@@ -1767,7 +1869,7 @@ async fn wifi_service(
     wlan_present: bool,
     sender: watch::Sender<WifiStatus>,
     saves: Arc<LogSaves>,
-    rejoin: Arc<Notify>,
+    rejoin: Arc<wifi::RejoinSignal>,
 ) -> Ended {
     let mut status = sender.subscribe();
     let mut report = |next: WifiStatus| {
@@ -1811,13 +1913,13 @@ async fn wifi_service(
 /// be made there is nothing to join as: either is logged, and the task then
 /// waits for ever. An interface that cannot be opened is tried again every
 /// `REOPEN_EVERY`. Once `wifi::run` has the interface it never gives it back,
-/// `report` hears each change of status, and `rejoin` is what the owner notifies to have a held link
+/// `report` hears each change of status, and `rejoin` is what the owner asks to have a held link
 /// ended and joined again.
 async fn wifi_task(
     cfg: &Config,
     wlan_present: bool,
     report: &mut (dyn FnMut(WifiStatus) + Send),
-    rejoin: &Notify,
+    rejoin: &wifi::RejoinSignal,
 ) -> Infallible {
     if !wlan_present {
         log::warn!("wifi: wlan0 is absent, not joining");
@@ -1945,6 +2047,11 @@ fn net_line(net: &config::Net) -> String {
 /// one that has not is not waited for. The card is claimed on `board` and, when the answer is
 /// `Restart`, the claim is not let go of: the restart follows at once, and no save of the pool
 /// may mount the card under it.
+///
+/// The owner's restart (`Cause::Owner`) first has `keep` save the owner's settings, if they differ
+/// from the newest saved copy, before the log is saved: it makes its own claim on the card and
+/// lets go of it, so that the log's save and the restart are as they were. No other reason does,
+/// and none does while a fatal error has begun on another thread, whose rescue has the card.
 fn leave(
     cfg: &Config,
     card: &mut dyn Card,
@@ -1952,8 +2059,18 @@ fn leave(
     reason: &Reason,
     saves: &LogSaves,
     board: &Mutex<Board>,
+    keep: &dyn Fn(),
 ) -> Leaving {
+    if is_owner_restart(reason) && board_is_ours(first_fatal(), thread::current().id()) {
+        pet_watchdog();
+        keep();
+    }
     wind_down(cfg, card, log, reason, saves, board, &first_fatal)
+}
+
+/// Whether `reason` is the restart that the owner asked for from the front panel.
+fn is_owner_restart(reason: &Reason) -> bool {
+    matches!(reason, Reason::Restart(Restart::Plain(Cause::Owner)))
 }
 
 /// What the main thread does once the supervisor has ended.
@@ -2701,6 +2818,7 @@ mod tests {
 
     use crate::live::Snapshot;
     use crate::modules::DEFAULT_TABLE;
+    use crate::panel::touch::Sensitivity;
     use crate::services::testutil::Jam;
 
     const EXAMPLE: &str = include_str!("../../../qberrypi.example.toml");
@@ -2873,8 +2991,9 @@ mod tests {
         let held = wait_until(200 * MS, 5 * MS, 20 * MS, &mut || pets += 1, &mut || false);
         assert!(!held);
         assert!(start.elapsed() >= 200 * MS);
-        // One at once and one every 20 ms after it: eleven if none is late.
-        assert!((4..=11).contains(&pets), "{pets} pets");
+        // One at once and one every 20 ms after it: eleven if none is late, and at least the one
+        // at once, one on the way out and one between them on a host that is late with most.
+        assert!((3..=11).contains(&pets), "{pets} pets");
     }
 
     #[test]
@@ -3001,10 +3120,10 @@ mod tests {
                 File::create(late).unwrap();
             }
         });
-        let found = wait_until(2000 * MS, 5 * MS, LONG, &mut || {}, &mut || late.exists());
+        let found = wait_until(LONG, 5 * MS, LONG, &mut || {}, &mut || late.exists());
         let waited = start.elapsed();
         assert!(found);
-        assert!(waited >= 150 * MS && waited < 2000 * MS, "{waited:?}");
+        assert!(waited >= 150 * MS && waited < LONG, "{waited:?}");
         creator.join().unwrap();
 
         let never = tmp.path().join("never");
@@ -3677,6 +3796,7 @@ mod tests {
             &Reason::ComponentFailed("dns"),
             &LogSaves::new(),
             &own_board(),
+            &|| {},
         );
         assert_eq!(left, Leaving::Restart);
         assert!(card.ops.is_empty());
@@ -3690,6 +3810,7 @@ mod tests {
             &Reason::ReturnAfter,
             &LogSaves::new(),
             &own_board(),
+            &|| {},
         );
         assert_eq!(left, Leaving::Restart);
         assert_eq!(card.ops, WRITE_OPS);
@@ -3991,12 +4112,43 @@ mod tests {
         }
     }
 
+    // The tests that use the card all go through the one claim on the process-wide `BOARD`, and a
+    // claim gives up on a thread that has waited `CARD_LOCK_WAIT`. Beside each other on a busy
+    // host, enough of them with a slow card in hand keep a later one waiting for longer than that
+    // (and it finds the card in use, and does nothing). So they take turns.
+
+    /// A turn at the card of `BOARD`, held until it is dropped. A wrapper, so that a test that
+    /// holds it across an await does not trip the lint for a lock held across one: nothing that
+    /// takes this turn waits for anything that holds it.
+    struct CardTurn(#[allow(dead_code, reason = "held for its drop")] MutexGuard<'static, ()>);
+
+    /// Waits for the turn at the card of `BOARD`. Every test that uses it takes one for its whole
+    /// length (`rescue` below does for the length of its call).
+    fn one_card_test() -> CardTurn {
+        static TURN: Mutex<()> = Mutex::new(());
+        CardTurn(lock(&TURN))
+    }
+
+    /// `rescue` on the card of `BOARD`, in its turn.
+    fn rescue(
+        cfg: Option<&Config>,
+        card: &mut dyn Card,
+        log: Option<&Mutex<LogBuf>>,
+        wait: Duration,
+        pet: &mut dyn FnMut(),
+    ) {
+        let _turn = one_card_test();
+        super::rescue(cfg, card, log, wait, pet);
+    }
+
     // The log's saves while the board serves.
 
     /// A card whose mount takes a while, and that counts its mounts.
     struct SlowCard {
         card: FakeCard,
         mount_takes: Duration,
+        /// For a card that is held: the mount waits until this is set, instead of for a time.
+        open: Option<Arc<AtomicBool>>,
         mounts: Arc<AtomicUsize>,
     }
 
@@ -4006,9 +4158,20 @@ mod tests {
             let card = Self {
                 card: FakeCard::new(),
                 mount_takes,
+                open: None,
                 mounts: mounts.clone(),
             };
             (card, mounts)
+        }
+
+        /// A card whose mount waits until the test sets the flag that this returns, which is as
+        /// slow as a test needs on a host of any speed. A mount that is not let go of within ten
+        /// seconds fails, so that a test that waited for it fails instead of hanging.
+        fn held() -> (Self, Arc<AtomicUsize>, Arc<AtomicBool>) {
+            let (mut card, mounts) = Self::new(Duration::ZERO);
+            let open = Arc::new(AtomicBool::new(false));
+            card.open = Some(open.clone());
+            (card, mounts, open)
         }
     }
 
@@ -4023,7 +4186,18 @@ mod tests {
 
         fn mount(&mut self, access: Access) -> io::Result<()> {
             self.mounts.fetch_add(1, Ordering::SeqCst);
-            thread::sleep(self.mount_takes);
+            match &self.open {
+                None => thread::sleep(self.mount_takes),
+                Some(open) => {
+                    let waiting_since = Instant::now();
+                    while !open.load(Ordering::SeqCst) {
+                        if waiting_since.elapsed() > Duration::from_secs(10) {
+                            return Err(io::Error::other("the test never let the mount go on"));
+                        }
+                        thread::sleep(MS);
+                    }
+                }
+            }
             self.card.mount(access)
         }
 
@@ -4048,7 +4222,7 @@ mod tests {
         let waited = Instant::now();
         while saves.running() {
             assert!(
-                waited.elapsed() < Duration::from_secs(5),
+                waited.elapsed() < Duration::from_secs(30),
                 "the save never ended"
             );
             tokio::time::sleep(10 * MS).await;
@@ -4061,7 +4235,7 @@ mod tests {
         let waited = Instant::now();
         while !saves.started() {
             assert!(
-                waited.elapsed() < Duration::from_secs(5),
+                waited.elapsed() < Duration::from_secs(30),
                 "the save never began"
             );
             tokio::time::sleep(MS).await;
@@ -4070,17 +4244,18 @@ mod tests {
 
     #[tokio::test]
     async fn a_save_from_the_tick_does_not_wait_for_the_card() {
+        let _turn = one_card_test();
         let (cfg, log) = kept(true, &["first"]);
         let saves = LogSaves::new();
-        let (card, mounts) = SlowCard::new(300 * MS);
+        let (card, mounts, open) = SlowCard::held();
 
-        let began = Instant::now();
         let started = saves.start(cfg, log, card);
 
-        // The mount takes 300 ms, and the runtime thread was never asked to wait for it.
+        // The mount waits for the test, and the runtime thread was never asked to wait for it: it
+        // is back with the save still under way.
         assert!(started);
-        assert!(began.elapsed() < 100 * MS, "{:?}", began.elapsed());
         assert!(saves.running());
+        open.store(true, Ordering::SeqCst);
         // It was saved all the same, on the pool.
         until_saved(&saves).await;
         assert_eq!(mounts.load(Ordering::SeqCst), 1);
@@ -4089,6 +4264,7 @@ mod tests {
 
     #[tokio::test]
     async fn only_one_save_runs_at_a_time_and_the_next_one_is_skipped() {
+        let _turn = one_card_test();
         let (cfg, log) = kept(true, &["first"]);
         let saves = LogSaves::new();
         let (slow, mounts) = SlowCard::new(200 * MS);
@@ -4109,6 +4285,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_boot_that_keeps_no_log_on_the_card_starts_no_save() {
+        let _turn = one_card_test();
         let (cfg, log) = kept(false, &["first"]);
         let saves = LogSaves::new();
         let (card, mounts) = SlowCard::new(MS);
@@ -4121,6 +4298,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_save_is_due_thirty_seconds_after_the_last_one_began_and_not_while_one_runs() {
+        let _turn = one_card_test();
         let secs = Duration::from_secs;
         let (cfg, log) = kept(true, &["first"]);
         let saves = LogSaves::new();
@@ -4144,6 +4322,7 @@ mod tests {
 
     #[tokio::test]
     async fn the_ticks_save_step_starts_a_due_save_and_does_not_wait_for_the_card() {
+        let _turn = one_card_test();
         let (cfg, log) = kept(true, &["first"]);
         let saves = LogSaves::new();
         let (idle, idle_mounts) = SlowCard::new(MS);
@@ -4158,8 +4337,7 @@ mod tests {
         ));
         assert_eq!(idle_mounts.load(Ordering::SeqCst), 0);
 
-        let (card, mounts) = SlowCard::new(300 * MS);
-        let began = Instant::now();
+        let (card, mounts, open) = SlowCard::held();
         let started = start_save_if_due(
             cfg,
             log,
@@ -4169,21 +4347,24 @@ mod tests {
             card,
         );
 
-        // The mount takes 300 ms, and the runtime thread was never asked to wait for it.
+        // The mount waits for the test, and the runtime thread was never asked to wait for it: it
+        // is back with the save still under way.
         assert!(started);
-        assert!(began.elapsed() < 100 * MS, "{:?}", began.elapsed());
+        assert!(saves.running());
+        open.store(true, Ordering::SeqCst);
         until_saved(&saves).await;
         assert_eq!(mounts.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
     async fn a_wait_for_the_saves_ends_at_once_when_none_runs_and_pets_while_one_does() {
+        let _turn = one_card_test();
         let (cfg, log) = kept(true, &["first"]);
         let saves = LogSaves::new();
         let pets = Cell::new(0);
         let began = Instant::now();
         assert!(saves.wait_idle(LONG, &mut || pets.set(pets.get() + 1)));
-        assert!(began.elapsed() < 100 * MS);
+        assert!(began.elapsed() < Duration::from_secs(5));
 
         // One that runs for 300 ms: the wait lasts as long, and the watchdog is petted.
         let (slow, _) = SlowCard::new(300 * MS);
@@ -4199,6 +4380,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_wait_for_a_save_that_does_not_end_gives_up_when_the_time_has_passed() {
+        let _turn = one_card_test();
         let (cfg, log) = kept(true, &["first"]);
         let saves = LogSaves::new();
         let (slow, _) = SlowCard::new(400 * MS);
@@ -4212,6 +4394,7 @@ mod tests {
 
     #[test]
     fn a_save_queued_behind_a_full_pool_is_not_waited_for_and_never_mounts_the_card() {
+        let _turn = one_card_test();
         let rt = services::runtime(None).unwrap();
         rt.block_on(async {
             let (cfg, log) = kept(true, &["first", "second"]);
@@ -4255,6 +4438,7 @@ mod tests {
 
     #[test]
     fn a_stalling_supervisor_does_not_wait_for_a_queued_save_and_it_never_mounts_the_card() {
+        let _turn = one_card_test();
         let rt = services::runtime(None).unwrap();
         rt.block_on(async {
             let (cfg, log) = kept(true, &["first", "second"]);
@@ -4291,6 +4475,7 @@ mod tests {
 
     #[test]
     fn no_save_starts_once_the_way_out_has_begun() {
+        let _turn = one_card_test();
         let rt = services::runtime(None).unwrap();
         rt.block_on(async {
             let (cfg, log) = kept(true, &["first"]);
@@ -4317,6 +4502,7 @@ mod tests {
 
     #[test]
     fn a_save_that_has_begun_when_the_way_out_does_is_still_waited_for_and_finishes() {
+        let _turn = one_card_test();
         let rt = services::runtime(None).unwrap();
         rt.block_on(async {
             let (cfg, log) = kept(true, &["first", "second"]);
@@ -4390,6 +4576,7 @@ mod tests {
 
     #[tokio::test]
     async fn the_way_out_waits_for_a_save_that_runs_before_it_uses_the_card() {
+        let _turn = one_card_test();
         let (cfg, log) = kept(true, &["first", "second"]);
         let saves = LogSaves::new();
         let (slow, _) = SlowCard::new(300 * MS);
@@ -4419,6 +4606,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_stalling_supervisor_lets_a_running_save_end_and_then_saves_the_log_itself() {
+        let _turn = one_card_test();
         let (cfg, log) = kept(true, &["first", "second"]);
         let saves = LogSaves::new();
         let (slow, _) = SlowCard::new(300 * MS);
@@ -4490,6 +4678,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_permanent_system_never_mounts_the_card_writable_from_boot_to_restart() {
+        let _turn = one_card_test();
         // Neither card switch is on: a system that is installed for good.
         let cfg: &'static Config = Box::leak(Box::new(cfg_debug(false, false)));
         let log: &'static Mutex<LogBuf> = Box::leak(Box::new(log_holding(&["banner"])));
@@ -4524,10 +4713,11 @@ mod tests {
             Reason::NoAssociation,
             Reason::ReturnAfter,
         ] {
-            leave(cfg, &mut card, log, &reason, &saves, &board);
+            leave(cfg, &mut card, log, &reason, &saves, &board, &|| {});
         }
         // A fatal error once the configuration has been read: a panic, or the board giving up.
-        rescue(Some(cfg), &mut card, Some(log), Duration::ZERO, &mut || {});
+        // This test has its turn already.
+        super::rescue(Some(cfg), &mut card, Some(log), Duration::ZERO, &mut || {});
 
         // Not a mount, read-only or writable, and the lines are still waiting in memory.
         assert!(card.ops.is_empty(), "{:?}", card.ops);
@@ -4589,7 +4779,7 @@ mod tests {
         let mut report = |status: WifiStatus| reported.push(status);
 
         // A board without the interface says so, and never joins.
-        let rejoin = Notify::new();
+        let rejoin = wifi::RejoinSignal::new();
         let task = wifi_task(&cfg, false, &mut report, &rejoin);
         assert!(timeout(Duration::from_millis(300), task).await.is_err());
         assert_eq!(CAPTURE.lines(), ["WARN wifi: wlan0 is absent, not joining"]);
@@ -4694,6 +4884,189 @@ mod tests {
         let cfg = load_config(&mut card).unwrap();
         assert_eq!(cfg.hostname, "qberrypi");
         assert_eq!(card.ops, READ_OPS);
+    }
+
+    // Step 3: the saved settings, read in the same mount as the configuration.
+
+    /// A well-formed state that differs from every other `n`: one name saved.
+    fn left_state(n: u8) -> crate::state::Saved {
+        crate::state::Saved {
+            names: vec![crate::state::SavedName {
+                name: format!("host-{n}.example.org").into(),
+                side: qb_dns::OwnerSide::Refuse,
+                set_unix: None,
+            }],
+            ..crate::state::Saved::default()
+        }
+    }
+
+    /// Writes copy `name` (`a.bin` or `b.bin`) of the saved settings into the card's state folder as
+    /// a whole file: a frame of `seq` holding `left_state(n)`, and the file's old tail.
+    fn put_copy(card: &FakeCard, name: &str, seq: u64, n: u8) {
+        use crate::state::format::{FILE_SIZE, encode_payload, frame};
+        let mut bytes = frame(seq, &encode_payload(&left_state(n)).unwrap());
+        bytes.resize(FILE_SIZE, 0x5a);
+        fs::create_dir_all(card.dir.path().join("qberrypi-state")).unwrap();
+        fs::write(card.dir.path().join("qberrypi-state").join(name), bytes).unwrap();
+    }
+
+    #[test]
+    fn the_saved_copies_are_read_in_the_one_read_only_mount_that_reads_the_config() {
+        use crate::state::store::{Loaded as Restored, Which};
+        let mut card = FakeCard::new();
+        put_copy(&card, "a.bin", 3, 1);
+        put_copy(&card, "b.bin", 2, 2);
+
+        let files = with_card(&mut card, Access::ReadOnly, |boot| {
+            read_boot_files(boot, OWN_DIR)
+        })
+        .unwrap();
+
+        assert_eq!(card.ops, READ_OPS, "one read-only mount, nothing written");
+        assert!(files.config.is_ok());
+        let read = files.state.expect("the copies were read");
+        let Restored::Found(found) = read.loaded() else {
+            panic!("no copy found: {read:?}");
+        };
+        assert_eq!((found.which, found.seq), (Which::A, 3));
+        assert_eq!(found.saved, left_state(1));
+        // A host cannot say where a file lies on the card's device, so the places are not trusted
+        // and saving is off for the boot; what was read still restores.
+        assert!(read.trouble().is_some(), "{read:?}");
+    }
+
+    #[test]
+    fn the_saved_copies_are_read_on_both_layouts_from_beside_the_slots_folders() {
+        use crate::state::store::Loaded as Restored;
+        let card = FakeCard::new();
+        put_copy(&card, "b.bin", 9, 4);
+        fs::create_dir(card.dir.path().join(BootSlot::B.dir())).unwrap();
+        fs::copy(
+            card.dir.path().join("qberrypi/qberrypi.toml"),
+            card.dir
+                .path()
+                .join(BootSlot::B.dir())
+                .join("qberrypi.toml"),
+        )
+        .unwrap();
+        for dir in [OWN_DIR, BootSlot::B.dir()] {
+            let files = read_boot_files(card.dir.path(), dir);
+            let read = files.state.expect("the copies were read");
+            assert!(
+                matches!(read.loaded(), Restored::Found(found) if found.seq == 9),
+                "{dir}: {read:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_card_with_no_copies_reads_as_one_that_never_saved_and_with_no_trouble() {
+        use crate::state::store::{Loaded as Restored, NoCopy};
+        let card = FakeCard::new();
+        let read = read_boot_files(card.dir.path(), OWN_DIR)
+            .state
+            .expect("read");
+        assert_eq!(read.loaded(), &Restored::Empty(NoCopy::Absent));
+        assert_eq!(read.trouble(), None);
+    }
+
+    #[test]
+    fn with_persist_off_nothing_of_the_state_is_read_and_a_config_that_fails_reads_none() {
+        let card = FakeCard::new();
+        put_copy(&card, "a.bin", 3, 1);
+        card.write(
+            "qberrypi/qberrypi.toml",
+            &EXAMPLE.replace("[state]\npersist = true", "[state]\npersist = false"),
+        );
+        let files = read_boot_files(card.dir.path(), OWN_DIR);
+        assert!(files.config.is_ok());
+        assert!(
+            files.state.is_none(),
+            "nothing is read when nothing is kept"
+        );
+
+        card.write("qberrypi/qberrypi.toml", "this is not toml");
+        let files = read_boot_files(card.dir.path(), OWN_DIR);
+        assert!(files.config.is_err());
+        assert!(
+            files.state.is_none(),
+            "a configuration that does not load keeps nothing"
+        );
+    }
+
+    #[test]
+    fn the_owners_restart_saves_the_settings_before_the_log_and_no_other_reason_does() {
+        for (reason, flushes) in [
+            (Reason::Restart(Restart::Plain(Cause::Owner)), 1),
+            (Reason::Restart(Restart::Plain(Cause::Update)), 0),
+            (Reason::Restart(Restart::Tryboot), 0),
+            (
+                Reason::Restart(Restart::Plain(Cause::GaveUp("gave up".to_owned()))),
+                0,
+            ),
+            (Reason::ReturnAfter, 0),
+            (Reason::ComponentFailed("dns"), 0),
+        ] {
+            let mut card = FakeCard::new();
+            let log = log_holding(&["banner"]);
+            let flushed = Cell::new(0);
+            let keep = || {
+                assert!(lock(&log).has_unsaved(), "before the log is saved");
+                flushed.set(flushed.get() + 1);
+            };
+            let left = leave(
+                &cfg_debug(true, true),
+                &mut card,
+                &log,
+                &reason,
+                &LogSaves::new(),
+                &own_board(),
+                &keep,
+            );
+            assert_eq!(left, Leaving::Restart, "{reason}");
+            assert_eq!(flushed.get(), flushes, "{reason}");
+            assert_eq!(card.ops, WRITE_OPS, "the log is saved after it: {reason}");
+        }
+    }
+
+    #[test]
+    fn the_saver_uses_the_one_claim_on_the_card_and_never_mounts() {
+        let me = thread::current().id();
+        let board = own_board();
+        let mut ran = false;
+        let used = claimed_on(&board, 50 * MS, &|| None, &mut || {
+            // While the work runs, the card is this thread's.
+            assert_eq!(lock(&board).card, Some(me));
+            ran = true;
+        });
+        assert!(used.is_ok() && ran);
+        assert_eq!(lock(&board).card, None, "let go of when the work is done");
+
+        // Another thread has the card: this one waits, and then is refused.
+        let board = board_of(Some(another_thread()), None);
+        let mut ran = false;
+        let started = Instant::now();
+        let used = claimed_on(&board, 50 * MS, &|| None, &mut || ran = true);
+        assert!(matches!(used, Err(CardError::Refused(_))), "{used:?}");
+        assert!(started.elapsed() >= 50 * MS);
+        assert!(!ran);
+
+        // A fatal error's rescue has it: refused at once, and the work does not run.
+        let board = board_of(None, Some(another_thread()));
+        let mut ran = false;
+        let used = claimed_on(
+            &board,
+            5 * 1000 * MS,
+            &|| Some(another_thread()),
+            &mut || {
+                ran = true;
+            },
+        );
+        match used {
+            Err(CardError::Refused(error)) => assert!(held_by_rescue(&error), "{error}"),
+            other => panic!("{other:?}"),
+        }
+        assert!(!ran);
     }
 
     #[test]
@@ -5637,12 +6010,15 @@ mod tests {
     }
 
     #[test]
-    fn the_panel_is_given_the_configured_calibration_and_whether_to_measure_it() {
+    fn the_panel_is_given_the_configured_calibration_and_sensitivity_and_whether_to_measure_it() {
         let plain = panel_deps(&config::parse(EXAMPLE).unwrap(), &Slot::new());
         assert_eq!(plain.calibration, Calibration::NOMINAL);
+        assert_eq!(plain.sensitivity, Sensitivity::DEFAULT);
         assert!(!plain.calibrate);
 
-        let text = format!("{EXAMPLE}\n[panel]\ntouch_left = 3890\ntouch_swap_xy = true\n");
+        let text = format!(
+            "{EXAMPLE}\n[panel]\ntouch_left = 3890\ntouch_swap_xy = true\ntouch_min_pressure = 30\ntouch_min_press_ms = 75\n"
+        );
         let text = text.replace("calibrate_touch = false", "calibrate_touch = true");
         let set = panel_deps(&config::parse(&text).unwrap(), &Slot::new());
         assert_eq!(
@@ -5653,6 +6029,13 @@ mod tests {
                 right: 3900,
                 top: 200,
                 bottom: 3900
+            }
+        );
+        assert_eq!(
+            set.sensitivity,
+            Sensitivity {
+                min_pressure: 30,
+                min_press_ms: 75
             }
         );
         assert!(set.calibrate);
@@ -5737,6 +6120,7 @@ mod tests {
                 signal: signal.clone(),
                 tls_pem: None,
                 update: update.clone(),
+                persist: Persist::unused(),
             },
             &BoardParts {
                 cfg,
@@ -5769,6 +6153,7 @@ mod tests {
                 ("lists", true),
                 ("analysis", false),
                 ("devices", false),
+                ("state", false),
                 ("wifi", true),
                 ("signal", true),
                 ("panel", false),
@@ -5787,6 +6172,7 @@ mod tests {
                 ("analysis", false),
                 ("devices", false),
                 ("api", false),
+                ("state", false),
                 ("wifi", true),
                 ("signal", true),
                 ("panel", false),
@@ -5824,6 +6210,7 @@ mod tests {
             ("lists", true),
             ("analysis", false),
             ("devices", false),
+            ("state", false),
         ];
         let board = [("wifi", true), ("signal", true), ("panel", false)];
         let started = |trial: bool, fault: &str| {

@@ -1,0 +1,81 @@
+# Checks every push to main and every pull request against it: formatting, clippy with warnings
+# as errors, and the test suite, on the host. Tests that need root, network namespaces,
+# mac80211_hwsim, QEMU or the board are #[ignore]d and do not run here; nothing reads a
+# qberrypi.toml, and the only network used is crates.io and the toolchain download.
+#
+# A second job builds the PID 1 binary for the Pi (aarch64-unknown-linux-musl, release), which is
+# pure Rust linked by rust-lld from the toolchain: no cross compiler and no download beyond the
+# toolchain's target. The bootable image (`cargo xtask build`, which fetches the kernel and the
+# firmware) and the QEMU boot test are left to the owner's machine.
+#
+# Actions are pinned to full commit SHAs; the tag each one is beside it.
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  RUST_BACKTRACE: "1"
+
+jobs:
+  check:
+    name: fmt, clippy, test
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # rust-toolchain.toml pins the release, its components and the Pi's target; `rustup install`
+      # with no argument installs what it names.
+      - name: Install the pinned toolchain
+        run: |
+          rustup set profile minimal
+          rustup install --no-self-update
+          rustc --version
+          cargo --version
+
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+
+      - name: cargo fmt --check
+        run: cargo fmt --all --check
+
+      - name: cargo clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+      - name: cargo test
+        run: cargo test --workspace --locked
+
+  pi-binary:
+    name: build for the Pi (aarch64-musl)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install the pinned toolchain
+        run: |
+          rustup set profile minimal
+          rustup install --no-self-update
+          rustc --version
+
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+
+      - name: cargo build --release (aarch64-unknown-linux-musl)
+        run: cargo build --locked --release -p qberrypi --target aarch64-unknown-linux-musl

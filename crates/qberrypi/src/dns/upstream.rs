@@ -1831,7 +1831,7 @@ mod tests {
     use crate::dns::client::{Answer, read_answer};
     use crate::dns::testutil::{
         FakeUpstream, NOW, Reply, TlsFakeUpstream, TlsMode, closed_port, ip, ms, pending,
-        tls_for_fake, tls_for_fakes,
+        tls_for_fake, tls_for_fakes, until,
     };
 
     use std::time::Duration;
@@ -3340,15 +3340,6 @@ mod tests {
     // takes the quickest of several tries, which a slow machine cannot make slower than the
     // hedge delay for all of them.
 
-    /// Waits until `ready` holds, for ten seconds at most, and panics with `what` if it does not.
-    async fn until(what: &str, mut ready: impl FnMut() -> bool) {
-        let end = Instant::now() + Duration::from_secs(10);
-        while !ready() {
-            assert!(Instant::now() < end, "timed out waiting for {what}");
-            sleep(ms(5)).await;
-        }
-    }
-
     /// Waits until exactly `up` of the TLS connections of `ups` have a session.
     async fn until_up(ups: &Upstreams, up: usize) {
         until(
@@ -3981,7 +3972,13 @@ mod tests {
             )
             .with_conn_options(options);
         ups.start_tls();
-        until_up(&ups, 2).await;
+        // Both have had a session. Not that both are up at once: the servers close a session
+        // after 100 ms, and on a slow host a handshake takes longer than that, so the two may
+        // never overlap.
+        until("both servers to have had a session", || {
+            first.handshakes() >= 1 && second.handshakes() >= 1
+        })
+        .await;
         for _ in 0..10 {
             let (answer, _) = run(&ups, "example.com").await;
             assert!(answer.is_some());

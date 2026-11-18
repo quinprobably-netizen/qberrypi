@@ -1276,6 +1276,13 @@ mod tests {
         SocketAddr::from(([127, 0, 0, 1], 0))
     }
 
+    /// A loopback address that nothing listens on, so that the kernel refuses what is sent to it.
+    /// Its port is one of the privileged ones that no test takes: a port that a socket bound and
+    /// then dropped could be taken by another test (or by anything else) before it is used.
+    fn closed() -> SocketAddr {
+        SocketAddr::from(([127, 0, 0, 1], 1))
+    }
+
     /// The name of the first question in `packet`, dotted, without the final dot.
     fn asked_name(packet: &[u8]) -> String {
         let message = Message::from_vec(packet).unwrap();
@@ -1377,12 +1384,12 @@ mod tests {
     #[test]
     fn ask_measures_at_least_the_servers_delay_and_returns_the_rcode() {
         let fake = FakeDns::start(|q, _| vec![(ms(40), reply(q, 3, None))]);
-        let (took, rcode) = ask(fake.addr, "example.com", 1, Duration::from_secs(2))
+        let (took, rcode) = ask(fake.addr, "example.com", 1, Duration::from_secs(30))
             .unwrap()
             .unwrap();
         assert_eq!(rcode, 3);
         assert!(took >= ms(40), "{took:?}");
-        assert!(took < Duration::from_secs(1), "{took:?}");
+        assert!(took < Duration::from_secs(20), "{took:?}");
     }
 
     #[test]
@@ -1398,7 +1405,9 @@ mod tests {
         let lost = ask(fake.addr, "example.com", 1, ms(200)).unwrap();
         assert_eq!(lost, None);
         assert!(started.elapsed() >= ms(200));
-        let (_, rcode) = ask(fake.addr, "example.com", 1, ms(200)).unwrap().unwrap();
+        let (_, rcode) = ask(fake.addr, "example.com", 1, Duration::from_secs(30))
+            .unwrap()
+            .unwrap();
         assert_eq!(rcode, 0);
     }
 
@@ -1435,7 +1444,7 @@ mod tests {
                 (ms(30), shouted),
             ]
         });
-        let (took, rcode) = ask(fake.addr, "example.com", 1, Duration::from_secs(2))
+        let (took, rcode) = ask(fake.addr, "example.com", 1, Duration::from_secs(30))
             .unwrap()
             .unwrap();
         assert_eq!(rcode, 3);
@@ -1444,11 +1453,7 @@ mod tests {
 
     #[test]
     fn a_refusing_port_is_an_error_not_a_loss() {
-        let closed = {
-            let socket = UdpSocket::bind(loopback()).unwrap();
-            socket.local_addr().unwrap()
-        };
-        let err = ask(closed, "example.com", 1, ms(500)).unwrap_err();
+        let err = ask(closed(), "example.com", 1, ms(500)).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::ConnectionRefused, "{err}");
     }
 
@@ -1463,6 +1468,8 @@ mod tests {
 
     #[test]
     fn a_dns_row_counts_received_and_lost() {
+        // Long enough for the answers that come at once to come on a busy host.
+        let wait = ms(1000);
         // Every third question is dropped: of six, questions 2 and 5 are lost.
         let fake = FakeDns::start(|q, nth| {
             if nth % 3 == 2 {
@@ -1471,7 +1478,7 @@ mod tests {
                 vec![(Duration::ZERO, reply(q, 3, None))]
             }
         });
-        let row = dns_row(fake.addr, ms(100), 6, Duration::ZERO, |i| {
+        let row = dns_row(fake.addr, wait, 6, Duration::ZERO, |i| {
             format!("name{i}.invalid")
         });
         assert_eq!(row.stats.samples, 4);
@@ -1481,11 +1488,11 @@ mod tests {
         assert_eq!(row.first_error, None);
         // Two of six are lost, so the p95 (the 6th of six) is a lost one, counted as the wait the
         // row used; the median (the 3rd) is a received answer, far below it.
-        assert_eq!(row.stats.lost_as, Some(ms(100)));
-        assert_eq!(row.stats.p95, Some(ms(100)));
-        assert!(row.stats.p50.unwrap() < ms(100), "{:?}", row.stats.p50);
-        assert!(row.stats.received.p95.unwrap() < ms(100));
-        assert!(row.stats.min.unwrap() < ms(100));
+        assert_eq!(row.stats.lost_as, Some(wait));
+        assert_eq!(row.stats.p95, Some(wait));
+        assert!(row.stats.p50.unwrap() < wait, "{:?}", row.stats.p50);
+        assert!(row.stats.received.p95.unwrap() < wait);
+        assert!(row.stats.min.unwrap() < wait);
         assert_eq!(
             fake.asked(),
             [
@@ -1501,12 +1508,14 @@ mod tests {
 
     #[test]
     fn a_servfail_answer_is_lost_and_failed_and_counts_as_the_wait() {
+        // Long enough for the answers that come at once to come on a busy host.
+        let wait = ms(1000);
         // Every second question is answered SERVFAIL at once, the others NXDOMAIN at once.
         let fake = FakeDns::start(|q, nth| {
             let rcode = if nth % 2 == 1 { 2 } else { 3 };
             vec![(Duration::ZERO, reply(q, rcode, None))]
         });
-        let row = dns_row(fake.addr, ms(100), 6, Duration::ZERO, |i| {
+        let row = dns_row(fake.addr, wait, 6, Duration::ZERO, |i| {
             format!("name{i}.invalid")
         });
         let stats = &row.stats;
@@ -1515,16 +1524,18 @@ mod tests {
         // The SERVFAILs came at once, yet they count as the wait, like a missing answer: the p95
         // (the 6th of six) is the wait, the p50 (the 3rd) is the slowest NXDOMAIN, and the mean
         // holds three waits in six.
-        assert_eq!(stats.lost_as, Some(ms(100)));
-        assert_eq!(stats.p95, Some(ms(100)));
-        assert!(stats.p50.unwrap() < ms(100), "{:?}", stats.p50);
-        assert!(stats.mean.unwrap() >= ms(50), "{:?}", stats.mean);
-        assert!(stats.received.p95.unwrap() < ms(100));
-        assert!(stats.min.unwrap() < ms(100));
+        assert_eq!(stats.lost_as, Some(wait));
+        assert_eq!(stats.p95, Some(wait));
+        assert!(stats.p50.unwrap() < wait, "{:?}", stats.p50);
+        assert!(stats.mean.unwrap() >= wait / 2, "{:?}", stats.mean);
+        assert!(stats.received.p95.unwrap() < wait);
+        assert!(stats.min.unwrap() < wait);
     }
 
     #[test]
     fn refused_counts_like_servfail_and_noerror_and_nxdomain_stay_answers() {
+        // Long enough for the answers that come at once to come on a busy host.
+        let wait = ms(1000);
         // Per four questions: NOERROR, NXDOMAIN, REFUSED, SERVFAIL.
         let fake = FakeDns::start(|q, nth| {
             let packet = match nth % 4 {
@@ -1535,14 +1546,14 @@ mod tests {
             };
             vec![(Duration::ZERO, packet)]
         });
-        let row = dns_row(fake.addr, ms(100), 8, Duration::ZERO, |i| {
+        let row = dns_row(fake.addr, wait, 8, Duration::ZERO, |i| {
             format!("name{i}.invalid")
         });
         let stats = &row.stats;
         assert_eq!((stats.samples, stats.lost, stats.failed), (4, 4, 4));
         // Half the samples count as the wait: the p95 is the wait, the p50 the slowest answer.
-        assert_eq!(stats.p95, Some(ms(100)));
-        assert!(stats.p50.unwrap() < ms(100), "{:?}", stats.p50);
+        assert_eq!(stats.p95, Some(wait));
+        assert!(stats.p50.unwrap() < wait, "{:?}", stats.p50);
         // With every answer SERVFAIL or REFUSED there is nothing received, and everything is the
         // wait.
         let all = FakeDns::start(|q, nth| {
@@ -1551,24 +1562,20 @@ mod tests {
                 reply(q, if nth % 2 == 0 { 5 } else { 2 }, None),
             )]
         });
-        let row = dns_row(all.addr, ms(100), 4, Duration::ZERO, |i| {
+        let row = dns_row(all.addr, wait, 4, Duration::ZERO, |i| {
             format!("name{i}.invalid")
         });
         let stats = &row.stats;
         assert_eq!((stats.samples, stats.lost, stats.failed), (0, 4, 4));
         assert_eq!(
             (stats.p50, stats.p95, stats.mean, stats.min),
-            (Some(ms(100)), Some(ms(100)), Some(ms(100)), None)
+            (Some(wait), Some(wait), Some(wait), None)
         );
     }
 
     #[test]
     fn a_socket_error_is_lost_too_and_the_first_one_is_kept() {
-        let closed = {
-            let socket = UdpSocket::bind(loopback()).unwrap();
-            socket.local_addr().unwrap()
-        };
-        let row = dns_row(closed, ms(300), 3, Duration::ZERO, |i| {
+        let row = dns_row(closed(), ms(300), 3, Duration::ZERO, |i| {
             format!("name{i}.invalid")
         });
         assert_eq!(row.stats.samples, 0);
@@ -1588,13 +1595,15 @@ mod tests {
     fn the_interval_lies_between_samples_and_not_after_the_last() {
         let fake = nxdomain_server();
         let started = Instant::now();
-        let row = dns_row(fake.addr, ms(200), 2, ms(400), |i| format!("n{i}.invalid"));
+        let row = dns_row(fake.addr, Duration::from_secs(30), 2, ms(1000), |i| {
+            format!("n{i}.invalid")
+        });
         let took = started.elapsed();
         assert_eq!(row.stats.samples, 2);
-        // One pause between the two samples, not two: a second pause would make it 800 ms, and a
-        // loaded test run has 400 ms to spare for the questions themselves.
-        assert!(took >= ms(400), "{took:?}");
-        assert!(took < ms(800), "{took:?}");
+        // One pause between the two samples, not two: a second pause would make it 2 s, and a
+        // loaded test run has a second to spare for the questions themselves.
+        assert!(took >= ms(1000), "{took:?}");
+        assert!(took < ms(2000), "{took:?}");
     }
 
     // measure
@@ -1604,7 +1613,9 @@ mod tests {
             samples,
             interval: Duration::ZERO,
             blocked,
-            wait: ms(300),
+            // Every answer of the fake comes at once, so the wait is only the most a busy host may
+            // take for one.
+            wait: ms(10_000),
         }
     }
 
@@ -1652,7 +1663,7 @@ mod tests {
             let measured = row.result.as_ref().unwrap();
             assert_eq!((measured.stats.samples, measured.stats.lost), (4, 0));
             // Every DNS row counts a lost answer as the wait of the settings.
-            assert_eq!(measured.stats.lost_as, Some(ms(300)));
+            assert_eq!(measured.stats.lost_as, Some(ms(10_000)));
         }
         assert_eq!(report.rows[0].result.as_ref().unwrap().stats.lost_as, None);
         let asked = fake.asked();

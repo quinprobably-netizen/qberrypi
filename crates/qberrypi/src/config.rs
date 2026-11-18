@@ -10,13 +10,15 @@ use std::ops::{Range, RangeInclusive};
 
 use qb_dns::name::{MAX_NAME_LEN, normalize};
 use qb_panel::Calibration;
+use qb_panel::touch::DEFAULT_MIN_PRESS_MS;
 use rustls::pki_types::ServerName;
 use toml::{Table, Value};
 use tz::{TimeZone, TimeZoneSettings};
 
 use crate::api::password::PasswordHash;
 use crate::panel::lock::{self, DEFAULT_NIGHT};
-use crate::panel::touch::RAW_MAX;
+use crate::panel::touch::{DEFAULT_MIN_PRESSURE, RAW_MAX, Sensitivity};
+use crate::slots::{DEFAULT_TOUCH_XOHMS, TOUCH_XOHMS};
 use crate::watch::devices::{MAX_BLOCK, MAX_EXEMPT};
 use crate::watch::frames::Mac;
 
@@ -57,6 +59,8 @@ pub struct Config {
     pub debug: DebugCfg,
     /// What the watchdog is told to leave alone.
     pub watch: WatchCfg,
+    /// Whether the owner's settings are kept on the card: the optional `[state]` table.
+    pub state: StateCfg,
     /// The Pi-hole API on port 443; `None` when the file has no `[api]` section, and then there is
     /// none.
     pub api: Option<Api>,
@@ -271,7 +275,35 @@ impl Default for WatchCfg {
     }
 }
 
-/// How the touch screen's readings lie on the screen: the optional `[panel]` table.
+/// Whether what the owner sets outlasts a restart: the optional `[state]` table.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StateCfg {
+    /// Whether the settings the desktop and the panel make (the pushed lists and mode, the labels,
+    /// the known devices, the owner's names, a PIN set from the desktop or the panel, the night
+    /// hours) are kept on the card and read back at the next start. True when unset. False reads
+    /// nothing, writes nothing and creates nothing on the card.
+    pub persist: bool,
+}
+
+impl Default for StateCfg {
+    /// What a file without a `[state]` table says: the settings are kept.
+    fn default() -> Self {
+        Self { persist: true }
+    }
+}
+
+/// The least pressures that `panel.touch_min_pressure` takes: the driver's own range but 255, which
+/// it never reports (it reports 255 less a touch's resistance, and nothing for a resistance of 0),
+/// so that a least of 255 would turn the touch screen off.
+const TOUCH_MIN_PRESSURE: RangeInclusive<i32> = 0..=254;
+
+/// The shortest taps, in milliseconds, that `panel.touch_min_press_ms` takes. The driver reads a
+/// pen that stays down every few milliseconds, so under 10 a press of one or two stray readings
+/// would be a tap; over half a second a tap is a long hold.
+const TOUCH_MIN_PRESS_MS: RangeInclusive<u64> = 10..=500;
+
+/// How the touch screen's readings lie on the screen, and how light a touch it takes: the
+/// optional `[panel]` table.
 ///
 /// Each reading is the controller's own, 0 to 4095. A side's two readings
 /// differ, and the first may be the greater, for an axis that runs backwards.
@@ -287,19 +319,41 @@ pub struct PanelCfg {
     pub touch_bottom: u16,
     /// Whether the two readings are exchanged before anything else.
     pub touch_swap_xy: bool,
+    /// The least pressure at which a report is a touch, of the driver's 0 to 255; a higher
+    /// one asks for a firmer touch.
+    pub touch_min_pressure: i32,
+    /// The shortest press that is a tap, in milliseconds.
+    pub touch_min_press_ms: u64,
+    /// The plate resistance, in ohms, that the slot's `config.txt` tells the touch screen's driver
+    /// (the overlay's `xohms`): a smaller one takes a lighter touch. It is the build's to write
+    /// (`touch_xohms`); the running system does not read it.
+    pub touch_xohms: u16,
 }
 
 impl PanelCfg {
-    /// What a file without a `[panel]` table says: a typical panel, unmeasured.
+    /// What a file without a `[panel]` table says: a typical panel, unmeasured, and the panel's
+    /// default sensitivity.
     ///
-    /// These are the five values of `Calibration::NOMINAL`; a test holds the two lists together.
+    /// The first five are the values of `Calibration::NOMINAL`, the next two `Sensitivity::DEFAULT`'s,
+    /// and the last `slots::DEFAULT_TOUCH_XOHMS`; a test holds the lists together.
     pub const DEFAULT: PanelCfg = PanelCfg {
         touch_left: 200,
         touch_right: 3900,
         touch_top: 200,
         touch_bottom: 3900,
         touch_swap_xy: false,
+        touch_min_pressure: DEFAULT_MIN_PRESSURE,
+        touch_min_press_ms: DEFAULT_MIN_PRESS_MS,
+        touch_xohms: DEFAULT_TOUCH_XOHMS,
     };
+
+    /// How light a touch these settings take.
+    pub fn sensitivity(&self) -> Sensitivity {
+        Sensitivity {
+            min_pressure: self.touch_min_pressure,
+            min_press_ms: self.touch_min_press_ms,
+        }
+    }
 
     /// The calibration these settings are.
     pub fn calibration(&self) -> Calibration {
@@ -315,7 +369,7 @@ impl PanelCfg {
 
 /// What the panel starts a boot with besides its touch calibration: the optional `night` and `pin_hash` of
 /// the `[panel]` table. Both are the boot's to change afterwards (the panel's screens and
-/// `PUT /api/qbp/panel`), for this boot only.
+/// `PUT /api/qbp/panel`), and what they set is kept on the card with `[state] persist`.
 #[derive(Debug)]
 pub struct PanelBoot {
     /// The night hours `(from, to)` as hours of the day, `HH-HH` in the file; `None` for no night
@@ -430,7 +484,7 @@ pub fn parse(text: &str) -> Result<Config, ConfigError> {
         &table,
         &[
             "hostname", "timezone", "wifi", "net", "dns", "upstream", "speed", "panel", "debug",
-            "watch", "api",
+            "watch", "state", "api",
         ],
     )?;
 
@@ -486,6 +540,9 @@ pub fn parse(text: &str) -> Result<Config, ConfigError> {
             "touch_top",
             "touch_bottom",
             "touch_swap_xy",
+            "touch_min_pressure",
+            "touch_min_press_ms",
+            "touch_xohms",
             "night",
             "pin_hash",
         ],
@@ -523,6 +580,10 @@ pub fn parse(text: &str) -> Result<Config, ConfigError> {
         Some(section) => watch(&section)?,
         None => WatchCfg::default(),
     };
+    let state = match root.section("state", &["persist"])? {
+        Some(section) => state(&section)?,
+        None => StateCfg::default(),
+    };
     let api = root
         .section("api", &["password_hash"])?
         .map(|section| api(&section))
@@ -539,6 +600,7 @@ pub fn parse(text: &str) -> Result<Config, ConfigError> {
         panel_boot,
         debug,
         watch,
+        state,
         api,
     })
 }
@@ -764,6 +826,13 @@ fn speed(section: &Section) -> Result<SpeedCfg, ConfigError> {
     })
 }
 
+/// Reads the `[state]` table.
+fn state(section: &Section) -> Result<StateCfg, ConfigError> {
+    Ok(StateCfg {
+        persist: section.bool_or("persist", StateCfg::default().persist)?,
+    })
+}
+
 /// A list of domain names, as written, or none when unset. Each entry has to pass the check
 /// that the block set applies to it, so that no entry is refused later.
 fn names_or_empty(section: &Section, name: &str) -> Result<Vec<String>, ConfigError> {
@@ -783,6 +852,21 @@ fn panel(section: &Section) -> Result<PanelCfg, ConfigError> {
         touch_top: section.reading_or("touch_top", default.touch_top)?,
         touch_bottom: section.reading_or("touch_bottom", default.touch_bottom)?,
         touch_swap_xy: section.bool_or_false("touch_swap_xy")?,
+        touch_min_pressure: section
+            .whole_number_in(
+                "touch_min_pressure",
+                TOUCH_MIN_PRESSURE,
+                "must be a whole number from 0 to 254",
+            )?
+            .unwrap_or(default.touch_min_pressure),
+        touch_min_press_ms: section
+            .whole_number_in(
+                "touch_min_press_ms",
+                TOUCH_MIN_PRESS_MS,
+                "must be a whole number of milliseconds from 10 to 500",
+            )?
+            .unwrap_or(default.touch_min_press_ms),
+        touch_xohms: xohms(section)?,
     };
     // Two edges at the same reading leave no way to tell where along the side a touch is.
     if panel.touch_left == panel.touch_right {
@@ -792,6 +876,38 @@ fn panel(section: &Section) -> Result<PanelCfg, ConfigError> {
         return Err(section.error("touch_bottom", "must differ from touch_top"));
     }
     Ok(panel)
+}
+
+/// The `touch_xohms` of the `[panel]` table; `slots::DEFAULT_TOUCH_XOHMS` when unset.
+fn xohms(section: &Section) -> Result<u16, ConfigError> {
+    Ok(section
+        .whole_number_in(
+            "touch_xohms",
+            TOUCH_XOHMS,
+            "must be a whole number of ohms from 10 to 1000",
+        )?
+        .unwrap_or(DEFAULT_TOUCH_XOHMS))
+}
+
+/// The `panel.touch_xohms` of the text of a `qberrypi.toml`, for the slot's `config.txt` that the
+/// build writes beside it; `slots::DEFAULT_TOUCH_XOHMS` when the file does not set it.
+///
+/// Only that key is looked at: the rest of the file is `parse`'s to check, and a text that is
+/// TOML but no configuration (as a test's may be) has the default. A text that is not TOML, a
+/// `panel` that is not a table, and a value `parse` would refuse are its errors, which quote
+/// nothing from the file.
+pub fn touch_xohms(text: &str) -> Result<u16, ConfigError> {
+    let table: Table = text
+        .parse()
+        .map_err(|e: toml::de::Error| syntax_error(text, e.span()))?;
+    match table.get("panel") {
+        None => Ok(DEFAULT_TOUCH_XOHMS),
+        Some(Value::Table(panel)) => xohms(&Section {
+            path: "panel",
+            table: panel,
+        }),
+        Some(_) => Err(error("panel", "must be a table")),
+    }
 }
 
 /// The `night` and `pin_hash` of the `[panel]` table. A hash that is no line of a PIN is refused by key,
@@ -1075,17 +1191,17 @@ impl<'a> Section<'a> {
 
     /// A whole number within `range`, or `None` when unset. A value of another type or outside
     /// the range is an error with `reason`.
-    fn whole_number_in(
+    fn whole_number_in<T: TryFrom<i64> + PartialOrd>(
         &self,
         name: &str,
-        range: RangeInclusive<u8>,
+        range: RangeInclusive<T>,
         reason: &'static str,
-    ) -> Result<Option<u8>, ConfigError> {
+    ) -> Result<Option<T>, ConfigError> {
         match self.get(name) {
             None => Ok(None),
             Some(value) => value
                 .as_integer()
-                .and_then(|number| u8::try_from(number).ok())
+                .and_then(|number| T::try_from(number).ok())
                 .filter(|number| range.contains(number))
                 .map(Some)
                 .ok_or_else(|| self.error(name, reason)),
@@ -1637,6 +1753,58 @@ upstreams = ["9.9.9.9"]
     }
 
     #[test]
+    fn the_settings_are_kept_unless_the_file_says_they_are_not() {
+        assert!(parse(MINIMAL).unwrap().state.persist);
+        assert_eq!(parse(MINIMAL).unwrap().state, StateCfg::default());
+        // An empty section says the same as an absent one.
+        assert!(parse(&minimal_with("[state]")).unwrap().state.persist);
+        assert!(
+            parse(&minimal_with("[state]\npersist = true"))
+                .unwrap()
+                .state
+                .persist
+        );
+        assert!(
+            !parse(&minimal_with("[state]\npersist = false"))
+                .unwrap()
+                .state
+                .persist
+        );
+        // The example says it, at its default.
+        assert!(parse(EXAMPLE).unwrap().state.persist);
+        let off = example_with("[state]\npersist = true", "[state]\npersist = false");
+        assert!(!parse(&off).unwrap().state.persist);
+    }
+
+    #[test]
+    fn the_state_table_refuses_what_is_not_a_switch_and_names_unknown_keys_with_their_full_path() {
+        for value in ["1", "\"true\"", "\"no\"", "[true]", "1.0"] {
+            assert_eq!(
+                refusal(&minimal_with(&format!("[state]\npersist = {value}"))),
+                (
+                    "state.persist".to_owned(),
+                    "must be true or false".to_owned()
+                ),
+                "{value}"
+            );
+        }
+        for (table, key) in [
+            ("[state]\nsave_after = 30", "state.save_after"),
+            ("[state]\npersist = false\ndevice = \"x\"", "state.device"),
+        ] {
+            assert_eq!(
+                refusal(&minimal_with(table)),
+                (key.to_owned(), "unknown key".to_owned())
+            );
+        }
+        let text = format!("state = 2\n{MINIMAL}");
+        assert_eq!(
+            refusal(&text),
+            ("state".to_owned(), "must be a table".to_owned())
+        );
+    }
+
+    #[test]
     fn a_file_saved_on_windows_parses() {
         let text = format!("\u{feff}{}", EXAMPLE.replace('\n', "\r\n"));
         assert_eq!(parse(&text).unwrap().wifi.ssid, "example-network");
@@ -2060,16 +2228,176 @@ upstreams = ["9.9.9.9"]
                 touch_right: 3900,
                 touch_top: 200,
                 touch_bottom: 3900,
-                touch_swap_xy: false
+                touch_swap_xy: false,
+                touch_min_pressure: 4,
+                touch_min_press_ms: 20,
+                touch_xohms: 25,
             }
         );
         assert!(!cfg.debug.calibrate_touch);
     }
 
     #[test]
-    fn the_defaults_of_the_panel_table_are_the_nominal_calibration() {
+    fn the_defaults_of_the_panel_table_are_the_nominal_calibration_and_the_default_sensitivity() {
         assert_eq!(PanelCfg::DEFAULT.calibration(), Calibration::NOMINAL);
+        assert_eq!(PanelCfg::DEFAULT.sensitivity(), Sensitivity::DEFAULT);
         assert_eq!(parse(MINIMAL).unwrap().panel, PanelCfg::DEFAULT);
+    }
+
+    #[test]
+    fn the_touch_sensitivity_is_read_and_the_ends_of_its_ranges_are_accepted() {
+        for (pressure, press_ms) in [(0, 10), (254, 500), (16, 50), (4, 20)] {
+            let text = format!(
+                "{EXAMPLE}\n[panel]\ntouch_min_pressure = {pressure}\ntouch_min_press_ms = {press_ms}\n"
+            );
+            let panel = parse(&text).unwrap().panel;
+            assert_eq!(
+                panel.sensitivity(),
+                Sensitivity {
+                    min_pressure: pressure,
+                    min_press_ms: press_ms
+                }
+            );
+            // The calibration beside them is as ever.
+            assert_eq!(panel.calibration(), Calibration::NOMINAL);
+        }
+        // Each key alone leaves the other at its default.
+        let text = format!("{EXAMPLE}\n[panel]\ntouch_min_pressure = 30\n");
+        assert_eq!(parse(&text).unwrap().panel.touch_min_press_ms, 20);
+        let text = format!("{EXAMPLE}\n[panel]\ntouch_min_press_ms = 75\n");
+        assert_eq!(parse(&text).unwrap().panel.touch_min_pressure, 4);
+    }
+
+    #[test]
+    fn the_plate_resistance_is_read_and_the_ends_of_its_range_are_accepted() {
+        assert_eq!(
+            parse(EXAMPLE).unwrap().panel.touch_xohms,
+            DEFAULT_TOUCH_XOHMS
+        );
+        for ohms in [10, 11, 25, 100, 999, 1000] {
+            let text = format!("{EXAMPLE}\n[panel]\ntouch_xohms = {ohms}\n");
+            let panel = parse(&text).unwrap().panel;
+            assert_eq!(panel.touch_xohms, ohms);
+            assert_eq!(touch_xohms(&text).unwrap(), ohms);
+            // The rest of the table is as ever.
+            assert_eq!(
+                PanelCfg {
+                    touch_xohms: DEFAULT_TOUCH_XOHMS,
+                    ..panel
+                },
+                PanelCfg::DEFAULT
+            );
+        }
+    }
+
+    #[test]
+    fn a_plate_resistance_out_of_its_range_is_refused_by_key_without_quoting_the_file() {
+        let reason = "must be a whole number of ohms from 10 to 1000";
+        for value in ["9", "0", "-25", "1001", "65536", "25.0", "\"25\"", "true"] {
+            let text = format!("{EXAMPLE}\n[panel]\ntouch_xohms = {value}\n");
+            for e in [parse(&text).unwrap_err(), touch_xohms(&text).unwrap_err()] {
+                assert_eq!(
+                    (e.key.as_str(), e.reason.as_str()),
+                    ("panel.touch_xohms", reason),
+                    "{value}"
+                );
+                let shown = format!("{e} {e:?}");
+                assert!(!shown.contains("example-passphrase"), "{shown}");
+                assert!(
+                    !shown.contains("65536") && !shown.contains("25.0"),
+                    "{shown}"
+                );
+            }
+        }
+        assert_eq!((*TOUCH_XOHMS.start(), *TOUCH_XOHMS.end()), (10, 1000));
+    }
+
+    #[test]
+    fn the_plate_resistance_alone_is_read_from_any_toml_and_a_text_that_is_not_toml_is_refused() {
+        for text in [
+            "",
+            "# slot a\n",
+            "[wifi]\n",
+            "[panel]\nnight = \"off\"\n",
+            "[a]\n",
+        ] {
+            assert_eq!(touch_xohms(text).unwrap(), DEFAULT_TOUCH_XOHMS, "{text:?}");
+        }
+        assert_eq!(touch_xohms("[panel]\ntouch_xohms = 40\n").unwrap(), 40);
+        assert_eq!(
+            touch_xohms("panel = 3\n").unwrap_err().key,
+            "panel",
+            "a panel that is no table"
+        );
+        // Not TOML, on the very line that holds the passphrase: the error says where, not what.
+        let broken = EXAMPLE.replace(PASSPHRASE_LINE, "passphrase = \"example-passphrase");
+        let e = touch_xohms(&broken).unwrap_err();
+        assert_eq!(e.key, "(syntax)");
+        assert!(!format!("{e} {e:?}").contains("example-passphrase"), "{e}");
+    }
+
+    #[test]
+    fn a_touch_sensitivity_out_of_its_range_is_refused_by_key_without_quoting_the_file() {
+        let pressure = "must be a whole number from 0 to 254";
+        let press = "must be a whole number of milliseconds from 10 to 500";
+        for (line, key, reason) in [
+            (
+                "touch_min_pressure = -1",
+                "panel.touch_min_pressure",
+                pressure,
+            ),
+            (
+                "touch_min_pressure = 255",
+                "panel.touch_min_pressure",
+                pressure,
+            ),
+            (
+                "touch_min_pressure = 4.5",
+                "panel.touch_min_pressure",
+                pressure,
+            ),
+            (
+                "touch_min_pressure = \"4\"",
+                "panel.touch_min_pressure",
+                pressure,
+            ),
+            ("touch_min_press_ms = 9", "panel.touch_min_press_ms", press),
+            ("touch_min_press_ms = 0", "panel.touch_min_press_ms", press),
+            (
+                "touch_min_press_ms = 501",
+                "panel.touch_min_press_ms",
+                press,
+            ),
+            (
+                "touch_min_press_ms = 99999999999",
+                "panel.touch_min_press_ms",
+                press,
+            ),
+            (
+                "touch_min_press_ms = true",
+                "panel.touch_min_press_ms",
+                press,
+            ),
+        ] {
+            let text = format!("{EXAMPLE}\n[panel]\n{line}\n");
+            let e = parse(&text).unwrap_err();
+            assert_eq!((e.key.as_str(), e.reason.as_str()), (key, reason), "{line}");
+            let shown = e.to_string();
+            assert!(!shown.contains("example-passphrase"), "{shown}");
+            assert!(
+                !shown.contains("99999999999") && !shown.contains("4.5"),
+                "{shown}"
+            );
+        }
+        // The words of the ranges are the ranges.
+        assert_eq!(
+            (*TOUCH_MIN_PRESSURE.start(), *TOUCH_MIN_PRESSURE.end()),
+            (0, 254)
+        );
+        assert_eq!(
+            (*TOUCH_MIN_PRESS_MS.start(), *TOUCH_MIN_PRESS_MS.end()),
+            (10, 500)
+        );
     }
 
     /// A well-formed `pin_hash` line that no PIN was derived from (10,000 rounds).
@@ -2187,6 +2515,12 @@ upstreams = ["9.9.9.9"]
             .replace("# [panel]", "[panel]")
             .replace("# night = \"23-07\"", "night = \"23-07\"");
         assert_eq!(parse(&text).unwrap().panel_boot.night, Some((23, 7)));
+        let sensitive = text
+            .replace("# touch_min_pressure = ", "touch_min_pressure = ")
+            .replace("# touch_min_press_ms = ", "touch_min_press_ms = ")
+            .replace("# touch_xohms = ", "touch_xohms = ");
+        assert_ne!(sensitive, text);
+        assert_eq!(parse(&sensitive).unwrap().panel, PanelCfg::DEFAULT);
         // The pin line is a pattern to fill in, not a PIN that anyone could use.
         assert!(EXAMPLE.contains("# pin_hash = \"$pbkdf2-sha256$i=10000$"));
         let text = text.replace("# pin_hash = ", "pin_hash = ");
@@ -2207,7 +2541,8 @@ upstreams = ["9.9.9.9"]
                 touch_right: 210,
                 touch_top: 300,
                 touch_bottom: 3900,
-                touch_swap_xy: true
+                touch_swap_xy: true,
+                ..PanelCfg::DEFAULT
             }
         );
         assert!(cfg.debug.calibrate_touch);

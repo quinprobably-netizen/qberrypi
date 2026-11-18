@@ -613,14 +613,15 @@ impl ReadingView {
     /// LOCK: `ON` or `OFF`, the strong actions a PIN guards, and where the PIN lives (spec §7.2).
     pub fn lock(world: &World) -> Self {
         let on = world.lock_on;
-        let home = if on {
-            match world.lock_source {
-                LockSource::Config => "kept in the config: it outlasts a restart",
-                LockSource::Api => "from the desktop: until the next restart",
-                LockSource::Panel => "set here: until the next restart",
-            }
-        } else {
-            "a PIN set here lasts until a restart"
+        // With the card keeping the state a PIN from the desktop or the panel outlasts a restart too.
+        let home = match (on, world.lock_source, world.lock_kept) {
+            (true, LockSource::Config, _) => "kept in the config: it outlasts a restart",
+            (true, LockSource::Api, true) => "from the desktop: it outlasts a restart",
+            (true, LockSource::Api, false) => "from the desktop: until the next restart",
+            (true, LockSource::Panel, true) => "set here: it outlasts a restart",
+            (true, LockSource::Panel, false) => "set here: until the next restart",
+            (false, _, true) => "a PIN set here outlasts a restart",
+            (false, _, false) => "a PIN set here lasts until a restart",
         };
         Self {
             lane: LaneView::of(Section::System, world),
@@ -1243,16 +1244,47 @@ mod tests {
         );
         assert_eq!(decide(&nav, &w, 400, 280), Tap::Act(Intent::ClearPin, None));
         assert!(Intent::ClearPin.is_strong());
-        // Where the PIN lives is the second line (spec §7.2).
-        for (source, said) in [
+        // Where the PIN lives is the second line (spec §7.2), and whether the card keeps it.
+        for (kept, expected) in [
             (
-                LockSource::Config,
-                "kept in the config: it outlasts a restart",
+                false,
+                [
+                    (
+                        LockSource::Config,
+                        "kept in the config: it outlasts a restart",
+                    ),
+                    (LockSource::Api, "from the desktop: until the next restart"),
+                    (LockSource::Panel, "set here: until the next restart"),
+                ],
             ),
-            (LockSource::Api, "from the desktop: until the next restart"),
-            (LockSource::Panel, "set here: until the next restart"),
+            (
+                true,
+                [
+                    (
+                        LockSource::Config,
+                        "kept in the config: it outlasts a restart",
+                    ),
+                    (LockSource::Api, "from the desktop: it outlasts a restart"),
+                    (LockSource::Panel, "set here: it outlasts a restart"),
+                ],
+            ),
         ] {
-            w.lock_source = source;
+            w.lock_kept = kept;
+            for (source, said) in expected {
+                w.lock_source = source;
+                let view = ReadingView::lock(&w);
+                assert_eq!(view.lines[1].text(), said);
+                assert!(said.chars().count() <= 43, "{said}");
+                assert!(view.lines[0].text().chars().count() <= 43);
+            }
+        }
+        // With the lock off the second line says how long a PIN set here would last.
+        w.lock_on = false;
+        for (kept, said) in [
+            (false, "a PIN set here lasts until a restart"),
+            (true, "a PIN set here outlasts a restart"),
+        ] {
+            w.lock_kept = kept;
             let view = ReadingView::lock(&w);
             assert_eq!(view.lines[1].text(), said);
             assert!(said.chars().count() <= 43, "{said}");

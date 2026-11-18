@@ -15,13 +15,19 @@
 //! which must answer with the night hours and the lock's state (and never a hash). The self-test's last
 //! line says this process's resident memory.
 //!
+//! The persistence step ([`PERSIST_ARG`]) is a boot of its own, which a scenario that boots three times
+//! runs three times: the first boot puts a label, an exempt address, a refused name and night hours
+//! through the API and asks the owner's restart (which saves them to the card); the second finds them
+//! restored and says so, then puts other night hours and leaves the board to run on until the saver
+//! saves them by itself; the third finds those restored and says so.
+//!
 //! The names asked for are fixed and made up for this, so the card's log holds none of the
 //! household's.
 
 use std::io::{Read, Write};
 use std::net::{Ipv4Addr, SocketAddr, TcpStream as StdTcpStream};
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
@@ -41,6 +47,8 @@ use crate::dns::client::{Answer, query, read_answer};
 use crate::dns::upstream::UDP_BUFFER;
 use crate::lists::snapshot::MARKER;
 use crate::services::blocking;
+use crate::watch::devices::Devices;
+use crate::watch::frames::Mac;
 
 /// The kernel argument that has init run the self-test.
 pub const DNS_ARG: &str = "qberrypi.selftest.dns";
@@ -560,6 +568,235 @@ fn names_outcome(
     Ok("200 refused cleared".to_owned())
 }
 
+// ---------------------------------------------------------------------------------------------
+// The persistence step (the owner's settings outlast a restart)
+
+/// The kernel argument that has init run the persistence step, in place of the DNS self-test and
+/// never beside it: the names step of that one clears the owner's list. The step has three phases, and
+/// what the API shows decides which it is. A boot whose API shows none of the step's settings puts them
+/// and asks the owner's restart ([`persist`]); a boot that finds them says that they came back and puts
+/// other night hours, which nothing asks the board to save but its own saver; a boot that finds those
+/// other night hours says that they came back. A scenario that boots three times shows each in turn.
+pub const PERSIST_ARG: &str = "qberrypi.selftest.persist";
+
+/// The path of the pushed exempt list, which the persistence step puts to.
+const EXEMPT_PATH: &str = "/api/qbp/devices/exempt";
+/// The path of the labels, which the persistence step puts to.
+const LABELS_PATH: &str = "/api/qbp/devices/labels";
+/// The address that the persistence step exempts and labels: locally administered, made up, and
+/// no device's.
+const PERSIST_MAC: &str = "02:00:00:71:5e:57";
+/// The label that the persistence step gives that address.
+const PERSIST_LABEL: &str = "persist test";
+/// The night hours that the persistence step sets, which the scenario's configuration does not have.
+const PERSIST_NIGHT: &str = "21-05";
+/// The night hours that the persistence step sets after it has found the first ones back: neither
+/// the first nor the configuration's, so that the phase is told by what the API shows.
+const PERSIST_NIGHT_LATER: &str = "22-06";
+
+/// What the persistence step did, for the caller to log and act on.
+pub struct Persisted {
+    /// The one line that says it, `selftest: persist: ...`.
+    pub line: String,
+    /// Whether the settings were put and the owner's restart is now to be asked for.
+    pub restart: bool,
+}
+
+/// The persistence step: logs in to the API at `api_server` with `password` and looks at the pushed
+/// exempt list and the night hours, which tell the phase.
+///
+/// With none of the step's settings there it puts them: a label and an exempt address (`PUT
+/// devices/labels`, `PUT devices/exempt`), a made-up `.invalid` name that the owner refuses (`PUT names`,
+/// which the DNS server at `dns_server` must then block) and the night hours (`PUT panel`). It says
+///
+/// ```text
+/// selftest: persist: put label exempt refused night
+/// ```
+///
+/// and `restart` is true: the caller asks the owner's restart, which saves them. Anything else is a
+/// word for where it ended (`label 400`, `refused SERVFAIL`, `login 401`, `no certificate`,
+/// `no answer`) and `restart` is false.
+///
+/// With the exempt address or the first night hours there (the boot after that restart) it reads, and
+/// says what came back, then puts the later night hours (`PUT panel`) and says so, and `restart` is
+/// false: nothing asks for a save, the board's saver makes it after the quiet.
+///
+/// ```text
+/// selftest: persist: back label exempt refused night, then put later-night
+/// ```
+///
+/// With the later night hours there (the boot after the saver's save) it only reads:
+///
+/// ```text
+/// selftest: persist: back label exempt refused later-night
+/// ```
+///
+/// A word that is missing from `back` is one that did not come back, and is named after it: `back
+/// exempt night, lost label refused`. The exempt list and the night are read through the API, the
+/// refused name by asking the DNS server for it. The label is read from `devices` itself: the API says
+/// a label only on a device that has been heard, and the guest hears none. The line names no address,
+/// label or name, only these words, and no session or password.
+///
+/// The whole exchange is blocking work of the pool, the handshake included.
+pub async fn persist(
+    api_server: SocketAddr,
+    dns_server: SocketAddr,
+    pem: Option<&[u8]>,
+    password: &str,
+    wait: Duration,
+    devices: Arc<Mutex<Devices>>,
+) -> Persisted {
+    let outcome = match pem.and_then(crate::api::tls::leaf_sha256) {
+        None => Err("no certificate".to_owned()),
+        Some(pin) => {
+            let password = password.to_owned();
+            let deadline = Instant::now() + wait;
+            blocking("selftest persist", move || {
+                persist_outcome(api_server, dns_server, pin, &password, deadline, &devices)
+            })
+            .await
+            .unwrap_or_else(|_| Err(NO_ANSWER.to_owned()))
+        }
+    };
+    let (words, restart) = match outcome {
+        Ok(done) => done,
+        Err(words) => (words, false),
+    };
+    Persisted {
+        line: format!("selftest: persist: {words}"),
+        restart,
+    }
+}
+
+/// The steps of [`persist`]: connect, handshake, login, look, then put or read. The words that say
+/// where it ended or what it found, and whether the settings were put.
+fn persist_outcome(
+    api_server: SocketAddr,
+    dns_server: SocketAddr,
+    pin: [u8; 32],
+    password: &str,
+    deadline: Instant,
+    devices: &Mutex<Devices>,
+) -> Result<(String, bool), String> {
+    let (mut stream, sid) = open(api_server, pin, password, deadline)?;
+    let mut call = |method: &str, path: &str, body: Option<&str>| -> Result<Value, String> {
+        let request = request_text(method, path, Some(&sid), body, false);
+        let (code, reply) = exchange(&mut stream, deadline, &request)?;
+        match code {
+            200 => Ok(serde_json::from_slice(&reply).unwrap_or(Value::Null)),
+            code => Err(format!("{} {code}", path_word(path))),
+        }
+    };
+
+    let listed = call("GET", DEVICES_PATH, None)?;
+    let shown = call("GET", PANEL_PATH, None)?;
+    let exempt = listed["exempt_pushed"]
+        .as_array()
+        .is_some_and(|macs| macs.iter().any(|mac| mac.as_str() == Some(PERSIST_MAC)));
+    let night = shown["night"].as_str() == Some(PERSIST_NIGHT);
+    let later = shown["night"].as_str() == Some(PERSIST_NIGHT_LATER);
+
+    if exempt || night || later {
+        let refused = ask_udp(dns_server, REFUSED, deadline)
+            .is_some_and(|answer| answer.summary() == BLOCKED);
+        let label = labelled(devices);
+        if later {
+            // The boot after the saver's own save: only what came back is said.
+            let found = [
+                ("label", label),
+                ("exempt", exempt),
+                ("refused", refused),
+                ("later-night", true),
+            ];
+            goodbye(&mut stream);
+            return Ok((read_words(&found), false));
+        }
+        let found = [
+            ("label", label),
+            ("exempt", exempt),
+            ("refused", refused),
+            ("night", night),
+        ];
+        // Found back: now other hours, which only the saver's own save can keep.
+        let put = json!({ "night": PERSIST_NIGHT_LATER }).to_string();
+        if call("PUT", PANEL_PATH, Some(&put))?["night"].as_str() != Some(PERSIST_NIGHT_LATER) {
+            return Err("later-night not set".to_owned());
+        }
+        goodbye(&mut stream);
+        return Ok((
+            format!("{}, then put later-night", read_words(&found)),
+            false,
+        ));
+    }
+
+    let labels = json!({ "labels": [[PERSIST_MAC, PERSIST_LABEL]] }).to_string();
+    if call("PUT", LABELS_PATH, Some(&labels))?["labels"].as_u64() != Some(1) {
+        return Err("label kept none".to_owned());
+    }
+    let exempt = json!({ "exempt": [PERSIST_MAC] }).to_string();
+    if call("PUT", EXEMPT_PATH, Some(&exempt))?["exempt"].as_u64() != Some(1) {
+        return Err("exempt kept none".to_owned());
+    }
+    let names = json!({ "allow": [], "refuse": [REFUSED] }).to_string();
+    call("PUT", NAMES_PATH, Some(&names))?;
+    let said = ask_udp(dns_server, REFUSED, deadline)
+        .map_or_else(|| NO_ANSWER.to_owned(), |answer| answer.summary());
+    if said != BLOCKED {
+        return Err(format!("refused {said}"));
+    }
+    let night = json!({ "night": PERSIST_NIGHT }).to_string();
+    if call("PUT", PANEL_PATH, Some(&night))?["night"].as_str() != Some(PERSIST_NIGHT) {
+        return Err("night not set".to_owned());
+    }
+    goodbye(&mut stream);
+    Ok(("put label exempt refused night".to_owned(), true))
+}
+
+/// The word that a path is called in the line of the step that put to it.
+fn path_word(path: &str) -> &'static str {
+    match path {
+        LABELS_PATH => "label",
+        EXEMPT_PATH => "exempt",
+        NAMES_PATH => "refused",
+        PANEL_PATH => "night",
+        _ => "devices",
+    }
+}
+
+/// What the second phase says: the words whose settings came back, then the words whose did not,
+/// each after `back` or `lost`.
+fn read_words(found: &[(&str, bool)]) -> String {
+    let words = |wanted: bool| -> Vec<&str> {
+        found
+            .iter()
+            .filter(|(_, came)| *came == wanted)
+            .map(|(word, _)| *word)
+            .collect()
+    };
+    let (back, lost) = (words(true), words(false));
+    let mut parts = Vec::new();
+    if !back.is_empty() {
+        parts.push(format!("back {}", back.join(" ")));
+    }
+    if !lost.is_empty() {
+        parts.push(format!("lost {}", lost.join(" ")));
+    }
+    parts.join(", ")
+}
+
+/// Whether the inventory holds the step's label for the step's address.
+fn labelled(devices: &Mutex<Devices>) -> bool {
+    let Ok(mac) = PERSIST_MAC.parse::<Mac>() else {
+        return false;
+    };
+    let inventory = devices.lock().unwrap_or_else(PoisonError::into_inner);
+    inventory
+        .kept()
+        .labels
+        .iter()
+        .any(|(held, label)| *held == mac && &**label == PERSIST_LABEL)
+}
+
 /// What `server` answers over UDP to the question `name` A, as [`udp`] asks it but in blocking work:
 /// for the exchanges that hold a connection open meanwhile. Given [`ANSWER_WAIT`], or what is left
 /// to `deadline` if that is less.
@@ -863,6 +1100,26 @@ mod tests {
         Arc<OwnerList>,
         Arc<Dns>,
     ) {
+        let clock: Arc<dyn Fn() -> (u64, u64) + Send + Sync> = Arc::new(|| (100, 1_800_000_000));
+        let devices = Arc::new(Mutex::new(Devices::new(
+            None,
+            Ipv4Addr::new(192, 0, 2, 1),
+            clock,
+        )));
+        names_service_over(denied, devices).await
+    }
+
+    /// [`names_service`], over the inventory `devices`, which the caller keeps to look at.
+    async fn names_service_over(
+        denied: &[String],
+        devices: Arc<Mutex<Devices>>,
+    ) -> (
+        SocketAddr,
+        SocketAddr,
+        &'static [u8],
+        Arc<OwnerList>,
+        Arc<Dns>,
+    ) {
         let dns = Dns::new(
             lists::from_config(denied, &[]).build(),
             Upstreams::with(vec![closed_port()], ms(300), ms(600)),
@@ -872,12 +1129,8 @@ mod tests {
         let list = Arc::new(OwnerList::new(SharedResolver::of(&dns)).starting_at(0));
         let clock: Arc<dyn Fn() -> (u64, u64) + Send + Sync> = Arc::new(|| (100, 1_800_000_000));
         let watch = Arc::new(QbpWatch {
-            alerts: Arc::new(AlertStore::new(clock.clone())),
-            devices: Arc::new(Mutex::new(Devices::new(
-                None,
-                Ipv4Addr::new(192, 0, 2, 1),
-                clock,
-            ))),
+            alerts: Arc::new(AlertStore::new(clock)),
+            devices,
             names: list.clone(),
             panel: Arc::new(PanelState::new(None, Some((23, 7)), Arc::new(|| 1_000))),
         });
@@ -973,6 +1226,188 @@ mod tests {
         .await;
 
         assert_eq!(line, "selftest: api: /api/qbp/names: no answer");
+        let took = started.elapsed();
+        assert!(took >= ms(600) && took < ms(4000), "{took:?}");
+    }
+
+    /// An empty inventory, as a start makes it, for the persistence step to put to and read.
+    fn empty_devices() -> Arc<Mutex<Devices>> {
+        let clock: Arc<dyn Fn() -> (u64, u64) + Send + Sync> = Arc::new(|| (100, 1_800_000_000));
+        Arc::new(Mutex::new(Devices::new(
+            None,
+            Ipv4Addr::new(192, 0, 2, 1),
+            clock,
+        )))
+    }
+
+    #[tokio::test]
+    async fn the_persistence_step_puts_the_settings_and_asks_the_restart_then_finds_them_back_and_changes_the_night_then_finds_that_back()
+     {
+        let devices = empty_devices();
+        let (dns_addr, api_addr, pem, list, _dns) = names_service_over(&[], devices.clone()).await;
+        let wait = Duration::from_secs(30);
+        let step = || {
+            persist(
+                api_addr,
+                dns_addr,
+                Some(pem),
+                "right",
+                wait,
+                devices.clone(),
+            )
+        };
+
+        // The first boot: nothing is there, so the step puts them, and says to restart.
+        let first = step().await;
+        assert_eq!(
+            first.line,
+            "selftest: persist: put label exempt refused night"
+        );
+        assert!(first.restart);
+        assert!(labelled(&devices));
+        assert_eq!(list.view().refuse, [REFUSED]);
+
+        // The second boot, which finds them as a restore would have put them: it reads, and puts
+        // the later hours. It asks no restart: the board's own saver is to keep them.
+        let second = step().await;
+        assert_eq!(
+            second.line,
+            "selftest: persist: back label exempt refused night, then put later-night"
+        );
+        assert!(!second.restart);
+        assert_eq!(list.rev(), 1, "nothing but the hours was put");
+
+        // The third boot, which finds the later hours: it only reads, and changes nothing.
+        let third = step().await;
+        assert_eq!(
+            third.line,
+            "selftest: persist: back label exempt refused later-night"
+        );
+        assert!(!third.restart);
+        assert_eq!(list.rev(), 1);
+        let fourth = step().await;
+        assert_eq!(fourth.line, third.line, "reading it again changes nothing");
+
+        // The lines hold no address, label or name, and no hours.
+        for text in [
+            PERSIST_MAC,
+            PERSIST_LABEL,
+            REFUSED,
+            PERSIST_NIGHT,
+            PERSIST_NIGHT_LATER,
+            "right",
+        ] {
+            for line in [&first.line, &second.line, &third.line] {
+                assert!(!line.contains(text), "{text}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn the_persistence_step_names_what_did_not_come_back() {
+        // Only the exempt address came back: no label, the name is not refused, the night is the
+        // configuration's.
+        let devices = empty_devices();
+        let mac = PERSIST_MAC.parse::<Mac>().unwrap();
+        devices.lock().unwrap().set_exempt(vec![mac]);
+        let (dns_addr, api_addr, pem, _list, _dns) = names_service_over(&[], devices.clone()).await;
+
+        let step = persist(
+            api_addr,
+            dns_addr,
+            Some(pem),
+            "right",
+            Duration::from_secs(30),
+            devices,
+        )
+        .await;
+
+        assert_eq!(
+            step.line,
+            "selftest: persist: back exempt, lost label refused night, then put later-night"
+        );
+        assert!(!step.restart);
+    }
+
+    #[tokio::test]
+    async fn the_persistence_step_is_in_its_third_phase_by_the_later_hours_and_says_what_is_lost() {
+        let devices = empty_devices();
+        let (dns_addr, api_addr, pem, _list, _dns) = names_service_over(&[], devices.clone()).await;
+        let wait = Duration::from_secs(30);
+        let step = || {
+            persist(
+                api_addr,
+                dns_addr,
+                Some(pem),
+                "right",
+                wait,
+                devices.clone(),
+            )
+        };
+        assert!(step().await.restart, "the first phase");
+        step().await; // the second phase puts the later hours
+
+        // A restore that lost the exempt address: the later hours say the phase, the line the loss,
+        // and nothing is put again.
+        devices.lock().unwrap().set_exempt(Vec::new());
+        let third = step().await;
+
+        assert_eq!(
+            third.line,
+            "selftest: persist: back label refused later-night, lost exempt"
+        );
+        assert!(!third.restart);
+    }
+
+    #[tokio::test]
+    async fn the_persistence_step_says_where_it_ended_and_does_not_ask_the_restart() {
+        let devices = empty_devices();
+        let (dns_addr, api_addr, pem, _list, _dns) = names_service_over(&[], devices.clone()).await;
+        let wait = Duration::from_secs(30);
+        let words = |step: Persisted| -> String {
+            assert!(!step.restart, "{}", step.line);
+            step.line
+                .strip_prefix("selftest: persist: ")
+                .unwrap_or_else(|| panic!("{}", step.line))
+                .to_owned()
+        };
+
+        let step = persist(
+            api_addr,
+            dns_addr,
+            Some(pem),
+            "wrong",
+            wait,
+            devices.clone(),
+        )
+        .await;
+        assert_eq!(words(step), "login 401");
+        let step = persist(api_addr, dns_addr, None, "right", wait, devices.clone()).await;
+        assert_eq!(words(step), "no certificate");
+        // A DNS service that the API's names do not reach does not block the name.
+        let (other_dns, ..) = names_service(&[]).await;
+        let step = persist(
+            api_addr,
+            other_dns,
+            Some(pem),
+            "right",
+            wait,
+            devices.clone(),
+        )
+        .await;
+        assert_eq!(words(step), "refused SERVFAIL");
+        // A server that is not there is given the wait and no more.
+        let started = Instant::now();
+        let step = persist(
+            closed_port(),
+            dns_addr,
+            Some(pem),
+            "right",
+            ms(700),
+            devices,
+        )
+        .await;
+        assert_eq!(words(step), "no answer");
         let took = started.elapsed();
         assert!(took >= ms(600) && took < ms(4000), "{took:?}");
     }

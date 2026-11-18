@@ -49,11 +49,11 @@ use sha2::{Digest, Sha256};
 
 use qberrypi::bootpart;
 use qberrypi::config::Fault;
-use qberrypi::slots::{self, Marker, Mode, Slot};
+use qberrypi::slots::{self, DEFAULT_TOUCH_XOHMS, Marker, Mode, Slot};
 
 use crate::build::{CMDLINE_TXT, CONFIG_TXT, read_build_epoch, slot_config_txt};
 use crate::image::{card_files, stand_in_firmware};
-use crate::sdimage::{self, Image};
+use crate::sdimage::{self, FileFacts, Image};
 use crate::slot;
 
 const QEMU: &str = "qemu-system-aarch64";
@@ -142,6 +142,20 @@ const BOOTED_LIKE_THE_FIRMWARE: &str = "QEMU does not run the Pi's boot firmware
     `tryboot` the same way is what the check on the Pi proves. QEMU has no Wi-Fi, clock or upstream \
     for a trial to wait for, so the build whose trial confirms is given the development switches \
     debug.trial_offline and debug.trial_confirm_secs";
+
+/// The name of the scenario where the owner's settings outlast a restart.
+const SETTINGS_SCENARIO: &str = "settings survive a restart";
+
+/// Printed with the scenario where the owner's settings outlast a restart.
+const SETTINGS_SURVIVE: &str = "the first boot is slot b on a trial that confirms (the owner's \
+    restart is refused during a trial), started by the same stand-in for the boot firmware as the \
+    trial scenarios; its self-test puts the settings through the API over loopback and asks the \
+    owner's restart, which makes the two copies and saves to copy a in place. The second boot \
+    restores them, puts other night hours and is left to run: the saver, not a restart, writes them \
+    to copy b after its quiet, through the raw partition with no mount, at the places mapped in the \
+    boot's read-only mount; the boot ends by the configured time, which saves nothing. The third \
+    boot restores them from copy b. QEMU's card is an image file: a power cut in the middle of a \
+    write, and a real card's timing, are not tried here";
 
 /// Printed with the scenario that asks the DNS and status servers over loopback.
 const NO_NETWORK: &str = "the guest has no network card, so every upstream is unreachable; this \
@@ -253,8 +267,17 @@ const TLS_PEM: &str = "qberrypi/tls.pem";
 const API_PASSWORD: &[u8] = qberrypi::selftest::API_PASSWORD.as_bytes();
 /// The log that a slot's build keeps in its own folder when `debug.log_to_sd` is on.
 const SLOT_LOG: &str = "log.txt";
+
+/// The two copies of the owner's settings, in their folder on the card, and what each begins with.
+/// Written out here (and not taken from the build) so that the card is checked against the format
+/// that was promised, not against the code that made it.
+const STATE_A: &str = "qberrypi-state/a.bin";
+const STATE_B: &str = "qberrypi-state/b.bin";
+const STATE_MAGIC: &[u8; 8] = b"QBPSTATE";
 /// What `tls.pem` holds in the slots of the scenarios' cards: a sentence, as the stand-in boot
-/// firmware's files are. The configurations have no `[api]` section, so nothing reads it as a key.
+/// firmware's files are. Most configurations have no `[api]` section, so nothing reads it as a key;
+/// the scenario whose configuration has one gets a key and certificate made for the run instead
+/// (`run_slots`).
 const SLOT_TLS_STAND_IN: &[u8] = b"A stand-in for the API's key: no scenario serves the API.\n";
 
 /// The template the scenarios make their `qberrypi.toml` from, under the repository root.
@@ -516,6 +539,9 @@ enum Machine {
     Shipped,
     /// `KERNEL_ARGS`, and the argument that has init ask its DNS and status servers over loopback.
     DnsSelftest,
+    /// `KERNEL_ARGS`, and the argument that has init put settings through the API and ask the owner's
+    /// restart, or find them restored (`qberrypi::selftest::persist`).
+    PersistSelftest,
 }
 
 impl Machine {
@@ -527,6 +553,7 @@ impl Machine {
             Self::WithWatchdog => KERNEL_ARGS_WITH_WATCHDOG.to_owned(),
             Self::Shipped => format!("{} {QEMU_NEEDS}", CMDLINE_TXT.trim()),
             Self::DnsSelftest => format!("{KERNEL_ARGS} {}", qberrypi::selftest::DNS_ARG),
+            Self::PersistSelftest => format!("{KERNEL_ARGS} {}", qberrypi::selftest::PERSIST_ARG),
         }
     }
 }
@@ -1017,6 +1044,9 @@ impl Drop for BootFolder {
     }
 }
 
+/// The files of a card by path, as `Image::facts` gives them.
+type Files = BTreeMap<String, FileFacts>;
+
 /// What the card holds after one boot of a card with two slots: the files that the boot rules
 /// read and write. A file that cannot be read is the reason, for the conditions to report.
 struct CardAfter {
@@ -1028,6 +1058,9 @@ struct CardAfter {
     marker: Result<Option<Vec<u8>>, String>,
     /// `log.txt` in the folder of slot a and of slot b; `None` for a slot that has none.
     logs: [Result<Option<String>, String>; 2],
+    /// Every file on the card, with its size, its first bytes and its SHA-256, for comparing the card
+    /// with what it held before the boot (`Image::facts`).
+    files: Result<Files, String>,
 }
 
 impl CardAfter {
@@ -1046,6 +1079,7 @@ impl CardAfter {
                 optional(card, &format!("{}/{SLOT_LOG}", slot.dir()))
                     .map(|log| log.map(|log| String::from_utf8_lossy(&log).into_owned()))
             }),
+            files: card.facts().map_err(|error| format!("{error:#}")),
         }
     }
 
@@ -1067,6 +1101,9 @@ struct BootEvidence {
     serial: String,
     /// Whether QEMU ended by itself in this boot.
     exited: bool,
+    /// The files the card held when this boot started: what the last boot left, or the image as it
+    /// was made.
+    found: Result<Files, String>,
     /// The card as this boot left it.
     card: CardAfter,
 }
@@ -1114,9 +1151,14 @@ fn run_boots(
     }
     let mut records = Vec::new();
     let mut tryboot = first_is_tryboot;
+    // What the last boot left on the card, which is what the next one finds.
+    let mut left: Option<Result<Files, String>> = None;
     for number in 1..=boots {
-        let (start, args, boot_folder) = {
+        let (start, args, boot_folder, found) = {
             let mut card = Image::open(image)?;
+            let found = left
+                .take()
+                .unwrap_or_else(|| card.facts().map_err(|error| format!("{error:#}")));
             let start = firmware_start(&mut card, tryboot)
                 .with_context(|| format!("boot {number} cannot be started"))?;
             let files = load_slot(&mut card, start.slot)
@@ -1124,7 +1166,7 @@ fn run_boots(
             let args = slot_kernel_args(machine, start.slot, &files.cmdline)
                 .with_context(|| format!("boot {number} cannot be started"))?;
             let path = folder.join(format!("{stem}-boot-{number}"));
-            (start, args, BootFolder::make(path, &files)?)
+            (start, args, BootFolder::make(path, &files)?, found)
         };
         let log = slot_boot_log(folder, stem, number);
         let (serial, exited) = boot(&BootRequest {
@@ -1136,6 +1178,7 @@ fn run_boots(
         drop(boot_folder);
 
         let card = CardAfter::read(&mut Image::open(image)?);
+        left = Some(card.files.clone());
         let restarted =
             exited || serial.contains(RESTART_REQUESTED) || serial.contains(GUEST_HALTED);
         tryboot = restart_was_tryboot(&serial);
@@ -1143,6 +1186,7 @@ fn run_boots(
             start,
             serial,
             exited,
+            found,
             card,
         });
         if !restarted {
@@ -1150,6 +1194,23 @@ fn run_boots(
         }
     }
     Ok(records)
+}
+
+/// A slot's own `config.txt` as the scenarios' configurations make it: none of them sets
+/// `[panel] touch_xohms` (a test holds them to that), so its plate resistance is the default.
+fn slot_config(slot: Slot) -> String {
+    slot_config_txt(slot, DEFAULT_TOUCH_XOHMS)
+}
+
+/// Puts `pem`, a key and certificate made for the run, in place of the stand-in in every slot's
+/// `tls.pem` among `files`, the files of a card; no other file is touched.
+fn put_certificate(files: &mut [(String, Vec<u8>)], pem: &str) {
+    let tls = format!("/{}", slot::TLS_FILE);
+    for (name, bytes) in files {
+        if name.ends_with(&tls) {
+            *bytes = pem.as_bytes().to_vec();
+        }
+    }
 }
 
 /// The files of a card with two slots with the trial of `plan` staged on it, as an update
@@ -1167,18 +1228,20 @@ fn staged_card_files(
     config_a: &str,
     epoch: u64,
 ) -> Result<Vec<(String, Vec<u8>)>> {
-    let slot_a = build.slot_files(Slot::A, config_a.as_bytes(), SLOT_TLS_STAND_IN);
-    let slot_b = build.slot_files(Slot::B, plan.config_b.as_bytes(), SLOT_TLS_STAND_IN);
+    let slot_a = build.slot_files(Slot::A, config_a.as_bytes(), SLOT_TLS_STAND_IN)?;
+    let slot_b = build.slot_files(Slot::B, plan.config_b.as_bytes(), SLOT_TLS_STAND_IN)?;
     let selected = match plan.mode {
         Mode::Tryboot => Slot::A,
         Mode::Software => Slot::B,
     };
     let mut files = card_files(&stand_in_firmware(), &slot_a, &slot_b, selected)?;
     if plan.mode == Mode::Tryboot {
-        files.push((
-            slots::TRYBOOT_FILE.to_owned(),
-            slot_config_txt(Slot::B).into_bytes(),
-        ));
+        let config_b = slot_b
+            .iter()
+            .find(|(name, _)| name == "config.txt")
+            .map(|(_, bytes)| bytes.clone())
+            .context("slot b's files have no config.txt")?;
+        files.push((slots::TRYBOOT_FILE.to_owned(), config_b));
     }
     let marker = Marker {
         slot: Slot::B,
@@ -1311,7 +1374,7 @@ impl Evidence {
             number,
             format!("config.txt on the card is slot {slot}'s own: it selects slot {slot}"),
             |boot| match &boot.card.config {
-                Ok(config) if config == slot_config_txt(slot).as_bytes() => Ok(()),
+                Ok(config) if config == slot_config(slot).as_bytes() => Ok(()),
                 Ok(config) => Err(format!("it is {:?}", String::from_utf8_lossy(config))),
                 Err(error) => Err(error.clone()),
             },
@@ -1367,7 +1430,7 @@ impl Evidence {
             false => format!("{} is not on the card", slots::TRYBOOT_FILE),
         };
         self.on_boot(number, what, |boot| match (&boot.card.tryboot, staged) {
-            (Ok(Some(text)), true) if text == slot_config_txt(Slot::B).as_bytes() => Ok(()),
+            (Ok(Some(text)), true) if text == slot_config(Slot::B).as_bytes() => Ok(()),
             (Ok(None), false) => Ok(()),
             (Ok(Some(text)), _) => Err(format!("it is {:?}", String::from_utf8_lossy(text))),
             (Ok(None), true) => Err("it is gone".into()),
@@ -1436,6 +1499,104 @@ impl Evidence {
                 }
                 Ok(None) => Err("there is no such log".into()),
                 Err(error) => Err(error.clone()),
+            },
+        )
+    }
+
+    /// The serial console of boot `number` has all of `texts`, each after the one before it.
+    fn boot_serial_has_in_order(&self, number: usize, texts: &[&str]) -> Condition {
+        self.on_boot(
+            number,
+            format!(
+                "the serial console has, in this order, `{}`",
+                texts.join("`, `")
+            ),
+            |boot| {
+                let mut from = 0;
+                for text in texts {
+                    match boot.serial[from..].find(text) {
+                        Some(at) => from += at + text.len(),
+                        None => return Err(format!("it has no `{text}` at that place")),
+                    }
+                }
+                Ok(())
+            },
+        )
+    }
+
+    /// The paths of the files that boot `number` changed on the card, sorted: those that are there
+    /// after it and were not before, those that are gone, and those with other contents.
+    fn files_changed_in(boot: &BootEvidence) -> Result<Vec<String>, String> {
+        let (before, after) = match (&boot.found, &boot.card.files) {
+            (Ok(before), Ok(after)) => (before, after),
+            (Err(error), _) | (_, Err(error)) => return Err(error.clone()),
+        };
+        let mut changed: Vec<String> = after
+            .iter()
+            .filter(|(path, facts)| before.get(*path) != Some(*facts))
+            .map(|(path, _)| path.clone())
+            .chain(
+                before
+                    .keys()
+                    .filter(|path| !after.contains_key(*path))
+                    .cloned(),
+            )
+            .collect();
+        changed.sort();
+        changed.dedup();
+        Ok(changed)
+    }
+
+    /// The files that boot `number` changed on the card (see `files_changed_in`) are exactly
+    /// `expected` (in any order): nothing else on the card was written, made or removed.
+    fn boot_changed_only(&self, number: usize, expected: &[&str]) -> Condition {
+        let mut expected = expected.to_vec();
+        expected.sort_unstable();
+        self.on_boot(
+            number,
+            format!(
+                "the only files that changed, appeared or went from the card are `{}`",
+                expected.join("`, `")
+            ),
+            |boot| {
+                let changed = Self::files_changed_in(boot)?;
+                match changed == expected {
+                    true => Ok(()),
+                    false => Err(format!("they are `{}`", changed.join("`, `"))),
+                }
+            },
+        )
+    }
+
+    /// After boot `number` the card has both copies of the saved settings, each of `FILE_SIZE`
+    /// bytes, and each of the copies in `framed` begins with the magic.
+    fn boot_state_files_are_whole(&self, number: usize, framed: &[&str]) -> Condition {
+        let framed = framed.to_vec();
+        self.on_boot(
+            number,
+            format!(
+                "{STATE_A} and {STATE_B} are on the card, each {} bytes, and {} begin{} with {}",
+                qberrypi::state::format::FILE_SIZE,
+                framed.join(" and "),
+                if framed.len() == 1 { "s" } else { "" },
+                String::from_utf8_lossy(STATE_MAGIC)
+            ),
+            |boot| {
+                let files = boot.card.files.as_ref().map_err(Clone::clone)?;
+                for path in [STATE_A, STATE_B] {
+                    let Some(facts) = files.get(path) else {
+                        return Err(format!("{path} is not there"));
+                    };
+                    if facts.size != qberrypi::state::format::FILE_SIZE as u64 {
+                        return Err(format!("{path} is {} bytes", facts.size));
+                    }
+                }
+                for path in &framed {
+                    if files[*path].head != *STATE_MAGIC {
+                        return Err(format!("{path} begins with {:?}", files[*path].head));
+                    }
+                }
+                Ok(())
             },
         )
     }
@@ -1895,6 +2056,128 @@ fn trial_fails_software_conditions(evidence: &Evidence) -> Vec<Condition> {
     trial_fails_conditions(evidence, Mode::Software)
 }
 
+/// The scenario where the owner's settings outlast a restart, three boots of slot b.
+///
+/// Boot 1 (a trial that confirms) puts a label, an exempt address, a refused name and night hours
+/// through the API and asks the owner's restart, which makes the two copies on the card and saves
+/// the settings to copy a. Boot 2 restores them, its self-test finds each one back and puts other
+/// night hours, and the board runs on: the saver, by its own debounce and with no restart, writes
+/// them in place to copy b (the extents were mapped in the read-only mount of the boot, and the raw
+/// write mounts nothing), and the boot ends by the configured time, which saves nothing. Boot 3
+/// restores copy b, with the other night hours, and changes nothing. After each boot the card is
+/// compared with what it held before: boot 1 makes the two state files and the log and confirms the
+/// trial, boot 2 changes the log and copy b and nothing else (copy a is byte for byte what it was),
+/// boot 3 changes the log alone.
+fn settings_survive_conditions(evidence: &Evidence) -> Vec<Condition> {
+    let build = evidence.build_epoch;
+    let allowed = &Allowed::NO_WATCHDOG_NO_LED;
+    let on_trial = format!("INFO  update: slot b is on trial: build {build}, from slot a");
+    let confirmed = format!("INFO  update: build {build} confirmed on slot b");
+    let running = "INFO  update: slot b is running, with no trial under way";
+    let put = "INFO  selftest: persist: put label exempt refused night";
+    let made = "INFO  state: made the two copies on the card";
+    let saved_a = "INFO  state: saved to copy a (seq 1)";
+    let saved_b = "INFO  state: saved to copy b (seq 2)";
+    let restored_a = "INFO  state: settings restored from copy a (seq 1): 1 ADS PASS, 0 blocked, \
+                      1 labels, 0 known, 1 names, no lock, night kept";
+    let restored_b = "INFO  state: settings restored from copy b (seq 2): 1 ADS PASS, 0 blocked, \
+                      1 labels, 0 known, 1 names, no lock, night kept";
+    let back = "INFO  selftest: persist: back label exempt refused night, then put later-night";
+    let back_later = "INFO  selftest: persist: back label exempt refused later-night";
+    let owner_restart = "the owner restarted the board";
+    let returning = "INFO  returning";
+    let log = "qberrypi-b/log.txt";
+    vec![
+        evidence.booted(3),
+        // Boot 1: the trial confirms (so the restart is allowed), then the settings are put and
+        // the owner's restart saves them, in this order.
+        evidence.boot_started(1, Slot::B, Settings::Tryboot),
+        evidence.boot_serial_has(1, &banner_start()),
+        evidence.boot_serial_has(1, &on_trial),
+        evidence.boot_serial_has(1, &confirmed),
+        evidence.boot_serial_has(1, "INFO  state: no saved settings on the card"),
+        evidence.boot_serial_has(1, put),
+        evidence.boot_serial_has(1, made),
+        evidence.boot_serial_has(1, saved_a),
+        evidence.boot_serial_has_in_order(1, &[put, made, saved_a, RESTART_REQUESTED]),
+        evidence.boot_serial_lacks(1, "state: saved to copy b"),
+        // The restart is the owner's, not the configured time passing.
+        evidence.boot_serial_lacks(1, returning),
+        evidence.boot_restart_requested(1),
+        evidence.boot_restart_is_plain(1),
+        evidence.boot_config_selects(1, Slot::B),
+        evidence.boot_has_no_marker(1),
+        evidence.boot_tryboot_txt(1, true),
+        evidence.boot_no_unexpected_complaint(1, allowed),
+        evidence.boot_log_has(1, Slot::B, saved_a),
+        // The card after boot 1: both copies, whole, and nothing else but the confirm and the log.
+        evidence.boot_state_files_are_whole(1, &[STATE_A]),
+        evidence.boot_changed_only(
+            1,
+            &["config.txt", slots::MARKER_FILE, log, STATE_A, STATE_B],
+        ),
+        // Boot 2: slot b again, no trial; copy a is restored, and the self-test finds it all back
+        // and puts other night hours.
+        evidence.boot_started(2, Slot::B, Settings::Config),
+        evidence.boot_serial_has(2, &banner_start()),
+        evidence.boot_serial_has(2, running),
+        evidence.boot_serial_has(2, restored_a),
+        evidence.boot_serial_has(2, back),
+        evidence.boot_serial_lacks(2, "selftest: persist: put label"),
+        // The common save path: the saver's debounce, not a restart, writes copy b in place with
+        // the sequence after copy a's, after the change and before the boot ends by the clock. The
+        // copies already exist, so nothing is made, and copy a is not written again.
+        evidence.boot_serial_has(2, saved_b),
+        evidence.boot_serial_has_in_order(2, &[restored_a, back, saved_b, returning]),
+        evidence.boot_serial_lacks(2, made),
+        evidence.boot_serial_lacks(2, "state: saved to copy a"),
+        evidence.boot_serial_lacks(2, owner_restart),
+        evidence.boot_serial_has(2, returning),
+        evidence.boot_restart_requested(2),
+        evidence.boot_config_selects(2, Slot::B),
+        evidence.boot_has_no_marker(2),
+        evidence.boot_tryboot_txt(2, true),
+        evidence.boot_no_unexpected_complaint(2, allowed),
+        evidence.boot_log_has(2, Slot::B, saved_b),
+        // The card after boot 2: both copies are whole, copy b holds a frame now, and the only files
+        // that changed are the log and copy b: copy a is byte for byte what it was.
+        evidence.boot_state_files_are_whole(2, &[STATE_A, STATE_B]),
+        evidence.boot_changed_only(2, &[log, STATE_B]),
+        evidence.boot_log_is_of_boots(2, Slot::B, 2),
+        evidence.boot_has_no_log(2, Slot::A),
+        // Boot 3: slot b again; copy b is the newest, and the changed hours are back.
+        evidence.boot_started(3, Slot::B, Settings::Config),
+        evidence.boot_serial_has(3, &banner_start()),
+        evidence.boot_serial_has(3, running),
+        evidence.boot_serial_has(3, restored_b),
+        evidence.boot_serial_has(3, back_later),
+        evidence.boot_serial_lacks(3, "selftest: persist: put"),
+        // Nothing changed, so nothing was made or saved.
+        evidence.boot_serial_lacks(3, made),
+        evidence.boot_serial_lacks(3, "state: saved to copy"),
+        evidence.boot_serial_has(3, returning),
+        evidence.boot_restart_requested(3),
+        evidence.boot_exited(3),
+        evidence.boot_config_selects(3, Slot::B),
+        evidence.boot_has_no_marker(3),
+        evidence.boot_tryboot_txt(3, true),
+        evidence.boot_no_unexpected_complaint(3, allowed),
+        // The card after boot 3: the log is all that changed.
+        evidence.boot_state_files_are_whole(3, &[STATE_A, STATE_B]),
+        evidence.boot_changed_only(3, &[log]),
+        evidence.boot_log_is_of_boots(3, Slot::B, 3),
+        evidence.boot_has_no_log(3, Slot::A),
+        // No secret and no setting is in a log: the key is not, and the line says no value.
+        evidence.boot_serial_lacks(1, "PRIVATE KEY"),
+        evidence.boot_serial_lacks(2, "PRIVATE KEY"),
+        evidence.boot_serial_lacks(3, "PRIVATE KEY"),
+        evidence.boot_serial_lacks(1, PASSPHRASE),
+        evidence.boot_serial_lacks(2, PASSPHRASE),
+        evidence.boot_serial_lacks(3, PASSPHRASE),
+        evidence.boot_log_lacks(3, Slot::B, PASSPHRASE),
+    ]
+}
+
 /// Makes the scenarios from the text of `qberrypi.example.toml`.
 fn scenarios(example: &str) -> Result<Vec<Scenario>> {
     // The supervisor starts the components only after the wait for `wlan0`, 20 s in QEMU, and the
@@ -1989,6 +2272,32 @@ fn scenarios(example: &str) -> Result<Vec<Scenario>> {
         ],
     )?;
     let slot_b_panics = edited(&slot_a, &[("fault = \"none\"", "fault = \"trial_panic\"")])?;
+    // The settings that outlast a restart: both slots serve the API (the self-test puts through it,
+    // with a throwaway password and a certificate made for the run), return 85 s in rather than
+    // 40 s (below the 90 s that the scenarios may not reach, see the test of the returns), since
+    // the services start after the 20 s wait for `wlan0`, the self-test follows, and the second
+    // boot's saver then waits out its 30 s of quiet and its 5 s poll before it writes the changed
+    // settings (a boot that is ended by the clock must not be the one that saves them). Slot b's
+    // trial confirms as in the scenario above, so that the owner's restart is not
+    // refused for a trial. The owner's restart ends the first boot well before that.
+    let api_section = format!(
+        "\n[api]\n{}\n",
+        crate::hashpw::hash_line(API_PASSWORD, [0; 16])?
+    );
+    let persist_a = format!(
+        "{}{api_section}",
+        edited(
+            &slot_a,
+            &[("return_after_secs = 40", "return_after_secs = 85")]
+        )?
+    );
+    let persist_b = edited(
+        &persist_a,
+        &[
+            ("trial_confirm_secs = 0", "trial_confirm_secs = 5"),
+            ("trial_offline = false", "trial_offline = true"),
+        ],
+    )?;
 
     // What the scenarios are about is in these switches, so they are read back.
     let switches = |text: &str| {
@@ -2037,6 +2346,20 @@ fn scenarios(example: &str) -> Result<Vec<Scenario>> {
         || trial_switches(&slot_b_panics)? != ((false, true, 40), Fault::TrialPanic, (0, false))
     {
         bail!("{EXAMPLE_CONFIG} did not take the trial scenarios' debug settings");
+    }
+    // What the settings scenario is about: the settings are kept, the API is served, 85 s in the boot
+    // returns, and the nights that its self-test sets are not the one the configuration has.
+    for (text, confirm) in [(&persist_a, (0, false)), (&persist_b, (5, true))] {
+        let cfg = qberrypi::config::parse(text)
+            .map_err(|error| anyhow!("{EXAMPLE_CONFIG}, edited for a scenario: {error}"))?;
+        let kept = (cfg.state.persist, cfg.api.is_some(), cfg.panel_boot.night);
+        let timing = (
+            cfg.debug.return_after_secs,
+            (cfg.debug.trial_confirm_secs, cfg.debug.trial_offline),
+        );
+        if kept != (true, true, Some((23, 7))) || timing != (85, confirm) {
+            bail!("{EXAMPLE_CONFIG} did not take the settings scenario's configuration");
+        }
     }
 
     Ok(vec![
@@ -2177,6 +2500,19 @@ fn scenarios(example: &str) -> Result<Vec<Scenario>> {
                 boots: 2,
             }),
             conditions: trial_fails_software_conditions,
+        },
+        Scenario {
+            name: SETTINGS_SCENARIO,
+            machine: Machine::PersistSelftest,
+            note: Some(SETTINGS_SURVIVE),
+            file_stem: "settings-survive-a-restart",
+            system_config: persist_a,
+            card: CardPlan::Slots(SlotPlan {
+                config_b: persist_b,
+                mode: Mode::Tryboot,
+                boots: 3,
+            }),
+            conditions: settings_survive_conditions,
         },
     ])
 }
@@ -2485,7 +2821,15 @@ fn run_slots(
     let files = {
         let slot_build = slot::Build::read(&build.folder)
             .with_context(|| format!("{}: cannot read the build", scenario.name))?;
-        staged_card_files(&slot_build, plan, &scenario.system_config, build.epoch)?
+        let mut files = staged_card_files(&slot_build, plan, &scenario.system_config, build.epoch)?;
+        // A scenario whose configuration serves the API has a key and a certificate made for
+        // the run, in both slots, in place of the stand-in that no scenario serves with.
+        let certificate = card_certificate(&scenario.system_config, crate::unix_time()?)
+            .with_context(|| format!("{}: cannot make the API's certificate", scenario.name))?;
+        if let Some(pem) = certificate {
+            put_certificate(&mut files, &pem);
+        }
+        files
     };
     sdimage::build_sized(&image, sdimage::IMAGE_BYTES, &files)?;
     drop(files);
@@ -2720,7 +3064,7 @@ mod tests {
 
         let (serial, exited) = run_guest(
             shell("echo $$; echo started; exec sleep 600"),
-            Duration::from_millis(500),
+            Duration::from_secs(3),
             None,
         )
         .unwrap();
@@ -2935,9 +3279,10 @@ mod tests {
 
     #[test]
     fn the_scenarios_differ_from_the_example_only_in_their_debug_settings() {
-        // The three trial scenarios come after these eleven and have a test of their own.
+        // The three trial scenarios and the settings scenario come after these eleven and have
+        // tests of their own.
         let mut all = scenarios(EXAMPLE).unwrap();
-        assert_eq!(all.len(), 14);
+        assert_eq!(all.len(), 15);
         all.truncate(11);
         let [
             one_shot,
@@ -3094,7 +3439,9 @@ mod tests {
                 // The trial scenarios.
                 Machine::Usual,
                 Machine::Usual,
-                Machine::Usual
+                Machine::Usual,
+                // The settings that outlast a restart.
+                Machine::PersistSelftest
             ]
         );
         // A scenario that is not on the usual machine says so, and so does one that boots a card
@@ -3124,7 +3471,8 @@ mod tests {
                 "permanent-crash-loop",
                 "trial-confirms",
                 "trial-fails-firmware",
-                "trial-fails-software"
+                "trial-fails-software",
+                "settings-survive-a-restart"
             ]
         );
     }
@@ -3213,7 +3561,8 @@ mod tests {
     }
 
     #[test]
-    fn the_dns_scenario_alone_serves_the_api_with_a_throwaway_password_and_certificate() {
+    fn the_dns_and_the_settings_scenarios_alone_serve_the_api_with_a_throwaway_password_and_certificate()
+     {
         let all = scenarios(EXAMPLE).unwrap();
         for scenario in &all {
             let cert = card_certificate(&scenario.system_config, 1_800_000_000).unwrap();
@@ -3221,10 +3570,10 @@ mod tests {
             let api = qberrypi::config::parse(&scenario.system_config)
                 .ok()
                 .and_then(|cfg| cfg.api);
-            if scenario.name == "dns without a network" {
+            if scenario.name == "dns without a network" || scenario.name == SETTINGS_SCENARIO {
                 // The password is `qemu`, hashed with a zero salt; nothing here is a secret.
                 let hash = api
-                    .expect("the DNS scenario has an [api] section")
+                    .expect("the scenario has an [api] section")
                     .password_hash;
                 assert!(hash.verify(b"qemu"));
                 // The certificate fits its hostname and address, and the server takes it.
@@ -3233,6 +3582,78 @@ mod tests {
             } else {
                 assert!(api.is_none(), "{}", scenario.name);
                 assert_eq!(cert, None, "{}", scenario.name);
+            }
+        }
+    }
+
+    #[test]
+    fn the_settings_scenario_serves_the_api_keeps_the_settings_and_sets_a_night_the_example_lacks()
+    {
+        let all = scenarios(EXAMPLE).unwrap();
+        let scenario = &all[14];
+        assert_eq!(scenario.name, SETTINGS_SCENARIO);
+        let CardPlan::Slots(plan) = &scenario.card else {
+            panic!("the settings scenario boots a card with two slots");
+        };
+        // Slot b is on a trial that confirms (an owner's restart is refused during a trial), the
+        // three boots are the first save (the owner's restart's), the second (the saver's own, which
+        // the boot has to stay up for) and the restore, and 85 s is room for the self-test and the
+        // saver's 30 s of quiet and 5 s poll, and under the 90 s that no scenario may reach.
+        assert_eq!((plan.mode, plan.boots), (Mode::Tryboot, 3));
+        assert_eq!(
+            changed(&scenario.system_config),
+            ["log_to_sd = true", "return_after_secs = 85"]
+        );
+        assert_eq!(
+            changed(&plan.config_b),
+            [
+                "log_to_sd = true",
+                "return_after_secs = 85",
+                "trial_confirm_secs = 5",
+                "trial_offline = true"
+            ]
+        );
+        for text in [&scenario.system_config, &plan.config_b] {
+            let cfg = qberrypi::config::parse(text).unwrap();
+            assert!(cfg.state.persist && cfg.api.is_some());
+            // The night that the self-test sets is not the configuration's, or a restore would be
+            // told from nothing.
+            assert_eq!(cfg.panel_boot.night, Some((23, 7)));
+            assert!(cfg.panel_boot.pin_hash.is_none());
+        }
+        // The self-test is its own argument, beside the usual ones and never with the DNS one.
+        let args = scenario.machine.kernel_args();
+        assert_eq!(args, format!("{KERNEL_ARGS} qberrypi.selftest.persist"));
+        assert!(!args.contains(qberrypi::selftest::DNS_ARG));
+        for other in all.iter().filter(|s| s.name != SETTINGS_SCENARIO) {
+            assert!(
+                !other
+                    .machine
+                    .kernel_args()
+                    .contains(qberrypi::selftest::PERSIST_ARG),
+                "{}",
+                other.name
+            );
+        }
+    }
+
+    #[test]
+    fn a_certificate_made_for_the_run_replaces_the_stand_in_in_both_slots_and_nothing_else() {
+        let mut files = staged_files(Mode::Tryboot);
+        let before = files.clone();
+
+        put_certificate(
+            &mut files,
+            "-----BEGIN CERTIFICATE-----\nmade for the run\n",
+        );
+
+        for ((name, new), (_, old)) in files.iter().zip(&before) {
+            match name.as_str() {
+                "qberrypi-a/tls.pem" | "qberrypi-b/tls.pem" => {
+                    assert_eq!(old, SLOT_TLS_STAND_IN, "{name}");
+                    assert!(new.starts_with(b"-----BEGIN CERTIFICATE-----"), "{name}");
+                }
+                _ => assert_eq!(new, old, "{name}"),
             }
         }
     }
@@ -5115,7 +5536,9 @@ mod tests {
                 most.fetch_max(running.fetch_add(1, SeqCst) + 1, SeqCst);
                 // The first two wait for each other, so that they are known to overlap.
                 let waiting_since = Instant::now();
-                while index < 2 && running.load(SeqCst) < 2 && waiting_since.elapsed().as_secs() < 5
+                while index < 2
+                    && running.load(SeqCst) < 2
+                    && waiting_since.elapsed().as_secs() < 30
                 {
                     thread::sleep(Duration::from_millis(5));
                 }
@@ -5140,17 +5563,23 @@ mod tests {
 
     #[test]
     fn the_error_returned_is_the_first_in_the_order_of_the_jobs_not_the_first_to_happen() {
+        use std::sync::atomic::{AtomicBool, Ordering::SeqCst};
         let mut finished = Vec::new();
+        let three_failed = AtomicBool::new(false);
 
         let error = run_concurrently(
             4,
             4,
             |index| match index {
                 1 => {
-                    thread::sleep(Duration::from_millis(150));
+                    // Fails after job 3 has, on a host of any speed, and so is claimed with it.
+                    wait_for(&three_failed, "job 3 never failed");
                     bail!("one")
                 }
-                3 => bail!("three"),
+                3 => {
+                    three_failed.store(true, SeqCst);
+                    bail!("three")
+                }
                 _ => Ok(index),
             },
             |index, _| finished.push(index),
@@ -5163,10 +5592,24 @@ mod tests {
         assert_eq!(finished, [0, 1, 2, 3]);
     }
 
+    /// Waits until `flag` is set, for ten seconds at most, and panics with `what` if it is not.
+    fn wait_for(flag: &std::sync::atomic::AtomicBool, what: &str) {
+        let waiting_since = Instant::now();
+        while !flag.load(std::sync::atomic::Ordering::SeqCst) {
+            assert!(waiting_since.elapsed().as_secs() < 10, "{what}");
+            thread::sleep(Duration::from_millis(1));
+        }
+    }
+
     /// Where the stand-in guest of a job writes its process id.
     fn pid_file(dir: &Path, index: usize) -> PathBuf {
         dir.join(format!("guest-{index}.pid"))
     }
+
+    /// How long the guard of a stand-in guest lets it run: far longer than the job that fails
+    /// takes to do so, because a stand-in that ended first would free its thread to start another
+    /// job, and the test would count that as a job started after the failure.
+    const STAND_IN_GUARD: Duration = Duration::from_secs(10);
 
     /// A job that boots a stand-in guest, which would run for 30 s if its guard did not stop it.
     fn stand_in_guest(dir: &Path, index: usize) -> Result<bool> {
@@ -5174,7 +5617,7 @@ mod tests {
             "echo $$ > {}; exec sleep 30",
             pid_file(dir, index).display()
         );
-        let (_, exited) = run_guest(shell(&script), Duration::from_secs(1), None)?;
+        let (_, exited) = run_guest(shell(&script), STAND_IN_GUARD, None)?;
         Ok(exited)
     }
 
@@ -5225,8 +5668,12 @@ mod tests {
         )
         .unwrap_err();
 
-        // Back once the guards have stopped the guests: far less than the 30 s they would run.
-        assert!(started.elapsed() < Duration::from_secs(15));
+        // Back once the guards have stopped the guests: less than the 30 s they would run.
+        assert!(
+            started.elapsed() < Duration::from_secs(25),
+            "{:?}",
+            started.elapsed()
+        );
         assert_eq!(error.to_string(), "job 0 could not be run");
         assert_eq!(begun.load(SeqCst), 3, "a job was started after the failure");
         assert_stand_ins_are_gone(dir.path(), &[1, 2]);
@@ -5258,7 +5705,11 @@ mod tests {
 
         // The panic arrives as it was raised, after the other jobs are over.
         assert_eq!(panic.downcast_ref::<&str>(), Some(&"job 0 blew up"));
-        assert!(started.elapsed() < Duration::from_secs(15));
+        assert!(
+            started.elapsed() < Duration::from_secs(25),
+            "{:?}",
+            started.elapsed()
+        );
         assert_eq!(begun.load(SeqCst), 3, "a job was started after the panic");
         assert_stand_ins_are_gone(dir.path(), &[1, 2]);
     }
@@ -5631,11 +6082,11 @@ mod tests {
 
         assert_eq!(
             card.config.as_ref().unwrap(),
-            slot_config_txt(Slot::A).as_bytes()
+            slot_config(Slot::A).as_bytes()
         );
         assert_eq!(
             card.tryboot.as_ref().unwrap().as_deref(),
-            Some(slot_config_txt(Slot::B).as_bytes())
+            Some(slot_config(Slot::B).as_bytes())
         );
         let marker = card.marker.as_ref().unwrap().as_deref().unwrap();
         assert!(marker.starts_with(b"slot=b\nfrom=a\n"));
@@ -5671,10 +6122,7 @@ mod tests {
                 ));
                 if asked.len() == 1 {
                     let mut selected = files.clone();
-                    selected.push((
-                        "config.txt".to_owned(),
-                        slot_config_txt(Slot::A).into_bytes(),
-                    ));
+                    selected.push(("config.txt".to_owned(), slot_config(Slot::A).into_bytes()));
                     card_at(dir.path(), &selected);
                 }
                 Ok((PLAIN_RESTART.to_owned(), false))
@@ -5706,12 +6154,20 @@ mod tests {
         // The card that each boot left is read after the boot, so the guest's write shows in both.
         assert_eq!(
             boots[0].card.config.as_ref().unwrap(),
-            slot_config_txt(Slot::A).as_bytes()
+            slot_config(Slot::A).as_bytes()
         );
         assert_eq!(
             boots[1].card.config.as_ref().unwrap(),
-            slot_config_txt(Slot::A).as_bytes()
+            slot_config(Slot::A).as_bytes()
         );
+        // What each boot found on the card and what it changed: boot 1 rewrote `config.txt`, which
+        // shows as its change, and boot 2 found the card as boot 1 left it and changed nothing.
+        assert_eq!(
+            Evidence::files_changed_in(&boots[0]),
+            Ok(vec!["config.txt".to_owned()])
+        );
+        assert_eq!(Evidence::files_changed_in(&boots[1]), Ok(Vec::new()));
+        assert_eq!(boots[1].found, boots[0].card.files);
         // The folder of each boot is gone once the boot is.
         assert!(!dir.path().join("t-boot-1").exists());
         assert!(!dir.path().join("t-boot-2").exists());
@@ -5853,10 +6309,11 @@ mod tests {
         logs: [Option<String>; 2],
     ) -> CardAfter {
         CardAfter {
-            config: Ok(slot_config_txt(selected).into_bytes()),
-            tryboot: Ok(tryboot.then(|| slot_config_txt(Slot::B).into_bytes())),
+            config: Ok(slot_config(selected).into_bytes()),
+            tryboot: Ok(tryboot.then(|| slot_config(Slot::B).into_bytes())),
             marker: Ok(marker.map(|marker| marker.render().into_bytes())),
             logs: logs.map(Ok),
+            files: Ok(Files::new()),
         }
     }
 
@@ -5902,6 +6359,7 @@ mod tests {
                     },
                     serial: slot_serial(&first),
                     exited: false,
+                    found: Ok(Files::new()),
                     card: card_after(Slot::B, true, None, [None, Some(boot_log(&first))]),
                 },
                 BootEvidence {
@@ -5911,6 +6369,7 @@ mod tests {
                     },
                     serial: slot_serial(RUNNING_BOOT_LINES),
                     exited: false,
+                    found: Ok(Files::new()),
                     card: card_after(Slot::B, true, None, [None, Some(both)]),
                 },
             ],
@@ -5972,6 +6431,7 @@ mod tests {
                     },
                     serial: slot_serial(&first),
                     exited: false,
+                    found: Ok(Files::new()),
                     card: card_after(
                         Slot::A,
                         staged,
@@ -5986,6 +6446,7 @@ mod tests {
                     },
                     serial: slot_serial(&second),
                     exited: false,
+                    found: Ok(Files::new()),
                     card: card_after(
                         Slot::A,
                         staged,
@@ -5998,6 +6459,412 @@ mod tests {
         }
     }
 
+    /// The facts of a file whose contents are made up: its length, its first bytes, and a digest
+    /// that is any text that tells it from another.
+    fn facts_of(size: u64, head: &[u8], digest: &str) -> FileFacts {
+        let mut first = [0u8; 8];
+        first[..head.len()].copy_from_slice(head);
+        FileFacts {
+            size,
+            head: first,
+            sha256: digest.to_owned(),
+        }
+    }
+
+    /// The card of the settings scenario at four moments: `0` as it is made, `1` after the boot that
+    /// makes the copies and saves to a (slot b's confirm selected slot b and took the marker, the log
+    /// is new and both copies are there, b still the fill), `2` after the boot whose saver writes copy
+    /// b (the log and copy b are other), `3` after the boot that restores it (only the log is other).
+    fn settings_files(moment: usize) -> Files {
+        let size = qberrypi::state::format::FILE_SIZE as u64;
+        let mut files = Files::new();
+        let mut put = |path: &str, size: u64, head: &[u8], digest: &str| {
+            files.insert(path.to_owned(), facts_of(size, head, digest));
+        };
+        put("qberrypi-a/kernel8.img", 4096, b"kernel", "kernel");
+        put("qberrypi-b/kernel8.img", 4096, b"kernel", "kernel");
+        put("tryboot.txt", 30, b"os_prefi", "tryboot");
+        match moment {
+            0 => {
+                put("config.txt", 30, b"os_prefi", "config a");
+                put(slots::MARKER_FILE, 20, b"slot=b", "marker");
+            }
+            _ => put("config.txt", 30, b"os_prefi", "config b"),
+        }
+        if moment >= 1 {
+            put(
+                "qberrypi-b/log.txt",
+                800 + 100 * moment as u64,
+                b"==== boo",
+                &format!("log {moment}"),
+            );
+            put(STATE_A, size, STATE_MAGIC, "copy a");
+            match moment {
+                1 => put(STATE_B, size, b"fillfill", "fill b"),
+                _ => put(STATE_B, size, STATE_MAGIC, "copy b"),
+            }
+        }
+        files
+    }
+
+    /// What the first boot of the settings scenario writes: the trial confirms, the self-test puts
+    /// the settings, and the owner's restart makes the two copies and saves to the first.
+    fn saving_boot_lines() -> String {
+        format!(
+            "[   0.040] INFO  update: slot b is on trial: build {EPOCH}, from slot a\n\
+             [   0.051] WARN  watchdog: No such file or directory (os error 2)\n\
+             [  20.342] INFO  supervisor: started trial\n\
+             [  20.350] INFO  state: no saved settings on the card\n\
+             [  21.117] INFO  update: build {EPOCH} confirmed on slot b\n\
+             [  21.338] INFO  selftest: persist: put label exempt refused night\n\
+             [  21.422] INFO  state: made the two copies on the card\n\
+             [  21.441] INFO  state: saved to copy a (seq 1)\n\
+             [  21.442] INFO  supervisor: restarting: the owner restarted the board from the panel\n"
+        )
+    }
+
+    /// What the second boot writes: copy a is restored, the self-test finds it all back and puts other
+    /// night hours, the saver writes copy b by itself after its quiet, and the clock ends the boot.
+    const SAVING_BY_ITSELF_LINES: &str = "\
+        [   0.041] INFO  update: slot b is running, with no trial under way\n\
+        [  21.063] INFO  state: settings restored from copy a (seq 1): 1 ADS PASS, 0 blocked, 1 labels, 0 known, 1 names, no lock, night kept\n\
+        [  21.380] INFO  selftest: persist: back label exempt refused night, then put later-night\n\
+        [  56.002] INFO  state: saved to copy b (seq 2)\n\
+        [  84.994] INFO  returning\n";
+
+    /// What the third boot writes: copy b is restored with the other hours, and nothing is saved.
+    const RESTORING_BOOT_LINES: &str = "\
+        [   0.041] INFO  update: slot b is running, with no trial under way\n\
+        [  21.063] INFO  state: settings restored from copy b (seq 2): 1 ADS PASS, 0 blocked, 1 labels, 0 known, 1 names, no lock, night kept\n\
+        [  21.380] INFO  selftest: persist: back label exempt refused later-night\n\
+        [  84.994] INFO  returning\n";
+
+    /// The three boots of the settings scenario, as they go in QEMU.
+    fn good_settings_survive_evidence() -> Evidence {
+        let (first, second, third) = (
+            saving_boot_lines(),
+            SAVING_BY_ITSELF_LINES,
+            RESTORING_BOOT_LINES,
+        );
+        let after_two = format!("{}{}", boot_log(&first), boot_log(second));
+        let after_three = format!("{after_two}{}", boot_log(third));
+        let boot = |read, moment, card: CardAfter, serial: &str| BootEvidence {
+            start: Start {
+                read,
+                slot: Slot::B,
+            },
+            serial: slot_serial(serial),
+            exited: false,
+            found: Ok(settings_files(moment)),
+            card: CardAfter {
+                files: Ok(settings_files(moment + 1)),
+                ..card
+            },
+        };
+        Evidence {
+            boots: vec![
+                boot(
+                    Settings::Tryboot,
+                    0,
+                    card_after(Slot::B, true, None, [None, Some(boot_log(&first))]),
+                    &first,
+                ),
+                boot(
+                    Settings::Config,
+                    1,
+                    card_after(Slot::B, true, None, [None, Some(after_two)]),
+                    second,
+                ),
+                boot(
+                    Settings::Config,
+                    2,
+                    card_after(Slot::B, true, None, [None, Some(after_three)]),
+                    third,
+                ),
+            ],
+            ..good_evidence()
+        }
+    }
+
+    #[test]
+    fn a_good_settings_scenario_fails_no_condition() {
+        let conditions = settings_survive_conditions(&good_settings_survive_evidence());
+
+        assert_eq!(failures(&conditions), [""; 0]);
+        assert_eq!(conditions.len(), 69);
+        // Only the guest's last restart is left unchecked, as in every other scenario.
+        let unchecked: Vec<&str> = conditions
+            .iter()
+            .filter(|c| matches!(c.verdict, Verdict::CannotBeCheckedInQemu(_)))
+            .map(|c| c.what.as_str())
+            .collect();
+        assert_eq!(unchecked, [format!("boot 3: {EXITED}")]);
+    }
+
+    #[test]
+    fn each_thing_wrong_with_the_settings_scenario_fails_its_condition() {
+        /// What the failed condition is about, and what makes the evidence wrong.
+        type Wrong = (&'static str, fn(&mut Evidence));
+        let wrong: [Wrong; 32] = [
+            ("the scenario booted 3 times", |e| drop(e.boots.pop())),
+            // The first boot did not put the settings, or the owner's restart did not save them.
+            (
+                "boot 1: the serial console has `INFO  selftest: persist: put label exempt refused night`",
+                |e| {
+                    e.boots[0].serial = e.boots[0]
+                        .serial
+                        .replace("persist: put", "persist: login 401")
+                },
+            ),
+            (
+                "boot 1: the serial console has `INFO  state: made the two copies on the card`",
+                |e| {
+                    e.boots[0].serial = e.boots[0]
+                        .serial
+                        .replace("made the two", "made one of the two")
+                },
+            ),
+            (
+                "boot 1: the serial console has `INFO  state: saved to copy a (seq 1)`",
+                |e| e.boots[0].serial = e.boots[0].serial.replace("(seq 1)", "(seq 2)"),
+            ),
+            // The copies are made again after the restart was asked for.
+            ("boot 1: the serial console has, in this order,", |e| {
+                let serial = &mut e.boots[0].serial;
+                *serial = serial.replace("made the two copies on the card", "made")
+                    + "[   50.0] INFO  state: made the two copies on the card\n";
+            }),
+            (
+                "boot 1: the serial console does not have `INFO  returning`",
+                |e| e.boots[0].serial.push_str("[  60.0] INFO  returning\n"),
+            ),
+            (
+                "boot 1: the serial console does not have `state: saved to copy b`",
+                |e| {
+                    e.boots[0]
+                        .serial
+                        .push_str("[  60.0] INFO  state: saved to copy b (seq 2)\n")
+                },
+            ),
+            ("boot 1: init logged no ERROR", |e| {
+                e.boots[0]
+                    .serial
+                    .push_str("[  30.000] WARN  state: the card refused a write\n")
+            }),
+            (
+                "boot 1: qberrypi-b/log.txt on the card has `INFO  state: saved to copy a (seq 1)`",
+                |e| e.boots[0].card.logs[1] = Ok(Some(boot_log("nothing\n"))),
+            ),
+            // The card after boot 1: a copy is missing or short, or has no magic.
+            (
+                "boot 1: qberrypi-state/a.bin and qberrypi-state/b.bin are on the card",
+                |e| {
+                    e.boots[0].card.files.as_mut().unwrap().remove(STATE_B);
+                },
+            ),
+            (
+                "boot 1: qberrypi-state/a.bin and qberrypi-state/b.bin are on the card",
+                |e| {
+                    let files = e.boots[0].card.files.as_mut().unwrap();
+                    files.get_mut(STATE_A).unwrap().size = 4096;
+                },
+            ),
+            (
+                "boot 1: qberrypi-state/a.bin and qberrypi-state/b.bin are on the card",
+                |e| {
+                    let files = e.boots[0].card.files.as_mut().unwrap();
+                    files.get_mut(STATE_A).unwrap().head = [0; 8];
+                },
+            ),
+            // Something else on the card changed in boot 1: a slot's kernel, a new file.
+            ("boot 1: the only files that changed", |e| {
+                let files = e.boots[0].card.files.as_mut().unwrap();
+                files.get_mut("qberrypi-a/kernel8.img").unwrap().sha256 = "other".into();
+            }),
+            ("boot 1: the only files that changed", |e| {
+                let files = e.boots[0].card.files.as_mut().unwrap();
+                files.insert("qberrypi-state/c.bin".into(), facts_of(1, b"x", "c"));
+            }),
+            // Boot 2 did not restore copy a, or did not find it back, or did not put the other hours.
+            (
+                "boot 2: the serial console has `INFO  state: settings restored from copy a (seq 1): 1 ADS PASS, 0 blocked, 1 labels, 0 known, 1 names, no lock, night kept`",
+                |e| e.boots[1].serial = e.boots[1].serial.replace("1 labels", "0 labels"),
+            ),
+            (
+                "boot 2: the serial console has `INFO  selftest: persist: back label exempt refused night, then put later-night`",
+                |e| {
+                    e.boots[1].serial = e.boots[1].serial.replace(
+                        "back label exempt refused night",
+                        "back exempt night, lost label refused",
+                    )
+                },
+            ),
+            (
+                "boot 2: the serial console has `INFO  selftest: persist: back label exempt refused night, then put later-night`",
+                |e| {
+                    e.boots[1].serial = e.boots[1]
+                        .serial
+                        .replace(", then put later-night", ", then put nothing")
+                },
+            ),
+            // Boot 2's saver did not write copy b: no line, the wrong sequence, or the wrong copy.
+            (
+                "boot 2: the serial console has `INFO  state: saved to copy b (seq 2)`",
+                |e| {
+                    e.boots[1].serial = e.boots[1]
+                        .serial
+                        .replace("saved to copy b", "saved to copy a")
+                },
+            ),
+            (
+                "boot 2: the serial console has `INFO  state: saved to copy b (seq 2)`",
+                |e| e.boots[1].serial = e.boots[1].serial.replace("(seq 2)", "(seq 3)"),
+            ),
+            // The save came after the clock ended the boot, which is no debounced save.
+            ("boot 2: the serial console has, in this order,", |e| {
+                let serial = &mut e.boots[1].serial;
+                *serial = serial.replace("state: saved to copy b (seq 2)", "state: kept")
+                    + "[  85.1] INFO  state: saved to copy b (seq 2)\n";
+            }),
+            // The save was the owner's restart's, or the copies were made, or copy a was written again.
+            (
+                "boot 2: the serial console does not have `the owner restarted the board`",
+                |e| {
+                    e.boots[1].serial.push_str(
+                        "[  85.0] INFO  supervisor: restarting: the owner restarted the board from the panel\n",
+                    )
+                },
+            ),
+            (
+                "boot 2: the serial console does not have `INFO  state: made the two copies on the card`",
+                |e| {
+                    e.boots[1]
+                        .serial
+                        .push_str("[  30.0] INFO  state: made the two copies on the card\n")
+                },
+            ),
+            (
+                "boot 2: the serial console does not have `state: saved to copy a`",
+                |e| {
+                    e.boots[1]
+                        .serial
+                        .push_str("[  70.0] INFO  state: saved to copy a (seq 3)\n")
+                },
+            ),
+            // The card after boot 2: copy b was not written, or copy a was, or something else was.
+            ("boot 2: the only files that changed", |e| {
+                let files = e.boots[1].card.files.as_mut().unwrap();
+                *files.get_mut(STATE_B).unwrap() = facts_of(
+                    qberrypi::state::format::FILE_SIZE as u64,
+                    b"fillfill",
+                    "fill b",
+                );
+            }),
+            ("boot 2: the only files that changed", |e| {
+                let files = e.boots[1].card.files.as_mut().unwrap();
+                files.get_mut(STATE_A).unwrap().sha256 = "written".into();
+            }),
+            ("boot 2: the only files that changed", |e| {
+                let files = e.boots[1].card.files.as_mut().unwrap();
+                files.get_mut("config.txt").unwrap().sha256 = "config a".into();
+            }),
+            (
+                "boot 2: qberrypi-state/a.bin and qberrypi-state/b.bin are on the card",
+                |e| {
+                    let files = e.boots[1].card.files.as_mut().unwrap();
+                    files.get_mut(STATE_B).unwrap().head = [0; 8];
+                },
+            ),
+            // A card whose files could not be read is not shown to hold them.
+            (
+                "boot 2: qberrypi-state/a.bin and qberrypi-state/b.bin are on the card",
+                |e| e.boots[1].card.files = Err("cannot read the files".into()),
+            ),
+            // Boot 3 did not restore copy b, or did not find the other hours back.
+            (
+                "boot 3: the serial console has `INFO  state: settings restored from copy b (seq 2): 1 ADS PASS, 0 blocked, 1 labels, 0 known, 1 names, no lock, night kept`",
+                |e| {
+                    e.boots[2].serial = e.boots[2]
+                        .serial
+                        .replace("copy b (seq 2)", "copy a (seq 1)")
+                },
+            ),
+            (
+                "boot 3: the serial console has `INFO  selftest: persist: back label exempt refused later-night`",
+                |e| {
+                    e.boots[2].serial = e.boots[2].serial.replace(
+                        "back label exempt refused later-night",
+                        "back label exempt refused night, then put later-night",
+                    )
+                },
+            ),
+            // Boot 3 saved or made something, or wrote the copies.
+            (
+                "boot 3: the serial console does not have `state: saved to copy`",
+                |e| {
+                    e.boots[2]
+                        .serial
+                        .push_str("[  50.0] INFO  state: saved to copy a (seq 3)\n")
+                },
+            ),
+            ("boot 3: the only files that changed", |e| {
+                let files = e.boots[2].card.files.as_mut().unwrap();
+                files.get_mut(STATE_B).unwrap().sha256 = "written".into();
+            }),
+        ];
+        for (about, spoil) in wrong {
+            let mut evidence = good_settings_survive_evidence();
+            spoil(&mut evidence);
+
+            let conditions = settings_survive_conditions(&evidence);
+
+            let failed = failures(&conditions);
+            assert!(
+                failed.iter().any(|what| what.contains(about)),
+                "{about}: {failed:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn what_changed_on_the_card_is_read_from_the_files_before_and_after() {
+        let boot = |found: Files, after: Files| BootEvidence {
+            start: Start {
+                read: Settings::Config,
+                slot: Slot::B,
+            },
+            serial: String::new(),
+            exited: false,
+            found: Ok(found),
+            card: CardAfter {
+                files: Ok(after),
+                ..card_after(Slot::B, true, None, [None, None])
+            },
+        };
+        // Appeared, other contents and gone are all changes, and a file that is the same is none.
+        let (before, after) = (settings_files(0), settings_files(1));
+        assert_eq!(
+            Evidence::files_changed_in(&boot(before.clone(), after.clone())),
+            Ok(vec![
+                "config.txt".to_owned(),
+                "qberrypi-b/log.txt".to_owned(),
+                STATE_A.to_owned(),
+                STATE_B.to_owned(),
+                slots::MARKER_FILE.to_owned(),
+            ])
+        );
+        assert_eq!(
+            Evidence::files_changed_in(&boot(after.clone(), after.clone())),
+            Ok(Vec::new())
+        );
+        // A card that could not be read is the reason, not a card with no change.
+        let mut unread = boot(before, after);
+        unread.card.files = Err("no such image".into());
+        assert_eq!(
+            Evidence::files_changed_in(&unread),
+            Err("no such image".to_owned())
+        );
+    }
     #[test]
     fn a_good_trial_that_confirms_fails_no_condition() {
         let conditions = trial_confirms_conditions(&good_trial_confirms_evidence());
@@ -6059,7 +6926,7 @@ mod tests {
             ),
             // The confirm did not select slot b, or did not delete the marker.
             ("boot 1: config.txt on the card is slot b's own", |e| {
-                e.boots[0].card.config = Ok(slot_config_txt(Slot::A).into_bytes())
+                e.boots[0].card.config = Ok(slot_config(Slot::A).into_bytes())
             }),
             ("boot 1: qberrypi-trial.txt is not on the card", |e| {
                 e.boots[0].card.marker = Ok(Some(b"slot=b\n".to_vec()))
@@ -6092,7 +6959,7 @@ mod tests {
                 },
             ),
             ("boot 2: config.txt on the card is slot b's own", |e| {
-                e.boots[1].card.config = Ok(slot_config_txt(Slot::A).into_bytes())
+                e.boots[1].card.config = Ok(slot_config(Slot::A).into_bytes())
             }),
             // The log: both boots are in it, the confirm is, and slot a never wrote one.
             (
@@ -6201,10 +7068,10 @@ mod tests {
             }),
             // The card was not left selecting slot a, or the marker was not deleted by the rollback.
             ("boot 1: config.txt on the card is slot a's own", |e| {
-                e.boots[0].card.config = Ok(slot_config_txt(Slot::B).into_bytes())
+                e.boots[0].card.config = Ok(slot_config(Slot::B).into_bytes())
             }),
             ("boot 2: config.txt on the card is slot a's own", |e| {
-                e.boots[1].card.config = Ok(slot_config_txt(Slot::B).into_bytes())
+                e.boots[1].card.config = Ok(slot_config(Slot::B).into_bytes())
             }),
             ("boot 2: qberrypi-trial.txt is not on the card", |e| {
                 e.boots[1].card.marker =
@@ -6294,8 +7161,7 @@ mod tests {
         // The software trial selects slot a again before anything else, and leaves no tryboot.txt.
         let mut software_as_firmware = good_trial_fails_evidence(Mode::Software);
         software_as_firmware.boots[0].start.read = Settings::Tryboot;
-        software_as_firmware.boots[0].card.tryboot =
-            Ok(Some(slot_config_txt(Slot::B).into_bytes()));
+        software_as_firmware.boots[0].card.tryboot = Ok(Some(slot_config(Slot::B).into_bytes()));
         let conditions = trial_fails_software_conditions(&software_as_firmware);
         let failed = failures(&conditions);
         assert!(
@@ -6367,7 +7233,7 @@ mod tests {
     #[test]
     fn the_trial_scenarios_boot_a_card_with_two_slots_and_stage_the_trial_of_their_mode() {
         let all = scenarios(EXAMPLE).unwrap();
-        let trials: Vec<&Scenario> = all.iter().skip(11).collect();
+        let trials: Vec<&Scenario> = all.iter().skip(11).take(3).collect();
 
         let names: Vec<&str> = trials.iter().map(|s| s.name).collect();
         assert_eq!(
@@ -6402,13 +7268,45 @@ mod tests {
     }
 
     #[test]
+    fn no_scenario_sets_the_plate_resistance_so_each_slots_config_txt_is_the_defaults() {
+        for scenario in scenarios(EXAMPLE).unwrap() {
+            let mut configs = vec![scenario.system_config.clone()];
+            if let CardPlan::Slots(plan) = &scenario.card {
+                configs.push(plan.config_b.clone());
+            }
+            for config in configs {
+                // The broken scenario's file is not TOML; it never makes a slot.
+                if let Ok(ohms) = qberrypi::config::touch_xohms(&config) {
+                    assert_eq!(ohms, DEFAULT_TOUCH_XOHMS, "{}", scenario.name);
+                } else {
+                    assert!(
+                        matches!(scenario.card, CardPlan::OneBoot),
+                        "{}",
+                        scenario.name
+                    );
+                }
+            }
+        }
+        // And the card of a trial carries it so: slot b's own file is the tryboot.txt.
+        let (_root, build) = fixture_build();
+        let files = staged_card_files(&build, &plan(Mode::Tryboot), "# slot a\n", EPOCH).unwrap();
+        let file = |name: &str| &files.iter().find(|(n, _)| n == name).unwrap().1;
+        assert_eq!(file(slots::TRYBOOT_FILE), slot_config(Slot::B).as_bytes());
+        assert_eq!(
+            file("qberrypi-b/config.txt"),
+            slot_config(Slot::B).as_bytes()
+        );
+        assert_eq!(file("config.txt"), slot_config(Slot::A).as_bytes());
+    }
+
+    #[test]
     fn the_slots_of_a_trial_scenario_differ_from_the_example_only_in_their_debug_settings() {
         let all = scenarios(EXAMPLE).unwrap();
         let slot_b = |scenario: &Scenario| match &scenario.card {
             CardPlan::Slots(plan) => plan.config_b.clone(),
             CardPlan::OneBoot => unreachable!("{}", scenario.name),
         };
-        let [confirms, fails_firmware, fails_software] = &all[11..] else {
+        let [confirms, fails_firmware, fails_software] = &all[11..14] else {
             panic!("{} scenarios", all.len());
         };
         let slot_a_changes = ["log_to_sd = true", "return_after_secs = 40"];

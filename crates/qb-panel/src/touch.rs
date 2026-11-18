@@ -29,8 +29,12 @@ pub enum TouchEvent {
     Up,
 }
 
-/// The shortest press that counts as a tap, in milliseconds; anything shorter is noise.
-pub const MIN_PRESS_MS: u64 = 50;
+/// The shortest press that counts as a tap, in milliseconds, unless the configuration says another
+/// (`[panel] touch_min_press_ms`); anything shorter is noise.
+///
+/// The driver reads a pen that stays down every few milliseconds, so a press of 20 ms is several
+/// of its readings; a stray reading alone is over sooner.
+pub const DEFAULT_MIN_PRESS_MS: u64 = 20;
 
 /// A press that would work a target if it were released now or later.
 #[derive(Debug, Clone)]
@@ -43,7 +47,8 @@ struct Press<T> {
     began_ms: u64,
 }
 
-/// Turns touch events into taps: a press that begins on a target, stays on it and lasts `MIN_PRESS_MS`.
+/// Turns touch events into taps: a press that begins on a target, stays on it and lasts the tracker's
+/// shortest press (`DEFAULT_MIN_PRESS_MS` unless it is made with another).
 ///
 /// A target is whatever the caller says is under a point: any value that can be compared (the OS's `Tap`
 /// of `nav::decide`). Two points are on the same target when the caller's function gives equal targets for
@@ -54,11 +59,30 @@ pub struct TapTracker<T> {
     /// down, and also during a press that began on nothing or was spoilt:
     /// none of the three can fire before the next `Down`.
     press: Option<Press<T>>,
+    /// The shortest press that is a tap, in milliseconds.
+    min_press_ms: u64,
 }
 
 impl<T> Default for TapTracker<T> {
+    /// A tracker whose shortest tap is `DEFAULT_MIN_PRESS_MS`.
     fn default() -> Self {
-        Self { press: None }
+        Self::new(DEFAULT_MIN_PRESS_MS)
+    }
+}
+
+impl<T> TapTracker<T> {
+    /// A tracker with no press under way whose shortest tap is `min_press_ms` milliseconds.
+    #[must_use]
+    pub const fn new(min_press_ms: u64) -> Self {
+        Self {
+            press: None,
+            min_press_ms,
+        }
+    }
+
+    /// Forgets the press under way, if there is one: its release, whenever it comes, taps nothing.
+    pub fn cancel(&mut self) {
+        self.press = None;
     }
 }
 
@@ -68,7 +92,7 @@ impl<T: Clone + PartialEq> TapTracker<T> {
     /// down at, which the caller hands to `nav::tap`.
     ///
     /// A press that began on nothing is not tracked. One that moves off its target is spoilt for good:
-    /// coming back does not restore it. A press shorter than `MIN_PRESS_MS` is noise. The target is
+    /// coming back does not restore it. A press shorter than the tracker's shortest tap is noise. The target is
     /// decided at the press; `target` is asked again at every move, so a target that goes away while
     /// the finger is down (the gate ask, once it has closed) spoils the press at its next move.
     #[must_use]
@@ -100,7 +124,7 @@ impl<T: Clone + PartialEq> TapTracker<T> {
                 let press = self.press.take()?;
                 // A clock that went backwards counts as no time at all.
                 let held_ms = at_ms.saturating_sub(press.began_ms);
-                (held_ms >= MIN_PRESS_MS).then_some((press.target, press.at))
+                (held_ms >= self.min_press_ms).then_some((press.target, press.at))
             }
         }
     }
@@ -283,24 +307,78 @@ mod tests {
         }
     }
 
+    /// What a tracker whose shortest tap is `min_press_ms` gives for `events`, as `run` says it.
+    fn run_with(min_press_ms: u64, events: &[(u64, TouchEvent)]) -> Vec<Option<Control>> {
+        let mut t = TapTracker::new(min_press_ms);
+        events
+            .iter()
+            .map(|&(at, e)| t.feed_with(at, e, hit).map(|(control, _)| control))
+            .collect()
+    }
+
     #[test]
-    fn a_press_of_fifty_milliseconds_inside_counts_on_release() {
+    fn a_press_of_twenty_milliseconds_inside_counts_on_release() {
+        assert_eq!(DEFAULT_MIN_PRESS_MS, 20);
         assert_eq!(
-            run(&[(1000, Down { x: 40, y: 290 }), (1050, Up)]),
+            run(&[(1000, Down { x: 40, y: 290 }), (1020, Up)]),
             [None, Some(Control::BlockingSwitch)]
         );
         assert_eq!(
-            run(&[(1000, Down { x: 40, y: 290 }), (1049, Up)]),
+            run(&[(1000, Down { x: 40, y: 290 }), (1019, Up)]),
             [None, None]
         );
         assert_eq!(
             run(&[
                 (0, Down { x: 40, y: 290 }),
-                (30, Move { x: 90, y: 300 }),
-                (80, Up)
+                (10, Move { x: 90, y: 300 }),
+                (30, Up)
             ])
             .last(),
             Some(&Some(Control::BlockingSwitch))
+        );
+    }
+
+    #[test]
+    fn a_tracker_made_with_another_shortest_tap_holds_to_it() {
+        let press = |held| [(1000, Down { x: 40, y: 290 }), (1000 + held, Up)];
+        for min in [0, 5, 50, 500] {
+            assert_eq!(
+                run_with(min, &press(min)),
+                [None, Some(Control::BlockingSwitch)],
+                "{min}"
+            );
+            if min > 0 {
+                assert_eq!(run_with(min, &press(min - 1)), [None, None], "{min}");
+            }
+        }
+        // The default tracker is the one made with the default.
+        assert_eq!(run_with(DEFAULT_MIN_PRESS_MS, &press(19)), run(&press(19)));
+        assert_eq!(run_with(DEFAULT_MIN_PRESS_MS, &press(20)), run(&press(20)));
+        // Whatever its shortest tap, a press that left its target stays spoilt.
+        assert_eq!(
+            run_with(
+                5,
+                &[
+                    (0, Down { x: IN.0, y: IN.1 }),
+                    (10, Move { x: 300, y: 290 }),
+                    (20, Move { x: IN.0, y: IN.1 }),
+                    (900, Up)
+                ]
+            ),
+            [None; 4]
+        );
+    }
+
+    #[test]
+    fn a_cancelled_press_taps_nothing_and_the_next_press_is_whole() {
+        let mut t = TapTracker::new(DEFAULT_MIN_PRESS_MS);
+        assert_eq!(t.feed_with(0, Down { x: IN.0, y: IN.1 }, hit), None);
+        t.cancel();
+        assert_eq!(t.feed_with(500, Up, hit), None);
+        assert_eq!(t.feed_with(600, Down { x: IN.0, y: IN.1 }, hit), None);
+        assert_eq!(
+            t.feed_with(620, Up, hit).map(|(control, _)| control),
+            Some(Control::BlockingSwitch)
         );
     }
 
@@ -330,10 +408,10 @@ mod tests {
             run(&[
                 (0, Down { x: IN.0, y: IN.1 }),
                 (100, Down { x: IN.0, y: IN.1 }),
-                (120, Up)
+                (119, Up)
             ]),
             [None; 3]
-        ); // 20 ms since the second Down
+        ); // 19 ms since the second Down
         assert_eq!(
             run(&[(500, Down { x: IN.0, y: IN.1 }), (100, Up)]),
             [None; 2]
@@ -481,9 +559,9 @@ mod tests {
             [None; 3]
         );
         // The second press lands on the switch: it is timed from its own Down and fires once.
-        assert_eq!(run(&[(0, down), (1000, down), (1049, Up)]), [None; 3]);
+        assert_eq!(run(&[(0, down), (1000, down), (1019, Up)]), [None; 3]);
         assert_eq!(
-            run(&[(0, down), (1000, down), (1050, Up), (1200, Up)]),
+            run(&[(0, down), (1000, down), (1020, Up), (1200, Up)]),
             [None, None, Some(Control::BlockingSwitch), None]
         );
     }
@@ -555,7 +633,7 @@ mod tests {
             [None, Some(Control::BlockingSwitch)]
         );
         assert_eq!(
-            run(&[(max - MIN_PRESS_MS, down), (max, Up)]),
+            run(&[(max - DEFAULT_MIN_PRESS_MS, down), (max, Up)]),
             [None, Some(Control::BlockingSwitch)]
         );
         assert_eq!(run(&[(max, down), (max, Up)]), [None; 2]);
@@ -712,14 +790,14 @@ mod tests {
         assert_eq!(feed(200, Up), None);
         assert_eq!(feed(300, Down { x: 10, y: 5 }), None);
         assert_eq!(feed(400, Up), None);
-        // Fifty milliseconds, as for the Drain's key.
+        // Twenty milliseconds, as for the Drain's key.
         assert_eq!(feed(500, Down { x: 300, y: 100 }), None);
-        assert_eq!(feed(549, Up), None);
+        assert_eq!(feed(519, Up), None);
         assert_eq!(feed(600, Down { x: 300, y: 100 }), None);
-        assert_eq!(feed(650, Up), Some((2, (300, 100))));
+        assert_eq!(feed(620, Up), Some((2, (300, 100))));
         // A lost release: the next press begins again, from its own time.
         assert_eq!(feed(700, Down { x: 300, y: 100 }), None);
         assert_eq!(feed(1_000, Down { x: 10, y: 100 }), None);
-        assert_eq!(feed(1_020, Up), None);
+        assert_eq!(feed(1_019, Up), None);
     }
 }

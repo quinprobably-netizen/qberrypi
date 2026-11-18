@@ -1676,6 +1676,51 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn another_xohms_for_the_touch_screen_is_no_change_of_the_boot_files_but_one_out_of_range_is_refused()
+     {
+        // The running build's config.txt loads the screen's overlay at the default plate
+        // resistance; an update whose owner set another takes no allow_kernel.
+        let with_xohms = |slot: Slot, ohms: &str| {
+            let mut config = files_for(slot)[1].1.clone();
+            config.extend_from_slice(
+                format!("dtoverlay=qb-piscreen,speed=16000000,rotate=270,xohms={ohms}\n")
+                    .as_bytes(),
+            );
+            config
+        };
+        let mut running = files_for(Slot::A);
+        running[1].1 = with_xohms(Slot::A, "25");
+        let digest = slots::boot_files_digest(
+            running
+                .iter()
+                .map(|(name, bytes)| (*name, bytes.as_slice())),
+        )
+        .unwrap();
+        for ohms in ["10", "40", "1000"] {
+            let fixture = Fixture::with(Limits::DEFAULT, Some(Slot::A), Some(digest.clone())).await;
+            let mut offer = Offer::update();
+            offer.replace("config.txt", with_xohms(Slot::B, ohms));
+            assert_eq!(fixture.send(offer).await.status, 200, "{ohms}");
+        }
+        for ohms in ["9", "1001", "025", ""] {
+            let fixture = Fixture::with(Limits::DEFAULT, Some(Slot::A), Some(digest.clone())).await;
+            let mut offer = Offer::update();
+            offer.replace("config.txt", with_xohms(Slot::B, ohms));
+            let answer = fixture.send(offer).await;
+            fixture.assert_refused_before_the_card(&answer, 400, "bad_request");
+            assert!(message(&answer).contains("xohms"), "{ohms}: {answer:?}");
+        }
+        // A build from before the parameter: its line has none, so the digest differs.
+        let fixture = Fixture::with(Limits::DEFAULT, Some(Slot::A), Some(digest)).await;
+        let mut offer = Offer::update();
+        let mut without = files_for(Slot::B)[1].1.clone();
+        without.extend_from_slice(b"dtoverlay=qb-piscreen,speed=16000000,rotate=270\n");
+        offer.replace("config.txt", without);
+        let answer = fixture.send(offer).await;
+        fixture.assert_refused_before_the_card(&answer, 409, "kernel_change");
+    }
+
+    #[tokio::test]
     async fn a_changed_kernel_device_tree_or_overlay_is_refused_unless_allowed() {
         for changed in [
             "kernel8.img",
@@ -1902,6 +1947,30 @@ mod tests {
         // be read.
         let answer = fixture.send_as(offer).await;
 
+        fixture.assert_refused_before_the_card(&answer, 401, "unauthorized");
+    }
+
+    #[tokio::test]
+    async fn a_refused_upload_is_read_whole_by_a_client_that_goes_on_sending_its_body() {
+        let fixture = Fixture::new().await;
+        let (addr, client) = (fixture.addr, fixture.client.clone());
+        let answer = tokio::task::spawn_blocking(move || {
+            let mut connection = Connection::open(addr, client).unwrap();
+            // No session: the 401 answers the head and no body byte is read for the update, but
+            // the connection lingers and takes what the client goes on sending, so that a write
+            // does not fail, as it would from the reset of a close at once.
+            let head = format!("POST {PATH} HTTP/1.1\r\nHost: x\r\nContent-Length: 100000\r\n\r\n");
+            connection.send_raw(head.as_bytes()).unwrap();
+            for piece in 0..16 {
+                std::thread::sleep(10 * MS);
+                connection
+                    .send_raw(&[b'a'; 1024])
+                    .unwrap_or_else(|error| panic!("write {piece}: {error}"));
+            }
+            connection.receive().unwrap()
+        })
+        .await
+        .unwrap();
         fixture.assert_refused_before_the_card(&answer, 401, "unauthorized");
     }
 
@@ -2383,9 +2452,12 @@ mod tests {
 
     #[tokio::test]
     async fn a_client_that_sends_a_byte_at_a_time_is_cut_off_at_the_whole_time_of_the_request() {
+        // The client goes on sending after the refusal, so the connection lingers (200 ms here)
+        // before it is closed, and the client finds out later by that much.
         let limits = Limits {
             upload: 700 * MS,
             upload_idle: 300 * MS,
+            linger: 200 * MS,
             ..Limits::DEFAULT
         };
         let fixture = Fixture::with(limits, Some(Slot::A), Some(running_digest())).await;

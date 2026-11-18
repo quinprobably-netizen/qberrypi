@@ -16,7 +16,7 @@ use qb_panel::{Calibration, HEIGHT, WIDTH, rgba_to_rgb565};
 
 use super::Surface;
 use super::touch::{
-    ABS_PRESSURE, ABS_X, ABS_Y, BTN_TOUCH, EV_ABS, EV_KEY, EV_SYN, MIN_PRESSURE, RawEvent,
+    ABS_PRESSURE, ABS_X, ABS_Y, BTN_TOUCH, DEFAULT_MIN_PRESSURE, EV_ABS, EV_KEY, EV_SYN, RawEvent,
     SYN_DROPPED, SYN_REPORT, hold,
 };
 
@@ -119,12 +119,14 @@ pub struct Reading {
 /// It follows `BTN_TOUCH`, `ABS_X`, `ABS_Y` and `ABS_PRESSURE` as the
 /// touch decoder does, but in the controller's own units. Each report with
 /// the glass touched is a sample unless a pressure was reported and the last
-/// one is under `MIN_PRESSURE`: the pen on its way up or down reads a point
-/// that is not where the finger is. The report that releases ends the press,
-/// and the press is the median of its samples, each axis on its own, so that
-/// a stray sample moves nothing.
-#[derive(Debug, Default)]
+/// one is under the collector's least pressure, the touch decoder's own: the pen
+/// on its way up or down reads a point that is not where the finger is. The
+/// report that releases ends the press, and the press is the median of its
+/// samples, each axis on its own, so that a stray sample moves nothing.
+#[derive(Debug)]
 pub struct Collector {
+    /// The least pressure at which a report is a sample, as the touch decoder takes it.
+    min_pressure: i32,
     /// The last horizontal reading.
     raw_x: u16,
     /// The last vertical reading.
@@ -137,7 +139,27 @@ pub struct Collector {
     samples: Vec<Reading>,
 }
 
+impl Default for Collector {
+    /// A collector whose least pressure is `DEFAULT_MIN_PRESSURE`.
+    fn default() -> Self {
+        Self::new(DEFAULT_MIN_PRESSURE)
+    }
+}
+
 impl Collector {
+    /// A collector with no press under way, whose samples are the reports of at least `min_pressure`.
+    #[must_use]
+    pub fn new(min_pressure: i32) -> Self {
+        Self {
+            min_pressure,
+            raw_x: 0,
+            raw_y: 0,
+            pressure: None,
+            button: false,
+            samples: Vec::new(),
+        }
+    }
+
     /// Takes the next event; returns the reading of the press that it ends.
     ///
     /// A press of fewer than three samples is no reading. Lost events cancel
@@ -164,7 +186,7 @@ impl Collector {
         if self.button {
             if self
                 .pressure
-                .is_none_or(|pressure| pressure >= MIN_PRESSURE)
+                .is_none_or(|pressure| pressure >= self.min_pressure)
             {
                 self.samples.push(Reading {
                     raw_x: self.raw_x,
@@ -283,7 +305,9 @@ fn await_tap(
 
 /// Shows the four crosses one after the other, waits for a tap on each, and logs the calibration the taps give.
 ///
-/// `wait` reads the touch device for up to the milliseconds it is given and
+/// A report is part of a tap when its pressure is at least `min_pressure`, the touch decoder's
+/// own, so the crosses are measured with the touches the panel will take. `wait` reads the touch
+/// device for up to the milliseconds it is given and
 /// returns the events it had; `now_ms` is a clock in milliseconds that does not
 /// jump. Returns the calibration, which is also logged as the lines to paste into
 /// `qberrypi.toml`; `None` when a cross was not tapped within `TARGET_WAIT_MS`
@@ -293,11 +317,12 @@ pub fn calibrate(
     surface: &mut dyn Surface,
     wait: &mut dyn FnMut(u64) -> io::Result<Vec<RawEvent>>,
     now_ms: &dyn Fn() -> u64,
+    min_pressure: i32,
 ) -> io::Result<Option<Calibration>> {
     let mut readings = [Reading { raw_x: 0, raw_y: 0 }; 4];
     // One collector for all four taps: the kernel sends an axis only when its value changes, and
     // two crosses in a row share a screen x or y.
-    let mut collector = Collector::default();
+    let mut collector = Collector::new(min_pressure);
     for (index, (reading, (x, y))) in readings.iter_mut().zip(TARGETS).enumerate() {
         let n = index + 1;
         surface.show(&target_frame(index))?;
@@ -339,7 +364,7 @@ pub(crate) mod tests {
 
     use crate::panel::tests::recorder;
     use crate::panel::touch::tests::{abs_x, abs_y, dropped, key, pressure, syn};
-    use crate::panel::touch::{MIN_PRESSURE, RawEvent};
+    use crate::panel::touch::{DEFAULT_MIN_PRESSURE, RawEvent};
 
     /// The reading a panel with `calibration` gives at the screen point (`x`, `y`).
     pub(crate) fn raw_at(calibration: &Calibration, x: u16, y: u16) -> Reading {
@@ -496,9 +521,14 @@ pub(crate) mod tests {
         ] {
             let (mut surface, _) = recorder();
             let now = || 0;
-            let solved = calibrate(&mut surface, &mut kernel_owner(cal, false), &now)
-                .unwrap()
-                .expect("a calibration");
+            let solved = calibrate(
+                &mut surface,
+                &mut kernel_owner(cal, false),
+                &now,
+                DEFAULT_MIN_PRESSURE,
+            )
+            .unwrap()
+            .expect("a calibration");
             assert_close(&solved, &cal);
         }
     }
@@ -514,9 +544,14 @@ pub(crate) mod tests {
         };
         let (mut surface, _) = recorder();
         let now = || 0;
-        let solved = calibrate(&mut surface, &mut kernel_owner(cal, true), &now)
-            .unwrap()
-            .expect("a calibration");
+        let solved = calibrate(
+            &mut surface,
+            &mut kernel_owner(cal, true),
+            &now,
+            DEFAULT_MIN_PRESSURE,
+        )
+        .unwrap()
+        .expect("a calibration");
         assert_close(&solved, &cal);
     }
 
@@ -658,7 +693,7 @@ pub(crate) mod tests {
 
     #[test]
     fn reports_too_light_to_be_a_touch_are_not_part_of_a_reading() {
-        let light = MIN_PRESSURE - 1;
+        let light = DEFAULT_MIN_PRESSURE - 1;
         let mut events = vec![key(0, 1), pressure(0, 180)];
         events.extend(report(0, 600, 3500));
         // A pen on its way down: the readings are corners.
@@ -678,7 +713,7 @@ pub(crate) mod tests {
 
         // A third firm report, at exactly the least pressure, makes the reading from the firm ones alone.
         let mut events = events[..events.len() - 2].to_vec();
-        events.push(pressure(100, MIN_PRESSURE));
+        events.push(pressure(100, DEFAULT_MIN_PRESSURE));
         events.extend(report(100, 620, 3490));
         events.extend([key(120, 0), syn(120)]);
         assert_eq!(
@@ -688,6 +723,32 @@ pub(crate) mod tests {
                 raw_y: 3490
             }]
         );
+    }
+
+    #[test]
+    fn a_collector_made_with_another_least_pressure_takes_the_reports_the_decoder_takes() {
+        use crate::panel::touch::{Decoded, Decoder};
+
+        // Three reports at 30, then the release: a reading for a collector whose least is 30 or
+        // less, none for one whose least is above; the decoder made with the same least agrees.
+        let mut events = vec![key(0, 1)];
+        for n in 0..3 {
+            let at = 20 * n;
+            events.push(pressure(at, 30));
+            events.extend(report(at, 600, 3500));
+        }
+        events.extend([key(60, 0), pressure(60, 0), syn(60)]);
+        for (min, read) in [(0, true), (4, true), (30, true), (31, false), (200, false)] {
+            let mut collector = Collector::new(min);
+            let readings: Vec<Reading> = events.iter().filter_map(|&e| collector.feed(e)).collect();
+            assert_eq!(!readings.is_empty(), read, "{min}");
+            let mut decoder = Decoder::new(min);
+            let touched = events
+                .iter()
+                .filter_map(|&e| decoder.feed(e, &Calibration::NOMINAL))
+                .any(|(_, decoded)| matches!(decoded, Decoded::Touch(_)));
+            assert_eq!(touched, read, "{min}");
+        }
     }
 
     #[test]
@@ -769,7 +830,7 @@ pub(crate) mod tests {
                 clock.set(clock.get() + 100);
                 clock.get()
             };
-            let solved = calibrate(&mut surface, &mut owner(cal, 4), &now)
+            let solved = calibrate(&mut surface, &mut owner(cal, 4), &now, DEFAULT_MIN_PRESSURE)
                 .unwrap()
                 .unwrap();
             assert_close(&solved, &cal);
@@ -790,7 +851,13 @@ pub(crate) mod tests {
             clock.get()
         };
         assert_eq!(
-            calibrate(&mut surface, &mut |_| Ok(Vec::new()), &now).unwrap(),
+            calibrate(
+                &mut surface,
+                &mut |_| Ok(Vec::new()),
+                &now,
+                DEFAULT_MIN_PRESSURE
+            )
+            .unwrap(),
             None
         );
         assert!(clock.get() >= TARGET_WAIT_MS, "{}", clock.get());
@@ -807,7 +874,10 @@ pub(crate) mod tests {
             clock.get()
         };
         let mut hand = owner(Calibration::NOMINAL, 2);
-        assert_eq!(calibrate(&mut surface, &mut hand, &now).unwrap(), None);
+        assert_eq!(
+            calibrate(&mut surface, &mut hand, &now, DEFAULT_MIN_PRESSURE).unwrap(),
+            None
+        );
         assert_eq!(
             frames.all(),
             (0..3).map(target_frame).collect::<Vec<_>>(),
@@ -827,6 +897,7 @@ pub(crate) mod tests {
             &mut surface,
             &mut |_| Ok(press(1_000, same_place, 5)),
             &|| 0,
+            DEFAULT_MIN_PRESSURE,
         );
         assert_eq!(outcome.unwrap(), None);
         assert_eq!(frames.all().len(), 4);
@@ -839,6 +910,7 @@ pub(crate) mod tests {
             &mut surface,
             &mut |_| Err(io::Error::other("the touch device is gone")),
             &|| 0,
+            DEFAULT_MIN_PRESSURE,
         )
         .unwrap_err();
         assert_eq!(error.to_string(), "the touch device is gone");

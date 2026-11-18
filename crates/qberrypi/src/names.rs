@@ -1,5 +1,5 @@
 //! The owner's own names, as the front panel and the API edit them: the ones the owner allows and
-//! the ones the owner refuses, kept in memory only.
+//! the ones the owner refuses, kept in memory and, when the card keeps the state, on the card.
 //!
 //! [`OwnerList`] is the one place they are made. It keeps each entry (a name, the side it is on,
 //! and the day the owner set it from the panel, if they did) in the order they were set, so the
@@ -12,9 +12,12 @@
 //! Locks: the list's own, and inside it, for the swap or for a copy, the resolver's. Nothing that
 //! holds the resolver's lock takes the list's, so no order of the two can matter.
 //!
-//! The list lives in memory only, like the exempt list: after a restart it is empty, and qnet
-//! pushes its own again. The days are the panel's own: a name that the desktop pushed has none, and a
-//! push that leaves an entry as it is leaves its day too.
+//! The list lives in memory, like the exempt list. When the card keeps the state ([`crate::state`])
+//! [`OwnerList::kept`] gives the entries as they are, in order and with their days, and
+//! [`OwnerList::restore`] takes them back at the start, through the same swap as any change, so
+//! that the resolver has them before the first query; with no card to keep them the list is empty
+//! after a restart, and qnet pushes its own again. The days are the panel's own: a name that the
+//! desktop pushed has none, and a push that leaves an entry as it is leaves its day too.
 //!
 //! The names are the owner's, so nothing here logs one and no type prints one: `Debug` says how many,
 //! and an error carries no text. A change that took effect logs one line with the two counts.
@@ -25,6 +28,7 @@ use std::sync::{Mutex, MutexGuard, PoisonError};
 use qb_dns::name::{MAX_NAME_LEN, normalize};
 use qb_dns::{OWNER_NAMES_MAX, OwnerNames, OwnerNamesError, OwnerSide, TopName};
 
+use crate::state::SavedName;
 use crate::wiring::SharedResolver;
 
 /// One entry of the owner's list, as the panel shows it.
@@ -248,6 +252,60 @@ impl OwnerList {
                 set_unix: entry.set_unix,
             })
             .collect()
+    }
+
+    /// The entries as they are kept ([`SavedName`]): in the order they were set, the newest last,
+    /// each with its side and the day it was set from the panel. At most twice
+    /// [`OWNER_NAMES_MAX`] of them; a copy under the list's own lock, and not the resolver's.
+    pub fn kept(&self) -> Vec<SavedName> {
+        self.lock()
+            .entries
+            .iter()
+            .map(|entry| SavedName {
+                name: entry.name.clone(),
+                side: entry.side,
+                set_unix: entry.set_unix,
+            })
+            .collect()
+    }
+
+    /// Makes `names`, as [`OwnerList::kept`] gave them, the list in force, at the start: through
+    /// the same swap as any change, so that the resolver has them at once, with their days and in
+    /// their order. A name that is saved twice on one side is the entry of its first place.
+    ///
+    /// It is all or nothing, and logs nothing (the caller says one line): a name that is not a
+    /// valid one, or not as [`qb_dns::name::normalize`] leaves it, is [`NamesError::Invalid`], and a side of
+    /// more than [`OWNER_NAMES_MAX`] names is [`NamesError::Full`]; the list stays as it was. A
+    /// restore that leaves the list as it is moves no revision; any other moves it by one.
+    pub fn restore(&self, names: Vec<SavedName>) -> Result<(), NamesError> {
+        let mut entries: Vec<Entry> = Vec::with_capacity(names.len().min(2 * OWNER_NAMES_MAX));
+        let mut buf = [0; MAX_NAME_LEN];
+        for saved in names {
+            let normal = normalize(saved.name.as_bytes(), &mut buf).ok_or(NamesError::Invalid)?;
+            if normal != &*saved.name {
+                return Err(NamesError::Invalid);
+            }
+            if entries
+                .iter()
+                .any(|entry| entry.side == saved.side && entry.name == saved.name)
+            {
+                continue;
+            }
+            if entries.len() >= 2 * OWNER_NAMES_MAX {
+                return Err(NamesError::Full);
+            }
+            entries.push(Entry {
+                name: saved.name,
+                side: saved.side,
+                set_unix: saved.set_unix,
+            });
+        }
+        let mut guard = self.lock();
+        let state = &mut *guard;
+        if entries == state.entries {
+            return Ok(());
+        }
+        self.commit(state, entries)
     }
 
     /// What the list says of `name`, as the resolver decides it, or `None` if it covers the name
@@ -733,6 +791,179 @@ mod tests {
                 exact: true,
                 set_unix: None
             })
+        );
+    }
+
+    /// A name as it is kept.
+    fn saved(name: &str, side: OwnerSide, set_unix: Option<u64>) -> SavedName {
+        SavedName {
+            name: name.into(),
+            side,
+            set_unix,
+        }
+    }
+
+    #[test]
+    fn the_kept_names_restore_into_another_list_in_their_order_and_with_their_days() {
+        let (first, _) = list();
+        first
+            .set("a.example.org", OwnerSide::Refuse, Some(UNIX))
+            .unwrap();
+        push_more(&first, "pushed.example.org");
+        first
+            .set("b.example.org", OwnerSide::Allow, Some(UNIX + 5))
+            .unwrap();
+        let kept = first.kept();
+        assert_eq!(
+            kept,
+            [
+                saved("a.example.org", OwnerSide::Refuse, Some(UNIX)),
+                saved("pushed.example.org", OwnerSide::Refuse, None),
+                saved("b.example.org", OwnerSide::Allow, Some(UNIX + 5)),
+            ]
+        );
+
+        let (second, _) = list();
+        assert_eq!(second.restore(kept.clone()), Ok(()));
+        assert_eq!(second.kept(), kept);
+        assert_eq!(
+            names_of(&second.newest(3)),
+            ["b.example.org", "pushed.example.org", "a.example.org"]
+        );
+        assert_eq!(second.newest(1)[0].set_unix, Some(UNIX + 5));
+        assert_eq!(
+            second.view(),
+            OwnerView {
+                rev: 1,
+                ..first.view()
+            }
+        );
+        // A list with nothing in it is kept as nothing.
+        let (empty, _) = list();
+        assert_eq!(empty.kept(), []);
+    }
+
+    #[test]
+    fn a_restored_refused_name_is_blocked_by_the_resolver_and_an_allowed_one_is_not() {
+        let (list, shared) = list();
+        assert!(blocked(&shared, "ads.example.com"));
+        assert!(!blocked(&shared, "new.example.org"));
+        list.restore(vec![
+            saved("new.example.org", OwnerSide::Refuse, Some(UNIX)),
+            saved("ads.example.com", OwnerSide::Allow, None),
+        ])
+        .unwrap();
+        assert!(blocked(&shared, "new.example.org"));
+        assert!(blocked(&shared, "sub.new.example.org"));
+        assert!(!blocked(&shared, "ads.example.com"));
+        assert_eq!(
+            list.hold("new.example.org"),
+            Some(OwnerHold {
+                side: OwnerSide::Refuse,
+                exact: true,
+                set_unix: Some(UNIX)
+            })
+        );
+        // A restore replaces what was there, and the resolver follows.
+        list.restore(vec![saved("other.example.org", OwnerSide::Refuse, None)])
+            .unwrap();
+        assert!(!blocked(&shared, "new.example.org"));
+        assert!(blocked(&shared, "ads.example.com"));
+        assert!(blocked(&shared, "other.example.org"));
+    }
+
+    #[test]
+    fn a_name_on_both_sides_is_kept_and_restored_on_both() {
+        let (first, _) = list();
+        push(&first, &["both.example.org"], &["both.example.org"]).unwrap();
+        let kept = first.kept();
+        assert_eq!(kept.len(), 2);
+        let (second, shared) = list();
+        second.restore(kept.clone()).unwrap();
+        assert_eq!(second.kept(), kept);
+        assert!(blocked(&shared, "both.example.org"));
+    }
+
+    #[test]
+    fn a_restore_that_leaves_the_list_as_it_is_moves_no_revision_and_any_other_moves_it_once() {
+        let (list, _) = list();
+        let one = vec![saved("a.example.org", OwnerSide::Refuse, Some(UNIX))];
+        assert_eq!(list.restore(Vec::new()), Ok(()));
+        assert_eq!(list.rev(), 0);
+        list.restore(one.clone()).unwrap();
+        assert_eq!(list.rev(), 1);
+        list.restore(one).unwrap();
+        assert_eq!(list.rev(), 1);
+        // A day that differs is a change.
+        list.restore(vec![saved("a.example.org", OwnerSide::Refuse, None)])
+            .unwrap();
+        assert_eq!(list.rev(), 2);
+    }
+
+    #[test]
+    fn a_name_that_fails_makes_the_whole_restore_refused_and_nothing_changes() {
+        let (list, shared) = list();
+        list.set("keep.example.org", OwnerSide::Refuse, Some(UNIX))
+            .unwrap();
+        let rev = list.rev();
+        let kept = list.kept();
+        let good = saved("fine.example.org", OwnerSide::Refuse, None);
+        for bad in [
+            "",
+            "not a name",
+            "*.example.org",
+            "a..b",
+            // Valid, but not as it is kept: the decoder never lets one through.
+            "Upper.example.org",
+            "trailing.example.org.",
+        ] {
+            assert_eq!(
+                list.restore(vec![good.clone(), saved(bad, OwnerSide::Refuse, None)]),
+                Err(NamesError::Invalid),
+                "{bad:?}"
+            );
+        }
+        let too_many: Vec<SavedName> = (0..=OWNER_NAMES_MAX)
+            .map(|n| saved(&format!("n{n}.example.org"), OwnerSide::Allow, None))
+            .collect();
+        assert_eq!(list.restore(too_many), Err(NamesError::Full));
+        let far_too_many: Vec<SavedName> = (0..2 * OWNER_NAMES_MAX + 5)
+            .map(|n| saved(&format!("n{n}.example.org"), OwnerSide::Refuse, None))
+            .collect();
+        assert_eq!(list.restore(far_too_many), Err(NamesError::Full));
+        assert_eq!(list.rev(), rev);
+        assert_eq!(list.kept(), kept);
+        assert!(blocked(&shared, "keep.example.org"));
+        assert!(!blocked(&shared, "fine.example.org"));
+    }
+
+    #[test]
+    fn a_full_list_restores_and_a_name_kept_twice_on_one_side_is_one_entry() {
+        let (first, _) = list();
+        for n in 0..OWNER_NAMES_MAX {
+            first
+                .set(&format!("a{n}.example.org"), OwnerSide::Allow, None)
+                .unwrap();
+            first
+                .set(&format!("r{n}.example.org"), OwnerSide::Refuse, Some(UNIX))
+                .unwrap();
+        }
+        let kept = first.kept();
+        assert_eq!(kept.len(), 2 * OWNER_NAMES_MAX);
+        let (second, _) = list();
+        assert_eq!(second.restore(kept.clone()), Ok(()));
+        assert_eq!(second.kept(), kept);
+        // The same name twice on a side comes in once, at its first place.
+        let (third, _) = list();
+        third
+            .restore(vec![
+                saved("x.example.org", OwnerSide::Refuse, Some(UNIX)),
+                saved("x.example.org", OwnerSide::Refuse, Some(UNIX + 1)),
+            ])
+            .unwrap();
+        assert_eq!(
+            third.kept(),
+            [saved("x.example.org", OwnerSide::Refuse, Some(UNIX))]
         );
     }
 

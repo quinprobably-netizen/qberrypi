@@ -108,9 +108,11 @@ back. The Pi answers no DNS for about 15 to 20 s around the restart.
 - `--server <ipv4>` names the Pi's address.
 - `--allow-kernel` lets the update change the kernel, device tree, overlays or command line. Without
   it the kernel and boot files stay fixed: the build carries a digest of them, and both `update` and
-  the Pi refuse a build whose digest differs from the running one's. Nothing rolls back a kernel that
-  stops the board before init runs, except that under the firmware trial a power cycle boots the old
-  slot again.
+  the Pi refuse a build whose digest differs from the running one's. The digest takes the slot's
+  name and the touch screen's `xohms` (the owner's `[panel] touch_xohms`) at fixed values, so
+  neither is a change of the boot files (once the running build is one that does so: the first update
+  from a build older than `touch_xohms` sees the overlay line change, and needs this flag). Nothing rolls back a kernel that stops the board before
+  init runs, except that under the firmware trial a power cycle boots the old slot again.
 - `--force` uploads a build that is not newer than the running one.
 - `--software-trial` selects the new slot in `config.txt` instead of using `tryboot`, for a board
   whose firmware ignores the flag. It rolls back only a build that reaches init; for anything
@@ -118,9 +120,11 @@ back. The Pi answers no DNS for about 15 to 20 s around the restart.
 - `--rollback-drill panic|stall` uploads the same build with a fault that acts only on a trial boot,
   and succeeds when the Pi rolls back. It is how the rollback is tested.
 
-qberrypi still writes nothing to the card while it runs, apart from an update's own writes and the
-few lines of a trial boot's bookkeeping; a boot with no update under way writes nothing
-([milestone 6](bring-up/m6.md), amended).
+While it runs, qberrypi writes to the card only an update's own writes, the few lines of a trial
+boot's bookkeeping, and your settings (see [What is written to the card](#what-is-written-to-the-card));
+a boot in which none of your settings change and no update is under way writes nothing (one thing
+changes them without you: with no known list from qnet, the devices heard in the first ten minutes
+are learned, and that is saved) ([milestone 6](bring-up/m6.md), amended).
 
 ## Recovery
 
@@ -134,6 +138,57 @@ few lines of a trial boot's bookkeeping; a boot with no update under way writes 
 - **Back to Raspberry Pi OS and Pi-hole:** `cargo xtask flash --image <the backup that backup-card
   made> --device /dev/sdX --yes` puts the old card back as it was. `return-to-pios` is not the way
   back from a slot card; it works only on the old layout described under Development.
+- **Your settings** are not in the image: a `flash` starts them empty, and qnet pushes its own again.
+  To start them afresh without a flash, delete the folder `qberrypi-state` from the card in the
+  reader. `[state] persist = false` only stops keeping them: the copies stay on the card, and come
+  back when it is turned on again.
+
+## What is written to the card
+
+Your settings are kept on the card so that they come back after a restart or a power cut, also when
+the desktop is off: the ADS PASS list and the block list the desktop pushed or the panel edited, the
+mode (`exempt_default`), the labels, the known devices, your names (with the day you set each on the
+panel), a PIN set from the desktop or on the panel, and the night hours. Nothing that runs out is kept
+(the main gate, a device's gate), nor alerts, counters, the wrong-PIN count, or anything about
+lookups: the Pi keeps no record of what any device asked.
+
+They live in two copies, `qberrypi-state/a.bin` and `b.bin` on the boot partition, each a fixed
+77,824 bytes. Each copy starts with a header (a magic word, a format version, a sequence number and
+the length), then the settings, then a SHA-256 of all of it. At a start the Pi takes the whole copy
+with the higher sequence number; if neither is whole it starts empty, as before, and says so in one
+line.
+
+- **When.** The Pi looks at the settings every 5 s and saves once they have been still for 30 s, at
+  most once a minute, and never while an update is received or on trial. `RESTART` on UP saves at
+  once, before the restart; no other restart does. So what can be lost is a change made in the last
+  minute or so before a power cut, a change made while an update was received or on trial, and one
+  made just before an update's own restart. A boot in which none of them change writes nothing.
+- **How.** The first save on a card makes the folder and the two files at their full size, in one
+  ordinary write of the partition. From then on a save never mounts the partition: it writes the
+  new settings, in place, into the sectors of the copy that is not the newest, straight through the
+  partition device, and waits until the card has them. No file grows, no directory entry, file
+  allocation table or boot sector is written, and the save goes through the same claim on the card as
+  an update and the log, so the two never meet. Before it writes, the Pi reads the copy back and
+  checks that it is what it left there; if not, or if a write fails, it stops saving for that boot
+  and says why in one line.
+- **Why a power cut cannot damage it.** A cut during a save can spoil only the copy being written.
+  Its checksum then fails, and the next start takes the other copy, which holds the settings as they
+  were one save before. Nothing else on the card is touched by a save, so the slots, `config.txt`
+  and the configuration stay as they were.
+- **The log lines** (counts only, never a name, label or address): `state: settings restored from
+  copy a (seq 12): 3 ADS PASS, 0 blocked, 5 labels, 41 known, 7 names, lock kept, night kept`,
+  `state: no saved settings on the card`, `state: neither saved copy is whole; starting empty`,
+  `state: made the two copies on the card` and `state: saved to copy b (seq 13)`.
+- **The configuration wins.** A kept PIN is put back only while `[panel] pin_hash` is what it was
+  when the PIN was kept, and a kept night only while `[panel] night` is; change either in the file
+  and update, and the file's value is the one in force. The configuration's own lists
+  (`watch.exempt`, `watch.block`) are never copied.
+- **The known devices.** After a start the Pi knows the devices it knew before, so they raise no
+  alert, and it waits for qnet's known list as before. If none comes in ten minutes, a device that
+  joined meanwhile and is not on the kept list is raised as new (with nothing kept, the devices seen
+  in those ten minutes are learned, as before).
+- **Turning it off.** `[state] persist = false` reads, writes and makes nothing: the settings live
+  in memory only, and qnet pushes its own again after a restart.
 
 ## The front panel
 
@@ -163,7 +218,7 @@ pixels, the panel comes up on STARTING and then HOME, and returns to HOME after 
 | **WI-FI** | The link drawn large: ten dashes lit by the signal (`(dBm + 100) / 5`, rounded, 0 to 10), its word, `5 GHz · signal -54 dBm · linked 12 days` and `upstream answers in 9 ms` (the time the Pi's own resolver measures to its upstream, not the router's). While a rejoin is under way every dash is dark and it says `JOINING` | `BACK`; `REJOIN` lets the link go and joins again (the house is without DNS for the few seconds of the join). It never asks for the PIN, is refused for a minute after the last one (the key says `WAIT`), and is inert while an update is received or on trial |
 | **VERSION** | The running version, `built 2026-11-12 · slot A`, and `last update: confirmed`, `rolled back` or `none since start` (the board keeps the outcome in memory only; there is no `CHECK NOW`, since the Pi cannot fetch a build) | `BACK` |
 | **UP** | `12 D 4 H` since the board started, `load 0.21 · memory 38% · 47 °C` (the minute's load, the memory in use by what is not `MemAvailable`, the processor's heat) and `last restart:` the cause as far as this boot knows (`an update`, or `an update that rolled back`; the Pi writes nothing for an ordinary restart, so it shows a dash) | `BACK`; `RESTART` restarts the board (the log is saved and the cause is logged as the owner's). It is strong, and inert while an update is received or on trial |
-| **NIGHT HOURS** | `DARK FROM 23:00` and `UNTIL 07:00`, each with a `-` and a `+` key. The two hours equal are no night | `-` and `+` change the draft; `DONE` sets the hours for this boot (and goes back); `SLEEP NOW` shows the night screen at once, until a touch |
+| **NIGHT HOURS** | `DARK FROM 23:00` and `UNTIL 07:00`, each with a `-` and a `+` key. The two hours equal are no night | `-` and `+` change the draft; `DONE` sets the hours (and goes back; they are kept on the card); `SLEEP NOW` shows the night screen at once, until a touch |
 | **LOCK** | `ON` or `OFF`, the actions a PIN guards, and where the PIN lives (below) | `KEEP ON` / `KEEP OFF` goes back; `SET A PIN` (lock off) opens the pad to choose four digits; `TURN OFF` (lock on, strong) turns the lock off |
 | **ABOUT** | `QBERRYPI`, `a DNS gate and watchdog for the house` and `version ... on a Pi 3B+ · panel 480x320` | `BACK` or the lane goes HOME |
 
@@ -176,7 +231,8 @@ every second, and the device inventory every two seconds while ALERTS or an ALER
 their devices.
 
 **Your names** are the names you allow or refuse from the panel (or that qnet pushes): at most 128
-a side, kept in memory only, so qnet pushes them again after a restart. A refused name is blocked,
+a side, kept on the card (see [What is written to the card](#what-is-written-to-the-card)), so they
+come back after a restart. A refused name is blocked,
 with its subdomains, for every device, ADS PASS ones and devices with their own gate open too, and
 is counted as blocked but never raises an alert. An allowed name is answered although an ads list or
 `dns.deny` blocks it; a name on a threat list can never be allowed (the panel offers no key for it,
@@ -196,7 +252,7 @@ qnet adopts the Pi's list when `rev` moved and the lists differ, as it does the 
 
 **ADS PASS** is the word, on the panel and in qnet, for a device that is let off the ads lists. The
 threat lists and every alert still apply to it. (The API's JSON keeps its field names, `exempt` and
-`exempt_macs`.) CONFIRM edits the list of the mode in force, in memory: the pushed exempt list when
+`exempt_macs`.) CONFIRM edits the list of the mode in force, which is kept on the card: the pushed exempt list when
 devices are blocked by default, the pushed block list when they pass by default. A device that the
 configuration's own list of that mode names says `SET IN CONFIG` and is left as the file says, and
 no gate opens on it (the Pi refuses it, so the panel does not offer it); the router and the Pi are
@@ -212,7 +268,7 @@ length that was chosen; a gate opened from elsewhere (qnet,
 the API) is drawn against the smallest of the three lengths that holds what is left of it.
 
 **Labels** are the owner's names for devices, pushed by qnet (`PUT /api/qbp/devices/labels`: at most
-64, each 1 to 24 printable ASCII characters, kept in memory and so pushed again after a restart). The
+64, each 1 to 24 printable ASCII characters, kept on the card, and pushed again after a restart). The
 wall shows a device's label, else its hostname, else its last address number. No name, label or
 address is ever written to the log.
 
@@ -225,9 +281,11 @@ that ran out. `PUT devices/exempt` and `devices/policy` take an optional `if_rev
 `{"rev": current}` when it is stale. qnet's side of the rule (qnet is outside this repository): read
 `GET devices` on the usual poll; when `rev` moved and the pushed lists (`exempt_pushed`,
 `block_pushed`) differ from its own, adopt the Pi's, because the panel was the last writer; push with
-`if_rev` and, on 409, read again and merge. After a restart the lists are empty and qnet pushes its
-own. A panel edit made in the poll interval before a power cut is lost, and the panel says nothing of
-that. To draw the same wall as the panel, `GET devices` also gives `own_mac` (the Pi's own address,
+`if_rev` and, on 409, read again and merge. After a restart the Pi has the lists of its last save,
+says `"known_list": "waiting"` until qnet sends its known list (as it did before the lists were kept),
+and qnet takes that as a restart and pushes its own. A panel edit made in the minute or so before a
+power cut may be lost (the Pi saves once the settings have been still for 30 s, at most once a minute),
+and the panel says nothing of that. To draw the same wall as the panel, `GET devices` also gives `own_mac` (the Pi's own address,
 or `null`) and, per device, `label_rank` (the place of its label, or `null`) and `always` (the router
 and whatever claims its address or the Pi's).
 
@@ -271,8 +329,8 @@ says `panel: wrong PIN (n in a row)` at WARN, the count only: no digit and no ha
 The counter is in memory, so a power cut resets it (about three guesses a boot: a household's lock, not a
 vault). Until the services have started the lock fails closed: the strong keys ask, and no PIN is accepted.
 
-**Where the PIN lives.** A PIN is four digits and the Pi writes nothing to its card, so the durable one is a
-line in your configuration, in `[panel]`:
+**Where the PIN lives.** A PIN is four digits, and the one that never goes away is a line in your
+configuration, in `[panel]`:
 
 ```
 [panel]
@@ -282,12 +340,14 @@ pin_hash = "$pbkdf2-sha256$i=10000$<salt>$<hash>"
 
 Make the `pin_hash` line by piping four digits into `cargo xtask hash-pin` (never typed as an argument, and it
 refuses a terminal); it prints the line to paste. It survives a power cut, and changing it rides the next
-`cargo xtask update`. The desktop can put a hash in force for the running boot with `PUT /api/qbp/panel`
-(qnet keeps the hash and pushes it again after each start), and `SET A PIN` on the panel's LOCK screen works at
-once, for this boot only: the LOCK screen's second line says where the PIN lives (`kept in the config: it
-outlasts a restart`, `from the desktop: until the next restart`, `set here: until the next restart`). The
-latest set wins for the boot; at a start it is the configuration's hash, or none. `TURN OFF` on the panel
-lasts until the next restart when the configuration has a hash.
+`cargo xtask update`. The desktop can put a hash in force with `PUT /api/qbp/panel` (qnet keeps the hash and
+pushes it again after each start), and `SET A PIN` on the panel's LOCK screen works at once. Both are kept on the
+card with your other settings, so they outlast a restart: the LOCK screen's second line says where the PIN lives
+(`kept in the config: it outlasts a restart`, `from the desktop: it outlasts a restart`, `set here: it outlasts
+a restart`; with `[state] persist = false` the last two say `until the next restart`). The latest set wins; at
+a start it is the kept one, unless the configuration's `pin_hash` changed since it was kept, and then the
+configuration's (or none). `TURN OFF` on the panel lasts until the next restart when the configuration has a
+hash, and a PIN from the configuration is never copied into the kept settings.
 
 `GET /api/qbp/panel` (behind the login) answers `{"night": "23-07" or null, "lock": {"on": true,
 "source": "config" | "api" | "panel" | null}}`: the hash is never in an answer. `PUT /api/qbp/panel` takes
@@ -301,7 +361,8 @@ change, as `GET` does. A body with neither key, a bad night, a hash of another n
 not exactly as `hash-pin` prints it or a value that is no PIN's hash is a 400 and changes nothing, and no answer
 repeats a piece of the body. Pushing the hash that is in force already (qnet pushes its own again after every start)
 changes nothing, and in particular keeps a wait that the lock is running. The night hours the panel's
-NIGHT HOURS sets are this same state: the panel and the desktop edit one value, kept in memory for the boot.
+NIGHT HOURS sets are this same state: the panel and the desktop edit one value, kept on the card; at a start it is
+the kept one, unless the configuration's `night` changed since it was kept.
 
 **Reads of the board.** The panel reads the board's load, memory and heat (four small files of `/proc` and
 `/sys`, on its own thread, never the runtime's) every five seconds and only while SYSTEM, UP or WI-FI is up;
@@ -353,6 +414,31 @@ one boot. Four crosses appear one after the other on the screen: press each for
 about half a second. The log then holds the `[panel]` table for this screen as
 `panel: calibration:` lines, a heading and five values; copy them into
 `qberrypi.toml` without that prefix and set `calibrate_touch` back to `false`.
+
+How light a touch the screen takes is set in `[panel]` too, by three keys;
+lower values take a lighter, quicker touch and let more stray presses through.
+
+- `touch_xohms` (10 to 1000 ohms; 25 when unset) is the plate resistance the
+  `ads7846` touch driver is told, as `xohms=` on the `dtoverlay=qb-piscreen`
+  line of the slot's `config.txt` (the overlay's own value is 100). The driver
+  reckons the resistance of a touch in proportion to it, drops a touch above
+  255 and reports the pressure as 255 less the resistance, so a smaller value
+  takes a lighter touch; one too small rounds the firmest presses to nothing,
+  which the driver does not report. The digest of the boot files counts any
+  value in the range as the default, so a change goes out with a plain
+  `cargo xtask update`, under the usual trial and rollback. The exception is the
+  first update from a build older than these keys onto one that has them: in
+  the old build's eyes the overlay line gains `xohms=`, a change of the boot
+  files, so that one update needs `--allow-kernel` (and runs as a firmware trial).
+- `touch_min_pressure` (0 to 254 of the driver's 0 to 255; 4 when unset): a
+  report of the driver is a touch when its pressure is at least this. The
+  calibration counts the same reports as touches.
+- `touch_min_press_ms` (10 to 500 ms; 20 when unset): a press is a tap when it
+  lasts this long.
+
+Whatever the values, a press is a tap only if it begins on a key and never
+leaves it, a press cut by lost events is none, and the strong actions still ask
+for the PIN when the lock is on.
 
 ## Speed against Pi-hole
 

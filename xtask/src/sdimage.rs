@@ -10,6 +10,7 @@
 //! version 0.3 of the `fatfs` crate gives the directory's `.` and `..` entries
 //! long names. Linux reads and writes the directory all the same.
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::io::{Cursor, Read, Write};
 use std::ops::Range;
@@ -17,6 +18,7 @@ use std::path::Path;
 
 use anyhow::{Context, Result, bail};
 use fatfs::{FatType, FileSystem, FormatVolumeOptions, FsOptions};
+use sha2::{Digest, Sha256};
 
 /// The size of the image that QEMU boots. QEMU's Raspberry Pi takes a card only if its size is a
 /// power of two.
@@ -42,6 +44,9 @@ const NO_CHS: [u8; 3] = [0xFE, 0xFF, 0xFF];
 
 /// The partition over which a mounted FAT filesystem reads and writes.
 type Partition<'a> = Cursor<&'a mut [u8]>;
+
+/// A folder of that partition's file system.
+type Directory<'d, 'p> = fatfs::Dir<'d, Partition<'p>>;
 
 /// Writes a 64 MiB card image whose one partition is FAT and holds the given files.
 ///
@@ -258,6 +263,23 @@ impl Image {
         .with_context(|| format!("cannot list {dir:?} on {image}"))
     }
 
+    /// What the card holds, file by file: every file in the partition, folders included in each
+    /// path (`qberrypi-state/a.bin`), with its size, its first eight bytes and its SHA-256. Two
+    /// cards, or one card before and after a boot, are compared by comparing these.
+    ///
+    /// It reads every file whole, so it costs about the size of the files; nothing is written.
+    ///
+    /// It is an error for the file system not to be readable; the error names the image.
+    pub fn facts(&mut self) -> Result<BTreeMap<String, FileFacts>> {
+        let image = self.name.clone();
+        self.with_fat(|fat| {
+            let mut found = BTreeMap::new();
+            collect_facts(&fat.root_dir(), "", &mut found)?;
+            Ok(found)
+        })
+        .with_context(|| format!("cannot read the files of {image}"))
+    }
+
     /// Runs `work` on the image's filesystem. Nothing it does is written to the image file.
     fn with_fat<T>(
         &mut self,
@@ -267,6 +289,58 @@ impl Image {
         let fat = FileSystem::new(Cursor::new(partition), FsOptions::new())?;
         Ok(work(&fat)?)
     }
+}
+
+/// What a card holds of one file, for comparing cards: see [`Image::facts`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileFacts {
+    /// The file's length in bytes.
+    pub size: u64,
+    /// Its first eight bytes (fewer, zero-filled, if it is shorter).
+    pub head: [u8; 8],
+    /// The SHA-256 of its contents, as lowercase hexadecimal.
+    pub sha256: String,
+}
+
+/// The facts of every file under `dir`, with each path made of `prefix` and the names on the way.
+fn collect_facts(
+    dir: &Directory<'_, '_>,
+    prefix: &str,
+    found: &mut BTreeMap<String, FileFacts>,
+) -> std::io::Result<()> {
+    for entry in dir.iter() {
+        let entry = entry?;
+        let name = entry.file_name();
+        if name == "." || name == ".." {
+            continue;
+        }
+        let path = match prefix {
+            "" => name,
+            prefix => format!("{prefix}/{name}"),
+        };
+        if entry.is_dir() {
+            collect_facts(&entry.to_dir(), &path, found)?;
+            continue;
+        }
+        let mut file = entry.to_file();
+        let (mut size, mut head, mut sha) = (0u64, [0u8; 8], Sha256::new());
+        let mut chunk = vec![0u8; 64 * 1024];
+        loop {
+            let read = file.read(&mut chunk)?;
+            if read == 0 {
+                break;
+            }
+            if let Some(room) = head.get_mut(size as usize..) {
+                let take = room.len().min(read);
+                room[..take].copy_from_slice(&chunk[..take]);
+            }
+            sha.update(&chunk[..read]);
+            size += read as u64;
+        }
+        let sha256 = sha.finalize().iter().map(|b| format!("{b:02x}")).collect();
+        found.insert(path, FileFacts { size, head, sha256 });
+    }
+    Ok(())
 }
 
 /// Finds where the first partition lies, going by the image's partition table.
@@ -337,6 +411,51 @@ mod tests {
         build(&second, &files).unwrap();
 
         assert!(fs::read(&first).unwrap() == fs::read(&second).unwrap());
+    }
+
+    #[test]
+    fn the_facts_of_an_image_are_every_file_by_path_with_its_size_start_and_digest() {
+        let dir = tempfile::tempdir().unwrap();
+        let img = dir.path().join("sd.img");
+        let long = vec![b'z'; 100_000];
+        build(
+            &img,
+            &[
+                ("config.txt", b"os"),
+                ("qberrypi-state/a.bin", b"QBPSTATE then more"),
+                ("qberrypi-state/b.bin", &long),
+                ("empty.txt", b""),
+            ],
+        )
+        .unwrap();
+
+        let facts = Image::open(&img).unwrap().facts().unwrap();
+
+        let paths: Vec<&str> = facts.keys().map(String::as_str).collect();
+        assert_eq!(
+            paths,
+            [
+                "config.txt",
+                "empty.txt",
+                "qberrypi-state/a.bin",
+                "qberrypi-state/b.bin"
+            ]
+        );
+        let a = &facts["qberrypi-state/a.bin"];
+        assert_eq!((a.size, &a.head), (18, b"QBPSTATE"));
+        // The digest is the SHA-256 of the contents, whole, however many reads they took.
+        let digest = |bytes: &[u8]| -> String {
+            Sha256::digest(bytes)
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect()
+        };
+        assert_eq!(facts["qberrypi-state/b.bin"].sha256, digest(&long));
+        assert_eq!(facts["qberrypi-state/b.bin"].size, 100_000);
+        // A short file's start is its bytes, filled with zeros; an empty one has none.
+        assert_eq!(facts["config.txt"].head, *b"os\0\0\0\0\0\0");
+        assert_eq!(facts["empty.txt"].size, 0);
+        assert_eq!(facts["empty.txt"].sha256, digest(b""));
     }
 
     #[test]

@@ -311,18 +311,16 @@ mod tests {
     use crate::supervisor::{self, Hooks, Plan, Reason};
     use crate::wifi::WifiStatus;
 
-    /// The log buffer every test in this binary shares. The log macros do nothing until a logger is
-    /// installed, so a test that reads the log calls this before the code under test runs.
-    fn logging() -> &'static Mutex<crate::logbuf::LogBuf> {
-        crate::logbuf::install(Box::new(std::io::sink()))
+    /// Gives the test a log of its own, so that it reads its lines and no other test's. The log
+    /// macros do nothing until a logger is installed, so a test that reads the log calls this
+    /// before the code under test runs.
+    fn logging() {
+        crate::logbuf::testlog::start();
     }
 
-    /// Everything the log holds.
+    /// Everything the test's own log holds.
     fn log_text() -> String {
-        logging()
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .text()
+        crate::logbuf::testlog::text()
     }
 
     #[test]

@@ -8,11 +8,11 @@ use std::time::Duration;
 
 use qb_wpa2::MacAddr;
 use qb_wpa2::pmk::{Pmk, PmkError};
-use tokio::sync::Notify;
 use tokio::time::{Instant, sleep};
 
 use crate::config::{self, WifiKey};
 use backoff::Backoff;
+pub use join::RejoinSignal;
 use join::{JoinCfg, JoinError, Lost, hold, join, scan};
 
 pub mod backoff;
@@ -116,17 +116,18 @@ enum Outcome {
 ///
 /// # The owner's rejoin
 ///
-/// `rejoin` is notified (with `notify_waiters`) when the owner asks on the front panel for the link to be
+/// `rejoin` is asked ([`RejoinSignal::ask`]) when the owner asks on the front panel for the link to be
 /// made again. A link that is held then ends at once ([`join::hold`]: the station leaves of its own accord),
 /// and the pass ends as one whose link held, whatever its age: no access point is marked as failed, the
 /// waits start over, and the pass that follows scans the hinted channels first. A request that comes while
 /// no link is held is forgotten: a join is under way or about to be, and is not repeated. The refusal of a
-/// second request within a minute is the caller's (`wiring::LiveSystem`), not this loop's.
+/// second request within a minute is the caller's (`wiring::LiveSystem`), not this loop's: `ask` tells it whether
+/// a held link was let go, and only one that was is charged its minute.
 pub async fn run<R: radio::Radio>(
     radio: &mut R,
     cfg: &JoinCfg,
     report: &mut (dyn FnMut(WifiStatus) + Send),
-    rejoin: &Notify,
+    rejoin: &RejoinSignal,
 ) -> Infallible {
     let mut backoff = Backoff::default();
     let mut failed: Vec<MacAddr> = Vec::new();
@@ -223,7 +224,7 @@ async fn pass<R: radio::Radio>(
     failed: &mut Vec<MacAddr>,
     hinted: bool,
     report: &mut (dyn FnMut(WifiStatus) + Send),
-    rejoin: &Notify,
+    rejoin: &RejoinSignal,
 ) -> Outcome {
     let began = Instant::now();
     report(WifiStatus::Scanning);
@@ -360,8 +361,6 @@ fn signal_text(signal_mbm: i32) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::PoisonError;
-
     use super::*;
     use crate::netlink::nl80211::{Bss, Event};
     use crate::wifi::fake::reference::{AA, M1, M3, PMK, RSNE};
@@ -408,18 +407,16 @@ allow = []
         config::parse(&text).unwrap().wifi
     }
 
-    /// The log buffer every test in this binary shares. The log macros do nothing until a logger is
-    /// installed, so a test that reads the log calls this before the code under test runs.
-    fn logging() -> &'static std::sync::Mutex<crate::logbuf::LogBuf> {
-        crate::logbuf::install(Box::new(std::io::sink()))
+    /// Gives the test a log of its own, so that it reads its lines and no other test's. The log
+    /// macros do nothing until a logger is installed, so a test that reads the log calls this
+    /// before the code under test runs.
+    fn logging() {
+        crate::logbuf::testlog::start();
     }
 
-    /// Everything the log holds.
+    /// Everything the test's own log holds.
     fn log_text() -> String {
-        logging()
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .text()
+        crate::logbuf::testlog::text()
     }
 
     /// A scan result for a network called `ssid` that advertises `rsne`, heard at -56 dBm.
@@ -515,7 +512,7 @@ allow = []
         until: Duration,
     ) -> (FakeRadio, Vec<WifiStatus>) {
         let mut statuses = Vec::new();
-        let rejoin = Notify::new();
+        let rejoin = RejoinSignal::new();
         {
             let mut report = |status: WifiStatus| statuses.push(untimed(status));
             tokio::select! {
@@ -610,7 +607,6 @@ allow = []
     #[tokio::test(start_paused = true)]
     async fn an_access_point_with_no_signal_is_logged_as_having_none() {
         logging();
-        // A channel of its own, so that its lines are told from those of the other tests.
         let mut radio = radio_seeing(vec![Bss {
             signal_mbm: i32::MIN,
             ..bss(AA, 5240, b"ThisIsASSID", &RSNE)
@@ -691,7 +687,7 @@ allow = []
         let mut radio = radio_seeing(vec![reference_bss()]);
         radio.script.extend(join_script());
         let mut statuses = Vec::new();
-        let (cfg, rejoin) = (cfg(), Notify::new());
+        let (cfg, rejoin) = (cfg(), RejoinSignal::new());
         let before = crate::sys::uptime().as_secs();
         {
             let mut report = |status: WifiStatus| statuses.push(status);
@@ -731,14 +727,17 @@ allow = []
         ));
         radio.script.extend(join_script());
         let cfg = hinted(&[5180]);
-        let rejoin = Notify::new();
+        let rejoin = RejoinSignal::new();
         let mut statuses = Vec::new();
         {
             let mut report = |status: WifiStatus| statuses.push(untimed(status));
             let asking = async {
                 // Seven seconds into a link that is held for less than the stable time.
                 tokio::time::sleep(Duration::from_secs(7)).await;
-                rejoin.notify_waiters();
+                assert!(
+                    rejoin.ask(),
+                    "the link that was held did not hear the owner"
+                );
                 tokio::time::sleep(Duration::from_secs(20)).await;
             };
             tokio::select! {
@@ -797,13 +796,16 @@ allow = []
             from_ap(&M1),
             from_ap(&M3),
         ]);
-        let (cfg, rejoin) = (cfg(), Notify::new());
+        let (cfg, rejoin) = (cfg(), RejoinSignal::new());
         let mut statuses = Vec::new();
         {
             let mut report = |status: WifiStatus| statuses.push(untimed(status));
             let asking = async {
                 tokio::time::sleep(Duration::from_secs(2)).await;
-                rejoin.notify_waiters();
+                assert!(
+                    !rejoin.ask(),
+                    "a join that is under way counted as a held link"
+                );
                 tokio::time::sleep(Duration::from_secs(60)).await;
             };
             tokio::select! {
@@ -1088,7 +1090,7 @@ allow = []
     #[tokio::test(start_paused = true)]
     async fn the_hint_keeps_the_log_free_of_its_frequencies() {
         logging();
-        // A channel of its own, so that the lines of the other tests are told from these.
+        // No access point is on 5745, so a line that names it can only print the hint's list.
         let mut radio = radio_seeing(vec![bss(AA, 5765, b"ThisIsASSID", &RSNE)]);
         radio.script.extend(join_script());
         drive(radio, &hinted(&[5765, 5745]), Duration::from_secs(5)).await;
@@ -1451,7 +1453,7 @@ allow = []
         {
             let mut report = |status: WifiStatus| statuses.push(untimed(status));
             let armed_at = MUTE_AFTER + Duration::from_secs(5);
-            let (cfg, rejoin) = (cfg(), Notify::new());
+            let (cfg, rejoin) = (cfg(), RejoinSignal::new());
             tokio::select! {
                 never = run(&mut radio, &cfg, &mut report, &rejoin) => match never {},
                 ended = arm_after(&mute, armed_at) => panic!("the arming ended: {ended:?}"),

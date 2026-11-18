@@ -14,7 +14,7 @@
 //! own small lock, once a second.
 //!
 //! **Acts.** `rejoin` and `restart` carry out the two actions of spec §6.6 and refuse as it says: a rejoin
-//! at most once a minute, and neither while an update is received or staged or on a trial. The
+//! that lets a link go at most once a minute, and neither while an update is received or staged or on a trial. The
 //! panel makes the two keys inert while an update is under way, but the refusal is here as well, in the one
 //! place that knows. Neither carries a name, a label or an address, and what the panel logs of either is
 //! that it was asked.
@@ -48,8 +48,10 @@ impl From<Busy> for RestartRefused {
 /// Where the panel reads the board from, and what it does to it.
 pub trait SystemControl: Send + Sync {
     /// Asks the Wi-Fi to let the link go and join again (spec §6.6): the link that is held ends at once and
-    /// a hinted join follows. Refused while the last one is less than [`REJOIN_EVERY_SECS`] old, with the
-    /// seconds that are left. Refused as well, as a wait of the whole minute that is charged to nobody,
+    /// a hinted join follows. Refused while the last one that let a link go is less than [`REJOIN_EVERY_SECS`]
+    /// old, with the seconds that are left. One that finds no link held (it is down, or being joined) lets
+    /// nothing go, since the join that is under way or about to be is the one asked for: it is no refusal, and
+    /// it is not charged the minute. Refused as well, as a wait of the whole minute that is charged to nobody,
     /// while an update is received or staged and while this boot is on trial: the link that carries it is
     /// not let go of. The house is without DNS for the few seconds of the join.
     fn rejoin(&self) -> Result<(), RejoinWait>;

@@ -146,20 +146,34 @@ impl Outcome {
 
 /// A name the watched device asked, with what came of it.
 ///
-/// `Debug` shows the outcome only.
+/// It is held twice: fitted to its row, as DEVICE draws it, and whole, as the row opens NAME with it (NAME is
+/// about a name by its whole text, spec §4). `Debug` shows the outcome only.
 #[derive(Clone, PartialEq, Eq)]
 pub struct WatchedName {
     /// The name, as `fit_site` fits it to `WATCHED_NAME_CELLS`.
     pub name: String,
+    /// The name by its whole text, at most `NAME_BYTES_MAX` bytes: what the row opens NAME with. `None` when
+    /// the whole of it is not known, and the row is then no door.
+    pub whole: Option<String>,
     /// What came of it.
     pub outcome: Outcome,
 }
 
 impl WatchedName {
-    /// A name and its outcome; the name is fitted.
+    /// A name and its outcome: the row shows it fitted, and opens NAME with it whole.
     pub fn new(name: &str, outcome: Outcome) -> Self {
+        Self::shown_as(name, Some(name), outcome)
+    }
+
+    /// A name that the row shows as `shown` (which is fitted here) and opens NAME with as `whole`: for a source
+    /// whose text to show is not the whole name (the board cuts what it shows as its lane does). A `whole` longer
+    /// than a DNS name is not one, and is not held.
+    pub fn shown_as(shown: &str, whole: Option<&str>, outcome: Outcome) -> Self {
         Self {
-            name: fit_site(name, WATCHED_NAME_CELLS),
+            name: fit_site(shown, WATCHED_NAME_CELLS),
+            whole: whole
+                .filter(|name| !name.is_empty() && name.len() <= NAME_BYTES_MAX)
+                .map(str::to_owned),
             outcome,
         }
     }
@@ -294,9 +308,11 @@ pub enum LockSource {
     /// `[panel] pin_hash` in the slot's configuration: it survives a restart.
     #[default]
     Config,
-    /// Pushed from the desktop for this boot.
+    /// Pushed from the desktop: until the next restart, or beyond it when the card keeps the state
+    /// ([`World::lock_kept`]).
     Api,
-    /// Set on the panel itself: until the next restart.
+    /// Set on the panel itself: until the next restart, or beyond it when the card keeps the state
+    /// ([`World::lock_kept`]).
     Panel,
 }
 
@@ -792,6 +808,10 @@ pub struct World {
     pub lock_on: bool,
     /// Where the PIN lives; read only while `lock_on` (the LOCK screen's second line).
     pub lock_source: LockSource,
+    /// Whether the card keeps what the owner sets, so that a PIN from the desktop or the panel outlasts a
+    /// restart whatever `lock_source` says; `false` until the loop reads it (the LOCK screen's second line,
+    /// whether the lock is on or not).
+    pub lock_kept: bool,
     /// The Wi-Fi link's figures; read while SYSTEM or WI-FI shows.
     pub link: Link,
     /// The board's readings; read while SYSTEM or one of its readings shows.
@@ -840,6 +860,7 @@ impl Default for World {
             name_facts: None,
             lock_on: false,
             lock_source: LockSource::default(),
+            lock_kept: false,
             link: Link::default(),
             machine: Machine::default(),
             night: None,
@@ -966,7 +987,7 @@ impl World {
         size_of::<Self>()
             + (VERSION_CELLS + BUILT_CELLS + RESTART_CAUSE_CELLS) * CHAR
             + MAX_DEVICES * (size_of::<DeviceRow>() + DEVICE_NAME_CELLS * CHAR)
-            + MAX_WATCHED * (size_of::<WatchedName>() + WATCHED_NAME_CELLS * CHAR)
+            + MAX_WATCHED * (size_of::<WatchedName>() + WATCHED_NAME_CELLS * CHAR + NAME_BYTES_MAX)
             + MAX_ALERT_ROWS * alert_row
             + MAX_TOP_NAMES * (size_of::<NameRow>() + NAME_BYTES_MAX)
             + MAX_OWNER_ROWS * (size_of::<OwnerRow>() + NAME_BYTES_MAX)
@@ -991,7 +1012,7 @@ impl World {
             + self
                 .watched
                 .iter()
-                .map(|w| w.name.capacity())
+                .map(|w| w.name.capacity() + w.whole.as_ref().map_or(0, String::capacity))
                 .sum::<usize>()
             + self.alerts.capacity() * size_of::<AlertRow>()
             + self
@@ -1064,6 +1085,7 @@ mod tests {
         for _ in 0..MAX_WATCHED {
             world.watched.push(WatchedName {
                 name: cells(WATCHED_NAME_CELLS),
+                whole: Some("n".repeat(NAME_BYTES_MAX)),
                 outcome: Outcome::Refused,
             });
         }
@@ -1136,6 +1158,33 @@ mod tests {
         let long = display_name(Some("A very long label for a very small tile"), None, 1).0;
         assert_eq!(long.chars().count(), DEVICE_NAME_CELLS);
         assert!(long.ends_with('~'));
+    }
+
+    #[test]
+    fn a_watched_name_is_held_whole_for_name_beside_what_its_row_shows() {
+        let long = "a.very.long.host.name.of.a.tracker.example.org";
+        let name = WatchedName::new(long, Outcome::Refused);
+        assert_eq!(name.name, "a.tracker.example.org");
+        assert_eq!(name.whole.as_deref(), Some(long));
+        // The board shows the text its lane cut, and keeps the whole name for the door.
+        let cut = WatchedName::shown_as("a.very.long.host", Some(long), Outcome::Answered);
+        assert_eq!(
+            (cut.name.as_str(), cut.whole.as_deref()),
+            ("a.very.long.host", Some(long))
+        );
+        // A name that is not known whole, or is longer than a DNS name, or is empty, is no door.
+        assert_eq!(
+            WatchedName::shown_as("cut~", None, Outcome::Answered).whole,
+            None
+        );
+        let too_long = "n".repeat(NAME_BYTES_MAX + 1);
+        assert_eq!(
+            WatchedName::shown_as("n", Some(&too_long), Outcome::Answered).whole,
+            None
+        );
+        assert_eq!(WatchedName::new("", Outcome::Answered).whole, None);
+        // `Debug` prints neither.
+        assert!(!format!("{name:?}").contains("tracker"));
     }
 
     #[test]
@@ -1361,7 +1410,7 @@ mod tests {
         }
         let bytes = world.devices.len() * (size_of::<DeviceRow>() + DEVICE_NAME_CELLS)
             + size_of::<World>()
-            + 2 * (size_of::<WatchedName>() + WATCHED_NAME_CELLS)
+            + 2 * (size_of::<WatchedName>() + WATCHED_NAME_CELLS + NAME_BYTES_MAX)
             + size_of::<AlertRow>()
             + ALERT_TITLE_CELLS
             + ALERT_LINE_CELLS.iter().sum::<usize>();

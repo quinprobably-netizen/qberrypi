@@ -49,7 +49,7 @@ use std::time::Instant;
 use qb_dns::stats::BUCKET_SECS;
 use qb_dns::{Counts, HistoryBucket, LogEntry};
 use serde_json::{Value, json};
-use zeroize::Zeroizing;
+use zeroize::{Zeroize, Zeroizing};
 
 use super::bench::{self, Bench};
 use super::http::{Reply, Request};
@@ -370,13 +370,14 @@ impl Api {
         if right {
             self.limiter().succeeded(from);
             drop(verifying);
-            let Some(random) = (self.random)() else {
+            let Some(random) = (self.random)().map(Zeroizing::new) else {
                 log::warn!("api: no random source for a session");
                 return error(500, NO_RANDOM, started);
             };
-            let sid = self.sessions().open(random, now);
+            // The id as text is a copy of the session's secret, wiped once the reply is made.
+            let sid = Zeroizing::new(self.sessions().open(*random, now));
             log::info!("api: login accepted");
-            return session_valid(Some(sid), SESSION_SECS, Some("password correct"), started);
+            return session_valid(Some(&sid), SESSION_SECS, Some("password correct"), started);
         }
         // Recorded before the lock is let go, so that the next guess in line meets its hold-back.
         let hold = self.limiter().failed(from, now);
@@ -648,7 +649,7 @@ pub(crate) fn error_with(status: u16, key: &str, message: &str, started: Instant
 
 /// The session object of a valid session, a 200: `sid` is given only for a new one.
 fn session_valid(
-    sid: Option<String>,
+    sid: Option<&str>,
     validity: u64,
     message: Option<&str>,
     started: Instant,
@@ -690,11 +691,18 @@ fn reply(status: u16, mut body: Value, started: Option<Instant>) -> Reply {
         fields.insert("took".into(), json!(started.elapsed().as_secs_f64()));
     }
     // Writing a `Value` into a `Vec` cannot fail: its keys are strings, and a non-finite float is
-    // already `null` in it.
-    Reply {
-        status,
-        body: serde_json::to_vec(&body).unwrap_or_default(),
+    // already `null` in it. There is room for the reply of a login, which holds a session id, so
+    // that the buffer does not grow and leave a smaller copy of the id behind unwiped.
+    let mut out = Vec::with_capacity(256);
+    if serde_json::to_writer(&mut out, &body).is_err() {
+        out.clear();
     }
+    // That reply is the one place where the JSON holds a secret, a new session's id, and the
+    // value holds a copy of it.
+    if let Some(Value::String(sid)) = body.pointer_mut("/session/sid") {
+        sid.zeroize();
+    }
+    Reply { status, body: out }
 }
 
 #[cfg(test)]

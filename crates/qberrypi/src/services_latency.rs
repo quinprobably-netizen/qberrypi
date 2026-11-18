@@ -234,6 +234,7 @@ pub(crate) fn run(parts: Parts, samples: usize, every: Duration, scale: usize) -
                     control: slot.clone(),
                     calibration: cfg.panel.calibration(),
                     calibrate: false,
+                    sensitivity: cfg.panel.sensitivity(),
                     lane: slot.lane(),
                     alerts: slot.clone(),
                     devices: slot.clone(),

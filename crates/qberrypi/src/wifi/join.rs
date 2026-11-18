@@ -15,6 +15,9 @@
 
 use std::collections::VecDeque;
 use std::fmt;
+use std::pin::Pin;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::task::{Context, Poll};
 use std::time::Duration;
 
 use qb_wpa2::MacAddr;
@@ -22,6 +25,7 @@ use qb_wpa2::pmk::Pmk;
 use qb_wpa2::rsne::SUPPLICANT_RSNE;
 use qb_wpa2::supplicant::{HandshakeError, Params, Phase, Reply, ReplyKind, Supplicant, Warning};
 use tokio::sync::Notify;
+use tokio::sync::futures::Notified;
 use tokio::time::{Instant, MissedTickBehavior, interval_at, sleep, timeout_at};
 
 use super::choose::Candidate;
@@ -504,6 +508,74 @@ async fn associate_and_handshake<R: Radio>(
     }
 }
 
+/// The owner's rejoin, from the front panel to the hold of the link: a notify that stores nothing for a hold
+/// that is not there to hear it, and the count of the holds that listen to it, so that the one who asks knows
+/// whether a held link was let go.
+///
+/// A hold listens from its start to its end ([`RejoinSignal::listen`]), and [`RejoinSignal::ask`] says whether
+/// one did when it was asked. A request while no link is held is forgotten and ends nothing: a join is under way
+/// or about to be, and is not repeated. A hold that is ending already for another cause still counts: its link
+/// is let go all the same, and a join follows.
+#[derive(Debug, Default)]
+pub struct RejoinSignal {
+    /// Notified with `notify_waiters`, which wakes the holds that listen and stores no permit for a later one.
+    notify: Notify,
+    /// How many holds listen: one, or none.
+    holds: AtomicUsize,
+}
+
+impl RejoinSignal {
+    /// A signal that no hold listens to yet.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Ends the link that is held, if one is, and says whether one was: `false` when no hold listened and
+    /// nothing was let go.
+    pub fn ask(&self) -> bool {
+        // A hold that is counted has made its `Notified` before the count (see `listen`), so it hears this.
+        if self.holds.load(Ordering::SeqCst) == 0 {
+            return false;
+        }
+        self.notify.notify_waiters();
+        true
+    }
+
+    /// What a hold waits on for the owner: ready once [`RejoinSignal::ask`] is called after this, polled or
+    /// not. The hold is counted as listening until what this returns is dropped.
+    pub fn listen(&self) -> Listening<'_> {
+        // Made before the count, so that an ask that sees the count is heard.
+        let asked = Box::pin(self.notify.notified());
+        self.holds.fetch_add(1, Ordering::SeqCst);
+        Listening {
+            asked,
+            holds: &self.holds,
+        }
+    }
+}
+
+/// A hold's ear for the owner's rejoin ([`RejoinSignal::listen`]): a future that is ready when the owner asks,
+/// and that counts as a listening hold until it is dropped.
+#[derive(Debug)]
+pub struct Listening<'a> {
+    asked: Pin<Box<Notified<'a>>>,
+    holds: &'a AtomicUsize,
+}
+
+impl Future for Listening<'_> {
+    type Output = ();
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+        self.asked.as_mut().poll(cx)
+    }
+}
+
+impl Drop for Listening<'_> {
+    fn drop(&mut self) {
+        self.holds.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
 /// Keeps the link: answers the access point's rekeys and installs the keys they deliver, until the link is lost.
 ///
 /// A frame the supplicant refuses is dropped, with a warning. A key the kernel refuses, a rekey whose message 3
@@ -512,9 +584,10 @@ async fn associate_and_handshake<R: Radio>(
 /// because the supplicant hands a key out once: the access point's repeat would not carry it again, and the
 /// link would stay up with its unicast or its group traffic dead.
 ///
-/// `rejoin` is the owner's way to end the link: when it is notified (`Notify::notify_waiters`, which stores
-/// nothing for a hold that is not there to hear it) the station leaves the network at once, with the reason
-/// of one that leaves of its own accord, and the hold ends with [`Lost::Rejoin`].
+/// `rejoin` is the owner's way to end the link: the hold listens to it from its start to its end, and when the
+/// owner asks ([`RejoinSignal::ask`], which stores nothing for a hold that is not there to hear it) the station
+/// leaves the network at once, with the reason of one that leaves of its own accord, and the hold ends with
+/// [`Lost::Rejoin`].
 ///
 /// A radio that dies without a word (a firmware that hangs sends no disconnect, no overrun and no error) would
 /// leave the link held for ever, so every `PROBE_EVERY` of the hold, whatever the traffic, the radio is asked
@@ -528,13 +601,14 @@ async fn associate_and_handshake<R: Radio>(
 /// A radio that has stopped answering is lost within 3 × (10 s + 10 s) = 60 s: a probe is due every
 /// `PROBE_EVERY` after the last one ended, and takes at most the bound of a radio command, which is two reply
 /// timeouts (10 s). The `leave` that follows is a command and has the same bound.
-pub async fn hold<R: Radio>(radio: &mut R, link: &mut Link, rejoin: &Notify) -> Lost {
+pub async fn hold<R: Radio>(radio: &mut R, link: &mut Link, rejoin: &RejoinSignal) -> Lost {
     // Delay: a probe that took long, or a stretch of work, moves the next one back and does not bunch two.
     let mut due = interval_at(Instant::now() + PROBE_EVERY, PROBE_EVERY);
     due.set_missed_tick_behavior(MissedTickBehavior::Delay);
     let mut failures = 0;
-    // Made before the first wait, so that a notification from now on is heard, polled or not.
-    let mut asked = std::pin::pin!(rejoin.notified());
+    // Made before the first wait, so that a request from now on is heard, polled or not; and counted from now on,
+    // so that the one who asks knows that a link was held.
+    let mut asked = rejoin.listen();
     loop {
         // `next_event` is cancel-safe: the tick or the owner that wins the race loses no event.
         let event = tokio::select! {
@@ -699,8 +773,6 @@ fn log_warning(reply: &Reply) {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::PoisonError;
-
     use super::*;
     use crate::netlink::nl80211::{Bss, Event};
     use crate::wifi::fake::authenticator::{ApFrame, gtk_kde, pad};
@@ -782,18 +854,16 @@ mod tests {
         radio.commands().pop()
     }
 
-    /// The log buffer every test in this binary shares. The log macros do nothing until a logger is
-    /// installed, so a test that reads the log calls this before the code under test runs.
-    fn logging() -> &'static std::sync::Mutex<crate::logbuf::LogBuf> {
-        crate::logbuf::install(Box::new(std::io::sink()))
+    /// Gives the test a log of its own, so that it reads its lines and no other test's. The log
+    /// macros do nothing until a logger is installed, so a test that reads the log calls this
+    /// before the code under test runs.
+    fn logging() {
+        crate::logbuf::testlog::start();
     }
 
-    /// Everything the log holds.
+    /// Everything the test's own log holds.
     fn log_text() -> String {
-        logging()
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .text()
+        crate::logbuf::testlog::text()
     }
 
     #[tokio::test(start_paused = true)]
@@ -1109,7 +1179,7 @@ mod tests {
             ),
         ]);
         let started = tokio::time::Instant::now();
-        let lost = hold(&mut radio, &mut link, &Notify::new()).await;
+        let lost = hold(&mut radio, &mut link, &RejoinSignal::new()).await;
         assert_eq!(started.elapsed(), an_hour);
         assert_eq!(
             lost,
@@ -1140,7 +1210,7 @@ mod tests {
             from_ap(&G1),
             disconnected(3, false),
         ]);
-        hold(&mut radio, &mut link, &Notify::new()).await;
+        hold(&mut radio, &mut link, &RejoinSignal::new()).await;
         let commands = radio.commands();
         assert_eq!(pairwise_installs(&commands), 1);
         let groups: Vec<u8> = commands
@@ -1161,7 +1231,7 @@ mod tests {
         // A new four-way handshake from the access point whose message 3 repeats an RSN element that is not
         // the advertised one.
         radio.script.extend(new_handshake(&OTHER_RSNE));
-        let lost = hold(&mut radio, &mut link, &Notify::new()).await;
+        let lost = hold(&mut radio, &mut link, &RejoinSignal::new()).await;
         assert_eq!(lost, Lost::RsneMismatch);
         assert_eq!(
             lost.to_string(),
@@ -1187,7 +1257,7 @@ mod tests {
         let (mut radio, mut link) = joined().await;
         radio.fail_install_group = true;
         radio.script.extend([from_ap(&G1), disconnected(3, false)]);
-        let lost = hold(&mut radio, &mut link, &Notify::new()).await;
+        let lost = hold(&mut radio, &mut link, &RejoinSignal::new()).await;
         assert!(refused(&lost), "{lost:?}");
         assert_eq!(
             after_join(&radio),
@@ -1206,7 +1276,7 @@ mod tests {
         let (mut radio, mut link) = joined().await;
         radio.fail_install = true;
         radio.script.extend(new_handshake(&RSNE));
-        let lost = hold(&mut radio, &mut link, &Notify::new()).await;
+        let lost = hold(&mut radio, &mut link, &RejoinSignal::new()).await;
         assert!(refused(&lost), "{lost:?}");
         let hold_commands = after_join(&radio);
         assert_eq!(sent_frames(&hold_commands), 2);
@@ -1221,7 +1291,7 @@ mod tests {
         let (mut radio, mut link) = joined().await;
         radio.script.push_back(nl(Event::Roamed { bssid: [2; 6] }));
         assert_eq!(
-            hold(&mut radio, &mut link, &Notify::new()).await,
+            hold(&mut radio, &mut link, &RejoinSignal::new()).await,
             Lost::Roamed
         );
         assert_eq!(last(&radio), Some(Call::Disconnect(3)));
@@ -1229,7 +1299,7 @@ mod tests {
         let (mut radio, mut link) = joined().await;
         radio.script.push_back(Step::Event(RadioEvent::Overrun));
         assert_eq!(
-            hold(&mut radio, &mut link, &Notify::new()).await,
+            hold(&mut radio, &mut link, &RejoinSignal::new()).await,
             Lost::EventsLost
         );
         assert_eq!(last(&radio), Some(Call::Disconnect(3)));
@@ -1252,9 +1322,17 @@ mod tests {
     }
 
     /// What a hold of a link whose radio is scripted by `script` returns, how long it took, and the radio.
+    ///
+    /// A hold that has not ended after a day of the paused clock fails the test, instead of hanging
+    /// it: the probes of a hold that nothing else ends are what end it.
     async fn held_for(mut radio: FakeRadio, mut link: Link) -> (Lost, Duration, FakeRadio) {
         let started = tokio::time::Instant::now();
-        let lost = hold(&mut radio, &mut link, &Notify::new()).await;
+        let lost = tokio::time::timeout(
+            Duration::from_secs(24 * 3600),
+            hold(&mut radio, &mut link, &RejoinSignal::new()),
+        )
+        .await
+        .expect("the hold did not end within a day");
         (lost, started.elapsed(), radio)
     }
 
@@ -1293,12 +1371,15 @@ mod tests {
     async fn a_rejoin_ends_the_hold_at_once_and_the_station_leaves() {
         logging();
         let (mut radio, mut link) = joined().await;
-        let rejoin = Notify::new();
+        let rejoin = RejoinSignal::new();
         let started = tokio::time::Instant::now();
-        let (lost, ()) = tokio::join!(hold(&mut radio, &mut link, &rejoin), async {
+        let (lost, asked) = tokio::join!(hold(&mut radio, &mut link, &rejoin), async {
             sleep(secs(25)).await;
-            rejoin.notify_waiters();
+            rejoin.ask()
         });
+        // The one who asked is told that a held link was let go; once the hold is over, nothing is held.
+        assert!(asked, "the hold was not listening");
+        assert!(!rejoin.ask(), "a hold that ended still counts as listening");
         assert_eq!(lost, Lost::Rejoin);
         assert_eq!(started.elapsed(), secs(25));
         assert_eq!(after_join(&radio), [Call::Disconnect(3)]);
@@ -1312,8 +1393,9 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_rejoin_asked_for_before_the_hold_is_not_remembered_by_it() {
         let (mut radio, mut link) = joined().await;
-        let rejoin = Notify::new();
-        rejoin.notify_waiters();
+        let rejoin = RejoinSignal::new();
+        // Nobody listens yet, and the one who asks is told so.
+        assert!(!rejoin.ask());
         radio.script.push_back(disconnects_after(secs(5)));
         let (lost, took, radio) = {
             let started = tokio::time::Instant::now();
@@ -1581,7 +1663,7 @@ mod tests {
         logging();
         let (mut radio, mut link) = joined().await;
         radio.script.extend([from_ap(&G1), disconnected(3, false)]);
-        hold(&mut radio, &mut link, &Notify::new()).await;
+        hold(&mut radio, &mut link, &RejoinSignal::new()).await;
         // Other tests log into the same buffer at the same time, which does no harm here.
         let text = log_text();
         assert!(text.contains("wifi: pairwise key installed"));

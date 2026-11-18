@@ -82,7 +82,7 @@ use fb::{Framebuffer, SCREEN_DRIVER, SYS_GRAPHICS, SYS_VTCONSOLE, Screen, Screen
 use lock::{Check, LockControl, Source as PinSource};
 use names::{NamesControl, OwnerSide};
 use system::{RejoinWait, RestartRefused, SystemControl};
-use touch::{Decoded, Decoder, RawEvent, SYS_INPUT, find_touch, read_events};
+use touch::{Decoded, Decoder, RawEvent, SYS_INPUT, Sensitivity, find_touch, read_events};
 use view::{WallEntry, blocking, gate_total, refill, wanted_stills};
 
 pub mod alerts;
@@ -206,6 +206,9 @@ pub struct Deps {
     pub calibration: Calibration,
     /// Whether to measure `calibration` before the panel is drawn: four crosses to tap, logged and used for this boot only.
     pub calibrate: bool,
+    /// How light a touch counts: the least pressure of a touch sample, which the calibration takes too,
+    /// and the shortest press that is a tap.
+    pub sensitivity: Sensitivity,
     /// The names that the resolver lets the lane show.
     pub lane: Arc<LaneFeed>,
     /// Where the panel's alerts come from, and where a dismissal is told: the ALERT screen shows the top one.
@@ -545,11 +548,12 @@ impl<S: Surface> Panel<S> {
         // A panel that failed, or was restarted, may have left the lane feed keeping the names of one
         // device (spec §6.2: names only while that device's screen is open). This one has no screen open.
         deps.devices.watch_client(None);
+        let sensitivity = deps.sensitivity;
         Self {
             surface,
             deps,
-            decoder: Decoder::default(),
-            tracker: TapTracker::default(),
+            decoder: Decoder::new(sensitivity.min_pressure),
+            tracker: TapTracker::new(sensitivity.min_press_ms),
             nav: Nav::new(),
             world: World {
                 version: qb_panel::format::fit_text(
@@ -636,7 +640,8 @@ impl<S: Surface> Panel<S> {
 
     /// Takes the events the touch screen reported, in the order they were read.
     ///
-    /// A press that begins on something a tap works, stays on it and lasts 50 ms is a tap; it is decided by
+    /// A press that begins on something a tap works, stays on it and lasts the shortest press of the
+    /// `sensitivity` (20 ms unless the configuration says another) is a tap; it is decided by
     /// `nav::tap`, which moves the panel and may give back what the system must do, which is done here.
     /// The next turn draws whatever it changed. A tap is timed by the events that make it, not by when
     /// they were read.
@@ -661,7 +666,7 @@ impl<S: Surface> Panel<S> {
                 }
                 // Whatever was known of the press is not to be trusted, nor is it needed:
                 // the press may be one whose `Down` was never given out.
-                Decoded::Lost => self.tracker = TapTracker::default(),
+                Decoded::Lost => self.tracker.cancel(),
             }
         }
     }
@@ -759,8 +764,8 @@ impl<S: Surface> Panel<S> {
                 }
                 Err(RestartRefused::NotReady) => log::warn!("panel: restart refused: not ready"),
             },
-            // The lock logs a PIN that was set or taken away (`panel: the PIN was set on the panel (until the next
-            // restart)`, `panel: the lock was turned off`): there is nothing the panel adds, and nothing it may.
+            // The lock logs a PIN that was set or taken away (`panel: the PIN was set on the panel`,
+            // `panel: the lock was turned off`): there is nothing the panel adds, and nothing it may.
             Intent::SetPin(digits) => {
                 if !self.deps.lock.set_pin(digits.into_zeroizing()) {
                     log::warn!("panel: the PIN was not set");
@@ -1162,7 +1167,8 @@ impl<S: Surface> Panel<S> {
         put(&mut self.world.rejoin, rejoin, &mut self.world_changed);
     }
 
-    /// Reads whether the lock is on and where its PIN came from: what makes a strong key ask. A mutex and a copy.
+    /// Reads whether the lock is on, where its PIN came from and whether the card keeps it: what makes a strong key
+    /// ask, and what the LOCK screen says. A mutex and a copy.
     fn read_lock(&mut self) {
         let view = self.deps.lock.lock_view();
         let source = match view.source {
@@ -1173,6 +1179,7 @@ impl<S: Surface> Panel<S> {
         let changed = &mut self.world_changed;
         put(&mut self.world.lock_on, view.on, changed);
         put(&mut self.world.lock_source, source, changed);
+        put(&mut self.world.lock_kept, view.kept, changed);
     }
 
     /// Asks the update machinery where it stands (every `UPDATE_MS`, whatever shows: UPDATE covers every screen): the
@@ -1268,7 +1275,14 @@ impl<S: Surface> Panel<S> {
             let names = self
                 .watched_buf
                 .iter()
-                .map(|name| WatchedName::new(&name.name, outcome_of(name.outcome)))
+                .map(|name| {
+                    // The row shows the name as the feed cut it, and opens NAME with it whole.
+                    WatchedName::shown_as(
+                        &name.name,
+                        name.whole.as_deref(),
+                        outcome_of(name.outcome),
+                    )
+                })
                 .collect();
             put(&mut self.world.watched, names, &mut self.world_changed);
         }
@@ -1713,6 +1727,7 @@ fn measure_touch<S: Surface, D: Read + AsFd>(
     };
     let began = Instant::now();
     let (calibration, decoder) = (panel.deps.calibration, &mut panel.decoder);
+    let min_pressure = panel.deps.sensitivity.min_pressure;
     let measured = calibrate::calibrate(
         &mut panel.surface,
         &mut |wait_ms| {
@@ -1727,6 +1742,7 @@ fn measure_touch<S: Surface, D: Read + AsFd>(
             Ok(events)
         },
         &|| u64::try_from(began.elapsed().as_millis()).unwrap_or(u64::MAX),
+        min_pressure,
     )
     .map_err(|error| PanelEnd::Failed(format!("calibrating the touch screen: {error}")))?;
     if let Some(calibration) = measured {
@@ -1981,6 +1997,7 @@ mod tests {
             control: Arc::new(FakeControl::default()),
             calibration: Calibration::NOMINAL,
             calibrate: false,
+            sensitivity: Sensitivity::DEFAULT,
             lane: LaneFeed::new(),
             alerts: Arc::new(NoAlerts),
             devices: Arc::new(NoDevices),
@@ -2167,6 +2184,7 @@ mod tests {
             out.clear();
             out.extend(state.watched.iter().map(|name| LaneWatched {
                 name: name.name.clone(),
+                whole: name.whole.clone(),
                 outcome: name.outcome,
             }));
         }
@@ -2615,6 +2633,7 @@ mod tests {
                 control: Arc::new(control.clone()),
                 calibration: Calibration::NOMINAL,
                 calibrate: false,
+                sensitivity: Sensitivity::DEFAULT,
                 lane: lane.clone(),
                 alerts: Arc::new(alerts.clone()),
                 devices: Arc::new(devices.clone()),
@@ -4450,10 +4469,12 @@ mod tests {
         rig.devices.state().watched = vec![
             LaneWatched {
                 name: "ads.example".to_owned(),
+                whole: Some("ads.example".to_owned()),
                 outcome: WatchedOutcome::Refused,
             },
             LaneWatched {
                 name: "example.org".to_owned(),
+                whole: Some("example.org".to_owned()),
                 outcome: WatchedOutcome::Answered,
             },
         ];
@@ -4492,6 +4513,57 @@ mod tests {
         rig.tap_at(&mut now, LANE_HOME.0, LANE_HOME.1);
         assert_eq!(at_screen(&rig), (Section::Home, None));
         assert_eq!(rig.devices.state().watches, [desk, None, desk, None]);
+    }
+
+    #[test]
+    fn a_name_row_of_a_device_opens_name_with_the_whole_name_and_back_watches_again() {
+        let mut rig = Rig::home(Arc::new(Fixed(reference_snapshot())));
+        let desk = Some(Ipv4Addr::new(192, 0, 2, 12));
+        let mut now = 0;
+        rig.drive(&mut now, 300);
+        rig.tap_at(&mut now, HOME_DEVICES.0, HOME_DEVICES.1);
+        rig.tap_at(&mut now, WALL_FIRST.0, WALL_FIRST.1);
+        // A name longer than the lane shows: its row has the feed's cut, and NAME is opened with the whole.
+        let long = format!("{}.tracker.example.org", "a".repeat(40));
+        rig.devices.state().watched = vec![LaneWatched {
+            name: long.get(..32).unwrap().to_owned(),
+            whole: Some(long.clone()),
+            outcome: WatchedOutcome::Refused,
+        }];
+        let until = now + FRAME_MS * 2;
+        rig.drive(&mut now, until);
+        let shown = rig
+            .panel
+            .world
+            .watched
+            .first()
+            .map(|name| name.name.clone());
+        assert!(
+            shown.is_some_and(|text| text.starts_with("aaaa") && !text.contains("example")),
+            "the row shows the feed's cut"
+        );
+        rig.tap_at(&mut now, 100, 150);
+        assert_eq!(rig.panel.nav.shown_name(), Some(long.as_str()));
+        assert_eq!(
+            rig.devices.state().watches,
+            [desk, None],
+            "NAME stops the watch"
+        );
+        // NAME reads the facts of the whole name.
+        let until = now + 1_000;
+        rig.drive(&mut now, until);
+        assert_eq!(
+            rig.panel
+                .world
+                .name_facts
+                .as_ref()
+                .map(|facts| facts.name.as_str()),
+            Some(long.as_str())
+        );
+        // Its BACK (the floor's left key, KEEP …) is DEVICE again, which watches again.
+        rig.tap_at(&mut now, FLOOR_LEFT.0, FLOOR_LEFT.1);
+        assert!(matches!(at_screen(&rig).1, Some(Opened::Device(_))));
+        assert_eq!(rig.devices.state().watches, [desk, None, desk]);
     }
 
     /// A panel on a surface that can be broken from outside, with a device that is watched.
@@ -5511,6 +5583,61 @@ mod tests {
     }
 
     #[test]
+    fn name_goes_home_after_the_idle_minute_as_every_other_screen_does() {
+        let mut rig = Rig::home(Arc::new(Fixed(reference_snapshot())));
+        let mut now = 0;
+        rig.drive(&mut now, 300);
+        rig.tap_at(&mut now, HOME_NAMES.0, HOME_NAMES.1);
+        rig.tap_at(&mut now, PIPE_FIRST.0, PIPE_FIRST.1);
+        assert_eq!(rig.panel.nav.shown_name(), Some("ads.example.net"));
+        let touched = now;
+        rig.drive(&mut now, touched + 59_000);
+        assert_eq!(rig.panel.nav.shown_name(), Some("ads.example.net"));
+        rig.drive(&mut now, touched + 61_000);
+        assert_eq!(at_screen(&rig), (Section::Home, None));
+        assert!(rig.panel.world.name_facts.is_none());
+
+        // A threat's NAME, from the slip of an alert that arrived by itself, goes HOME the same.
+        rig.alerts.raise(threat_alert(7));
+        let until = now + 1_300;
+        rig.drive(&mut now, until);
+        assert_eq!(at_screen(&rig), (Section::Alerts, Some(&Opened::Alert(7))));
+        rig.tap_at(&mut now, SLIP_NAME.0, SLIP_NAME.1);
+        assert_eq!(
+            rig.panel.nav.shown_name(),
+            Some("secure-login-verify.example")
+        );
+        let touched = now;
+        rig.drive(&mut now, touched + 59_000);
+        assert!(rig.panel.nav.shown_name().is_some());
+        rig.drive(&mut now, touched + 61_000);
+        assert_eq!(at_screen(&rig), (Section::Home, None));
+
+        // NAME from YOUR LIST, with the lock on: the pad over it goes back to NAME after its minute, and NAME
+        // goes HOME after its own.
+        rig.set_pin();
+        rig.names
+            .state()
+            .owner
+            .push(("ads.example.net".to_owned(), OwnerSide::Refuse, Some(UNIX)));
+        rig.tap_at(&mut now, HOME_NAMES.0, HOME_NAMES.1);
+        rig.tap_at(&mut now, LIST_DOOR.0, LIST_DOOR.1);
+        rig.tap_at(&mut now, PIPE_FIRST.0, PIPE_FIRST.1);
+        assert_eq!(rig.panel.nav.shown_name(), Some("ads.example.net"));
+        rig.tap_at(&mut now, FLOOR_RIGHT.0, FLOOR_RIGHT.1);
+        assert_eq!(rig.panel.nav.whole(), Some(Whole::Pin), "ANSWER AGAIN asks");
+        let touched = now;
+        rig.drive(&mut now, touched + 60_500);
+        assert_eq!(rig.panel.nav.whole(), None);
+        assert_eq!(rig.panel.nav.shown_name(), Some("ads.example.net"));
+        rig.drive(&mut now, touched + 60_000 + 59_000);
+        assert!(rig.panel.nav.shown_name().is_some());
+        rig.drive(&mut now, touched + 60_000 + 61_000);
+        assert_eq!(at_screen(&rig), (Section::Home, None));
+        assert!(rig.names.edits().is_empty());
+    }
+
+    #[test]
     fn a_pin_pad_left_alone_goes_back_with_the_action_not_done() {
         let mut rig = Rig::home(Arc::new(Fixed(started())));
         rig.set_pin();
@@ -5560,7 +5687,8 @@ mod tests {
             rig.lock.lock_view(),
             lock::LockView {
                 on: true,
-                source: Some(PinSource::Panel)
+                source: Some(PinSource::Panel),
+                kept: false
             }
         );
         assert!(rig.panel.world.lock_on);
@@ -5807,6 +5935,30 @@ mod tests {
         assert_eq!(rig.panel.nav.whole(), Some(Whole::Pin));
         assert!(rig.system.acts().is_empty());
         assert_eq!(rig.panel.world.lock_source, LockSource::Api);
+    }
+
+    #[test]
+    fn the_world_knows_whether_the_card_keeps_the_pin_whatever_its_source() {
+        let mut rig = Rig::home(Arc::new(Fixed(started())));
+        let mut now = 0;
+        rig.drive(&mut now, 1_000);
+        assert!(!rig.panel.world.lock_kept);
+        // The state is kept on the card: the world says so with the lock off, and with a PIN from each source.
+        let state = Arc::new(PanelState::new(None, None, Arc::new(|| 1_000)).with_kept(true));
+        rig.panel.deps.lock = state.clone();
+        rig.lock = state;
+        rig.drive(&mut now, 2_000);
+        assert!(rig.panel.world.lock_kept && !rig.panel.world.lock_on);
+        rig.lock
+            .lock()
+            .set_hash(Some(pin_hash(PIN)), PinSource::Api);
+        rig.drive(&mut now, 3_000);
+        assert!(rig.panel.world.lock_kept && rig.panel.world.lock_on);
+        assert_eq!(rig.panel.world.lock_source, LockSource::Api);
+        rig.lock.set_pin(Zeroizing::new(PIN));
+        rig.drive(&mut now, 4_000);
+        assert!(rig.panel.world.lock_kept);
+        assert_eq!(rig.panel.world.lock_source, LockSource::Panel);
     }
 
     /// A rig at HOME whose night is 10:00 to 11:00, in which the clock of these tests (10:20) is.
@@ -6057,6 +6209,7 @@ mod tests {
         rig.devices.state().asking = vec![Ipv4Addr::new(192, 0, 2, 23)];
         rig.devices.state().watched = vec![LaneWatched {
             name: "tracker.example".to_owned(),
+            whole: Some("tracker.example".to_owned()),
             outcome: WatchedOutcome::Refused,
         }];
         let mut now = 0;
@@ -6137,7 +6290,7 @@ mod tests {
             "INFO panel: restart asked",
             "INFO panel: restart refused: an update is under way",
             "WARN panel: restart refused: not ready",
-            "INFO panel: the PIN was set on the panel (until the next restart)",
+            "INFO panel: the PIN was set on the panel",
             "INFO panel: the lock was turned off",
             "INFO panel: night hours set",
             "INFO panel: sleeping until a touch",

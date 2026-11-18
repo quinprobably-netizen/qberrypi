@@ -23,7 +23,7 @@ use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::time::Duration;
 
 use qb_dns::{ListClass, LogEntry, Now, OwnerSide, Resolver, TopName};
-use tokio::sync::{Notify, watch};
+use tokio::sync::watch;
 use zeroize::Zeroizing;
 
 use crate::alerts::AlertSink;
@@ -43,7 +43,7 @@ use crate::update::{self, UpdateCtl};
 use crate::usage::Readings;
 use crate::watch::devices::{Devices, EditError, WallCopy, with_devices};
 use crate::watch::frames::Mac;
-use crate::wifi;
+use crate::wifi::{self, RejoinSignal};
 
 /// The file in which the kernel lists the wireless interfaces' signal.
 pub const PROC_WIRELESS: &str = "/proc/net/wireless";
@@ -289,30 +289,29 @@ impl NamesControl for LiveNames {
 /// and the Wi-Fi's rejoin, with its refusal of a second within a minute.
 ///
 /// Nothing here takes the resolver's lock or any lock of the answer path: the update machinery's own small
-/// lock is taken for a copy or a look, and a rejoin is a notify.
+/// lock is taken for a copy or a look, and a rejoin is a notify and a count.
 pub struct LiveSystem {
     /// The update machinery: its view, and the owner's restart.
     update: Arc<UpdateCtl>,
-    /// What `wifi::run` is given: notified (`notify_waiters`, which stores no permit) to end the link that is
-    /// held and join again.
-    rejoin: Arc<Notify>,
-    /// When the last rejoin that was let through was asked for, on `clock`.
+    /// What `wifi::run` is given: asked to end the link that is held and join again, and saying whether one was.
+    rejoin: Arc<RejoinSignal>,
+    /// When the last rejoin that let a held link go was asked for, on `clock`.
     last_rejoin: Mutex<Option<Duration>>,
     /// A clock that does not jump, from any starting point: the kernel's, or a test's own.
     clock: Box<dyn Fn() -> Duration + Send + Sync>,
 }
 
 impl LiveSystem {
-    /// The control of the board over `update` and the notify `rejoin` that the Wi-Fi component listens to, on
+    /// The control of the board over `update` and the signal `rejoin` that the Wi-Fi component listens to, on
     /// the kernel's monotonic clock.
-    pub fn new(update: Arc<UpdateCtl>, rejoin: Arc<Notify>) -> Self {
+    pub fn new(update: Arc<UpdateCtl>, rejoin: Arc<RejoinSignal>) -> Self {
         Self::with_clock(update, rejoin, sys::uptime)
     }
 
     /// As `new`, with the time of `clock`, so that a test moves it.
     pub fn with_clock(
         update: Arc<UpdateCtl>,
-        rejoin: Arc<Notify>,
+        rejoin: Arc<RejoinSignal>,
         clock: impl Fn() -> Duration + Send + Sync + 'static,
     ) -> Self {
         Self {
@@ -326,7 +325,10 @@ impl LiveSystem {
 
 impl LiveSystem {
     /// The rejoin of [`SystemControl::rejoin`] that the update machinery has let through: the limit of
-    /// one a minute, the second it was asked at, and the Wi-Fi's wake.
+    /// one a minute, the Wi-Fi's wake, and the second it was asked at when it let a held link go.
+    ///
+    /// Only a rejoin that let a link go starts the minute. One that finds no link held ends nothing (a join is
+    /// under way or about to be, and is not repeated), so it is charged nothing and the next is let through.
     fn rejoin_now(&self) -> Result<(), RejoinWait> {
         let now = (self.clock)();
         let mut last = self
@@ -342,10 +344,11 @@ impl LiveSystem {
                 return Err(RejoinWait(u16::try_from(left).unwrap_or(REJOIN_EVERY_SECS)));
             }
         }
-        *last = Some(now);
-        drop(last);
-        // Only a loop that is holding a link hears it: a join that is under way is not repeated.
-        self.rejoin.notify_waiters();
+        // Only a loop that is holding a link hears it: a join that is under way is not repeated. The lock is
+        // kept over the ask, so that the minute is charged in the same step as the link is let go.
+        if self.rejoin.ask() {
+            *last = Some(now);
+        }
         Ok(())
     }
 }
@@ -386,7 +389,7 @@ impl SystemControl for LiveSystem {
 /// the watch of one device's names is the lane feed's, which the slot holds from the start. And it is
 /// the panel's control of the owner's names ([`NamesControl`]): none is on any list, the top of the day is
 /// empty and an edit is refused until [`Slot::fill_names`]. And it is the panel's control of the board itself
-/// ([`SystemControl`]): the Wi-Fi's rejoin notify is the slot's own, from the start; until
+/// ([`SystemControl`]): the Wi-Fi's rejoin signal is the slot's own, from the start; until
 /// [`Slot::fill_system`] a restart is refused, a rejoin must wait, and the update machinery looks idle.
 /// And the panel's lock and night hours ([`LockControl`]): no night, and until [`Slot::fill_lock`] a lock that
 /// fails closed (the strong keys ask for a PIN that nothing accepts).
@@ -402,7 +405,7 @@ pub struct Slot {
     system: OnceLock<Arc<dyn SystemControl>>,
     /// What the Wi-Fi component waits on for the owner's rejoin. It is the slot's, not the control's: the
     /// component holds it from its start, before the control is made.
-    rejoin: Arc<Notify>,
+    rejoin: Arc<RejoinSignal>,
     /// The lock and the night hours, as the panel reads and edits them; filled by the same service.
     lock: OnceLock<Arc<dyn LockControl>>,
     /// The names that the DNS service offers the panel. It is the slot's, not the live source's:
@@ -419,7 +422,7 @@ impl Slot {
             devices: OnceLock::new(),
             names: OnceLock::new(),
             system: OnceLock::new(),
-            rejoin: Arc::new(Notify::new()),
+            rejoin: Arc::new(RejoinSignal::new()),
             lock: OnceLock::new(),
             lane: LaneFeed::new(),
         })
@@ -461,8 +464,8 @@ impl Slot {
         let _ = self.system.set(system);
     }
 
-    /// What the Wi-Fi component gives `wifi::run`, and the panel's rejoin notifies.
-    pub fn rejoin_notify(&self) -> Arc<Notify> {
+    /// What the Wi-Fi component gives `wifi::run`, and the panel's rejoin asks.
+    pub fn rejoin_signal(&self) -> Arc<RejoinSignal> {
         self.rejoin.clone()
     }
 
@@ -640,6 +643,7 @@ impl LockControl for Slot {
             LockView {
                 on: true,
                 source: None,
+                kept: false,
             },
             |lock| lock.lock_view(),
         )
@@ -1347,7 +1351,8 @@ mod tests {
             slot.lock_view(),
             LockView {
                 on: true,
-                source: None
+                source: None,
+                kept: false
             }
         );
         assert_eq!((slot.night(), slot.wait_left()), (None, 1));
@@ -1508,9 +1513,9 @@ mod tests {
         }
     }
     /// A control of the board whose clock is `ms` milliseconds on a counter that the test moves, over
-    /// `ctl`, with the Wi-Fi's notify.
-    fn system_on(ctl: &Arc<UpdateCtl>, ms: &Arc<AtomicU64>) -> (LiveSystem, Arc<Notify>) {
-        let notify = Arc::new(Notify::new());
+    /// `ctl`, with the Wi-Fi's signal.
+    fn system_on(ctl: &Arc<UpdateCtl>, ms: &Arc<AtomicU64>) -> (LiveSystem, Arc<RejoinSignal>) {
+        let notify = Arc::new(RejoinSignal::new());
         let clock = {
             let ms = ms.clone();
             move || Duration::from_millis(ms.load(Ordering::SeqCst))
@@ -1521,8 +1526,9 @@ mod tests {
         )
     }
 
-    /// Whether `notify` is notified within a moment: a waiter made before the call under test hears it.
-    async fn heard(waiting: std::pin::Pin<&mut tokio::sync::futures::Notified<'_>>) -> bool {
+    /// Whether a hold that listens hears the owner within a moment: one that listened before the call under
+    /// test hears it.
+    async fn heard(waiting: &mut wifi::join::Listening<'_>) -> bool {
         tokio::time::timeout(Duration::from_millis(50), waiting)
             .await
             .is_ok()
@@ -1533,28 +1539,31 @@ mod tests {
         let ms = Arc::new(AtomicU64::new(1_000_000));
         let (system, notify) = system_on(&UpdateCtl::off(), &ms);
 
-        let waiting = notify.notified();
-        tokio::pin!(waiting);
+        let mut waiting = notify.listen();
         assert_eq!(system.rejoin(), Ok(()));
-        assert!(heard(waiting).await, "the Wi-Fi did not hear the rejoin");
+        assert!(
+            heard(&mut waiting).await,
+            "the Wi-Fi did not hear the rejoin"
+        );
 
         // At once, the whole minute is left; the refusal wakes nobody.
-        let waiting = notify.notified();
-        tokio::pin!(waiting);
+        let mut waiting = notify.listen();
         assert_eq!(system.rejoin(), Err(RejoinWait(60)));
         // 1.5 s later 58.5 s are left, counted up; the last second of the minute says 1.
         ms.fetch_add(1_500, Ordering::SeqCst);
         assert_eq!(system.rejoin(), Err(RejoinWait(59)));
         ms.fetch_add(58_499, Ordering::SeqCst);
         assert_eq!(system.rejoin(), Err(RejoinWait(1)));
-        assert!(!heard(waiting).await, "a refused rejoin woke the Wi-Fi");
+        assert!(
+            !heard(&mut waiting).await,
+            "a refused rejoin woke the Wi-Fi"
+        );
 
         // A minute after the one that was let through, the next is.
         ms.fetch_add(1, Ordering::SeqCst);
-        let waiting = notify.notified();
-        tokio::pin!(waiting);
+        let mut waiting = notify.listen();
         assert_eq!(system.rejoin(), Ok(()));
-        assert!(heard(waiting).await);
+        assert!(heard(&mut waiting).await);
         // And the minute counts from that one.
         assert_eq!(system.rejoin(), Err(RejoinWait(60)));
     }
@@ -1566,13 +1575,15 @@ mod tests {
         let (system, notify) = system_on(&ctl, &ms);
 
         // While an update is received the whole minute is the answer, and the Wi-Fi hears nothing.
-        let waiting = notify.notified();
-        tokio::pin!(waiting);
+        let mut waiting = notify.listen();
         let receiving = ctl.begin_receive().unwrap();
         assert_eq!(system.rejoin(), Err(RejoinWait(REJOIN_EVERY_SECS)));
         ms.fetch_add(120_000, Ordering::SeqCst);
         assert_eq!(system.rejoin(), Err(RejoinWait(REJOIN_EVERY_SECS)));
-        assert!(!heard(waiting).await, "a refused rejoin woke the Wi-Fi");
+        assert!(
+            !heard(&mut waiting).await,
+            "a refused rejoin woke the Wi-Fi"
+        );
         // A staged update still waits for its restart.
         receiving.staged();
         assert_eq!(system.rejoin(), Err(RejoinWait(REJOIN_EVERY_SECS)));
@@ -1583,10 +1594,9 @@ mod tests {
         let receiving = idle.begin_receive().unwrap();
         assert_eq!(system.rejoin(), Err(RejoinWait(REJOIN_EVERY_SECS)));
         drop(receiving);
-        let waiting = notify.notified();
-        tokio::pin!(waiting);
+        let mut waiting = notify.listen();
         assert_eq!(system.rejoin(), Ok(()));
-        assert!(heard(waiting).await);
+        assert!(heard(&mut waiting).await);
 
         // A boot on trial refuses too.
         let trial = UpdateCtl::new(
@@ -1606,21 +1616,39 @@ mod tests {
             tokio::time::Instant::now(),
         );
         let (system, notify) = system_on(&trial, &ms);
-        let waiting = notify.notified();
-        tokio::pin!(waiting);
+        let mut waiting = notify.listen();
         assert_eq!(system.rejoin(), Err(RejoinWait(REJOIN_EVERY_SECS)));
-        assert!(!heard(waiting).await);
+        assert!(!heard(&mut waiting).await);
     }
 
     #[tokio::test(start_paused = true)]
     async fn a_rejoin_nobody_is_there_to_hear_leaves_nothing_for_a_later_join() {
         let ms = Arc::new(AtomicU64::new(0));
         let (system, notify) = system_on(&UpdateCtl::off(), &ms);
-        // No link is held, so no loop waits: the notify keeps no permit (`notify_waiters`).
+        // No link is held, so no loop waits: the signal keeps no permit (`notify_waiters`).
         assert_eq!(system.rejoin(), Ok(()));
-        let waiting = notify.notified();
-        tokio::pin!(waiting);
-        assert!(!heard(waiting).await);
+        let mut waiting = notify.listen();
+        assert!(!heard(&mut waiting).await);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_rejoin_that_finds_no_link_held_is_not_charged_its_minute() {
+        let ms = Arc::new(AtomicU64::new(1_000_000));
+        let (system, notify) = system_on(&UpdateCtl::off(), &ms);
+        // The link is down or being joined: nothing is let go, and the next ask, at once, is let through too.
+        assert_eq!(system.rejoin(), Ok(()));
+        ms.fetch_add(1_000, Ordering::SeqCst);
+        assert_eq!(system.rejoin(), Ok(()));
+
+        // Then a link is held: the ask lets it go, and that one starts the minute.
+        let mut waiting = notify.listen();
+        assert_eq!(system.rejoin(), Ok(()));
+        assert!(
+            heard(&mut waiting).await,
+            "the Wi-Fi did not hear the rejoin"
+        );
+        drop(waiting);
+        assert_eq!(system.rejoin(), Err(RejoinWait(60)));
     }
 
     #[test]
@@ -1696,8 +1724,10 @@ mod tests {
 
         let ms = Arc::new(AtomicU64::new(0));
         let ctl = UpdateCtl::new(Some(crate::slots::Slot::A), None, Arc::new(update::NoCard));
-        let (system, _) = system_on(&ctl, &ms);
+        let (system, signal) = system_on(&ctl, &ms);
         slot.fill_system(Arc::new(system));
+        // A link is held, so the first rejoin lets it go and the second must wait.
+        let holding = signal.listen();
         assert_eq!(slot.rejoin(), Ok(()));
         assert_eq!(slot.rejoin(), Err(RejoinWait(60)));
         assert_eq!(slot.update_view().slot, Some(crate::slots::Slot::A));
@@ -1705,7 +1735,8 @@ mod tests {
         // A second control is not taken: the first stays.
         slot.fill_system(Arc::new(crate::panel::system::NoSystem));
         assert_eq!(slot.rejoin(), Err(RejoinWait(60)));
-        // The notify the Wi-Fi component is given is the slot's own, the same on every call.
-        assert!(Arc::ptr_eq(&slot.rejoin_notify(), &slot.rejoin_notify()));
+        drop(holding);
+        // The signal the Wi-Fi component is given is the slot's own, the same on every call.
+        assert!(Arc::ptr_eq(&slot.rejoin_signal(), &slot.rejoin_signal()));
     }
 }

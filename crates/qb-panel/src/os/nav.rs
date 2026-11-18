@@ -45,9 +45,10 @@
 //! wall's page, which the `Nav` keeps while a screen is open over it and forgets at `go`), DEVICE, CONFIRM
 //! and ITS GATE, each carrying its device by hardware address. CONFIRM carries the state it would take as
 //! well, so what the screen asked is what a tap does whatever the device has become since. A name row of
-//! DEVICE is not a door: the names it shows are held fitted to their row, and NAME is about a name by its
-//! whole text. DEVICE is the screen whose device's names the loop watches
-//! (`Nav::watched_mac`); `refresh` pops a screen whose device is gone or no longer fits it.
+//! DEVICE opens NAME, as a pipe of NAMES does: the world holds each watched name whole beside the text fitted
+//! to its row (`WatchedName::whole`), and NAME is about a name by its whole text. DEVICE is the screen whose
+//! device's names the loop watches (`Nav::watched_mac`): NAME over it stops the watch, as CONFIRM does, and
+//! its `BACK` starts it again. `refresh` pops a screen whose device is gone or no longer fits it.
 //!
 //! LIVE is the Drain, which draws itself; its taps (the key, the gate ask over its field, the lane's
 //! `HOME`, the clock column) are `screens::live::decide`, called from `decide`, and the gate ask's state, open
@@ -1753,14 +1754,14 @@ mod tests {
         };
         let mut tracker: TapTracker<Tap> = TapTracker::default();
         let mut feed = |at_ms, event| tracker.feed_with(at_ms, event, target);
-        // A press of 50 ms on SYSTEM's tile: the tap is where it came down, and `tap` takes it from there.
+        // A press of 20 ms on SYSTEM's tile: the tap is where it came down, and `tap` takes it from there.
         assert_eq!(feed(0, Down { x: 400, y: 250 }), None);
-        let (pressed, point) = feed(50, Up).expect("a tap");
+        let (pressed, point) = feed(20, Up).expect("a tap");
         assert_eq!(point, (400, 250));
         assert_eq!(pressed, Tap::Nav(Change::Go(Section::System)));
         // Too short, or slid onto another tile, or begun on a gap: nothing.
         assert_eq!(feed(100, Down { x: 400, y: 250 }), None);
-        assert_eq!(feed(120, Up), None);
+        assert_eq!(feed(119, Up), None);
         assert_eq!(feed(200, Down { x: 400, y: 250 }), None);
         assert_eq!(feed(210, Move { x: 250, y: 250 }), None);
         assert_eq!(feed(300, Up), None);
@@ -1774,6 +1775,29 @@ mod tests {
     }
 
     // ---- ALERTS, NAMES and the arrival rule (P2) ----
+
+    #[test]
+    fn a_devices_name_row_opens_name_over_it_and_back_watches_the_device_again() {
+        let (mut nav, world) = at(Still::Device);
+        let tv = nav.watched_mac().expect("DEVICE watches its device");
+        assert_eq!(press(&mut nav, &world, 100, 150), None);
+        assert_eq!(
+            nav.stack(),
+            [
+                Screen::Device(tv),
+                Screen::Name("googlesyndication.com".into())
+            ]
+        );
+        assert_eq!(nav.shown_name(), Some("googlesyndication.com"));
+        assert!(nav.shows_names(), "the loop reads the name's facts");
+        assert_eq!(nav.watched_mac(), None, "NAME over DEVICE stops the watch");
+        nav.back();
+        assert_eq!(nav.stack(), [Screen::Device(tv)]);
+        assert_eq!(nav.watched_mac(), Some(tv));
+        // The second row is the older name.
+        assert_eq!(press(&mut nav, &world, 100, 210), None);
+        assert_eq!(nav.shown_name(), Some("i.ytimg.com"));
+    }
 
     #[test]
     fn the_p2_doors_lead_where_the_map_says() {

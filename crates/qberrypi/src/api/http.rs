@@ -13,10 +13,17 @@
 //! and [`read_request_body`] one after the other, which the connection calls apart: the one route
 //! whose body is streamed (the update's) is told from its head, and its body is never read here. A request is answered by
 //! [`write_reply`]. Nothing here panics on what it reads, and nothing logs. A [`Request`] holds
-//! secrets (the session id, the body of a login), so its `Debug` output hides both.
+//! secrets (the session id, the body of a login), so its `Debug` output hides both, and every
+//! copy of them that this module makes is wiped when it is let go of, whichever way the read
+//! ends: the head's bytes, a body that was read only in part, the session id, the target (a
+//! client may put a `sid` in its query), a [`Head`] or a [`Request`] that is dropped, and the
+//! bytes of a reply on their way out. What a connection's own buffers hold (rustls's and the
+//! reader's) is not this module's, and is not wiped.
 
 use std::fmt;
 use std::io::{self, BufRead, Read, Write};
+
+use zeroize::{Zeroize, Zeroizing};
 
 /// The most bytes a request head may take, its closing empty line included.
 pub const MAX_HEAD: usize = 8 * 1024;
@@ -76,6 +83,27 @@ impl fmt::Debug for Request {
             .field("body", &Redacted)
             .field("close", &self.close)
             .finish()
+    }
+}
+
+impl Request {
+    /// Wipes what the request holds that is secret: the body, the session id and the target,
+    /// which may carry a `sid` in its query. What is left of them is empty. The method and the
+    /// `close` flag are not secret and stay.
+    ///
+    /// The connection calls this as soon as the request is answered, before it writes the reply
+    /// (which may wait for a client that does not read); a request that is dropped without it is
+    /// wiped by its `Drop`.
+    pub fn wipe(&mut self) {
+        self.body.zeroize();
+        self.sid.zeroize();
+        self.target.zeroize();
+    }
+}
+
+impl Drop for Request {
+    fn drop(&mut self) {
+        self.wipe();
     }
 }
 
@@ -141,6 +169,15 @@ impl fmt::Debug for Head {
     }
 }
 
+impl Drop for Head {
+    /// Wipes the session id and the target, which may carry a `sid` in its query: a head that
+    /// is dropped is one whose body was refused, or could not be read.
+    fn drop(&mut self) {
+        self.sid.zeroize();
+        self.target.zeroize();
+    }
+}
+
 /// Reads the head of one request from `r`, through its closing empty line, and not a byte of
 /// the body.
 ///
@@ -163,11 +200,14 @@ pub fn read_request_head(r: &mut impl BufRead) -> Result<Head, ReadError> {
         return Err(ReadError::Malformed("incomplete head"));
     };
     let headers = &*parsed.headers;
+    // The length is looked at before anything is copied: a head that is refused here must not
+    // leave a copy of its target or its session id behind, which only a `Head` wipes.
+    let length = body_length(headers)?;
     Ok(Head {
         method: method.to_owned(),
         target: target.to_owned(),
         sid: session_id(headers),
-        length: body_length(headers)?,
+        length,
         close: wants_close(parsed.version, headers),
     })
 }
@@ -176,25 +216,33 @@ pub fn read_request_head(r: &mut impl BufRead) -> Result<Head, ReadError> {
 ///
 /// A length over [`MAX_BODY`] is [`ReadError::TooLarge`] and nothing is read; a stream that ends
 /// inside the body is `Malformed("cut short")`; any other failure is [`ReadError::Io`].
-pub fn read_request_body(r: &mut impl BufRead, head: Head) -> Result<Request, ReadError> {
+pub fn read_request_body(r: &mut impl BufRead, mut head: Head) -> Result<Request, ReadError> {
+    // On any error below `head` is dropped, which wipes it, and `read_body` wipes what it had
+    // read of the body.
     let length = usize::try_from(head.length)
         .ok()
         .filter(|&length| length <= MAX_BODY)
         .ok_or(ReadError::TooLarge)?;
+    let body = read_body(r, length)?;
+    // A `Head` is wiped when it is dropped, so what it holds is moved out and not taken apart.
     Ok(Request {
-        method: head.method,
-        target: head.target,
-        sid: head.sid,
-        body: read_body(r, length)?,
+        method: std::mem::take(&mut head.method),
+        target: std::mem::take(&mut head.target),
+        sid: head.sid.take(),
+        body,
         close: head.close,
     })
 }
 
 /// Takes the head from `r`: the bytes up to and including the first `\r\n\r\n`, and not one
 /// more. At most [`MAX_HEAD`] bytes are copied; the end may fall between two reads.
-fn read_head(r: &mut impl BufRead) -> Result<Vec<u8>, ReadError> {
+///
+/// The head holds the session id, in its header, so the copy is wiped when it is dropped, on
+/// every path, and the buffer is made whole at once so that no earlier, smaller one is left
+/// behind unwiped.
+fn read_head(r: &mut impl BufRead) -> Result<Zeroizing<Vec<u8>>, ReadError> {
     // Room for the whole head at once: a `Vec` that grows by doubling could reach twice that.
-    let mut head: Vec<u8> = Vec::with_capacity(MAX_HEAD);
+    let mut head = Zeroizing::new(Vec::with_capacity(MAX_HEAD));
     loop {
         let chunk = match r.fill_buf() {
             Ok(chunk) => chunk,
@@ -299,8 +347,12 @@ fn body_length(headers: &[httparse::Header<'_>]) -> Result<u64, ReadError> {
 }
 
 /// Takes exactly `length` bytes from `r`.
+///
+/// The body may be a password, so what has been read of it is wiped on every path that does not
+/// hand it on: a read that fails and a stream that ends before `length` bytes alike. The buffer
+/// is made whole at once, so that it never grows and leaves a smaller copy behind.
 fn read_body(r: &mut impl BufRead, length: usize) -> Result<Vec<u8>, ReadError> {
-    let mut body = Vec::with_capacity(length);
+    let mut body = Zeroizing::new(Vec::with_capacity(length));
     // `length` is at most MAX_BODY; `take` stops the read there, and `read_to_end` retries an
     // interrupted read.
     Read::take(&mut *r, length as u64)
@@ -309,7 +361,7 @@ fn read_body(r: &mut impl BufRead, length: usize) -> Result<Vec<u8>, ReadError> 
     if body.len() < length {
         return Err(ReadError::Malformed("cut short"));
     }
-    Ok(body)
+    Ok(std::mem::take(&mut *body))
 }
 
 /// The session id in the `X-FTL-SID` header: the value of the one header of that name, when it is
@@ -386,7 +438,8 @@ fn reason(status: u16) -> &'static str {
     }
 }
 
-/// Writes `reply` to `w` as an HTTP/1.1 response, then flushes.
+/// Writes `reply` to `w` as an HTTP/1.1 response, then flushes. The copy of the reply that is
+/// built here, which holds a new session id after a login, is wiped when it is let go of.
 ///
 /// The head is the status line, `Content-Type: application/json` (not for a 204), the
 /// `Content-Length`, `Cache-Control: no-store` and `Connection: close` if `close` is set, else
@@ -394,7 +447,7 @@ fn reason(status: u16) -> &'static str {
 pub fn write_reply(w: &mut impl Write, reply: &Reply, close: bool) -> io::Result<()> {
     let empty = reply.status == 204;
     let body: &[u8] = if empty { &[] } else { &reply.body };
-    let mut out = Vec::with_capacity(192_usize.saturating_add(body.len()));
+    let mut out = Zeroizing::new(Vec::with_capacity(192_usize.saturating_add(body.len())));
     write!(
         out,
         "HTTP/1.1 {} {}\r\n",
@@ -419,6 +472,7 @@ pub fn write_reply(w: &mut impl Write, reply: &Reply, close: bool) -> io::Result
 mod tests {
     use std::collections::VecDeque;
     use std::io::{self, BufRead, Cursor, Read, Write};
+    use std::sync::atomic::Ordering;
 
     use super::*;
 
@@ -579,6 +633,7 @@ mod tests {
             )))
             .unwrap()
             .sid
+            .clone()
         };
         assert_eq!(with("Cookie: sid=abc"), None);
         assert_eq!(with("X-FTL-SID: a b"), None);
@@ -879,6 +934,319 @@ mod tests {
         );
     }
 
+    // ---- what is wiped ----
+
+    /// A global allocator for the tests of this crate that notes, while it is armed, each block
+    /// that is let go of with the marker in it: a secret that was freed without being wiped. It
+    /// then cleans the block, so that what it found is not found again in the next owner of the
+    /// place. Nothing else about it differs from the system's, and while it is not armed it
+    /// costs one load of a flag.
+    mod probe {
+        use std::alloc::{GlobalAlloc, Layout, System};
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+        /// The text that stands for a secret in the tests that arm the probe, and nowhere else.
+        pub const MARKER: &[u8] = b"hunter2-marker-4f1c9a";
+        /// Whether blocks that are freed are looked into.
+        pub static ARMED: AtomicBool = AtomicBool::new(false);
+        /// How many blocks that held the marker were freed while armed.
+        pub static LEAKS: AtomicUsize = AtomicUsize::new(0);
+
+        pub struct Probe;
+
+        /// Notes the block at `ptr` of `size` bytes if the marker is in it, and says so.
+        fn look(ptr: *mut u8, size: usize) -> bool {
+            if size < MARKER.len() || !ARMED.load(Ordering::Relaxed) {
+                return false;
+            }
+            // SAFETY: the block is ours until it is given back, and a byte of it that was never
+            // written reads as whatever the allocator left there, which is no harm to a copy.
+            let block = unsafe { std::slice::from_raw_parts(ptr, size) };
+            let found = block.windows(MARKER.len()).any(|window| window == MARKER);
+            if found {
+                LEAKS.fetch_add(1, Ordering::Relaxed);
+            }
+            found
+        }
+
+        // SAFETY: every call is the system allocator's, with the arguments that it was given.
+        unsafe impl GlobalAlloc for Probe {
+            unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+                unsafe { System.alloc(layout) }
+            }
+
+            unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+                unsafe { System.alloc_zeroed(layout) }
+            }
+
+            unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+                if look(ptr, layout.size()) {
+                    // The block is on its way out: what a leak left in it is cleaned off, so
+                    // that no later owner of the place is taken for one.
+                    unsafe { ptr.write_bytes(0, layout.size()) };
+                }
+                unsafe { System.dealloc(ptr, layout) }
+            }
+
+            // A block that grows may move, and its old place is then let go of: a secret that
+            // was in it is a copy that was left behind. It is counted, and moved and cleaned.
+            unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+                if !look(ptr, layout.size()) {
+                    return unsafe { System.realloc(ptr, layout, new_size) };
+                }
+                // The block is moved by hand, so that the old one can be cleaned.
+                // SAFETY: the same alignment as the block's, and a size that the caller gave.
+                unsafe {
+                    let to = Layout::from_size_align_unchecked(new_size, layout.align());
+                    let new = System.alloc(to);
+                    if !new.is_null() {
+                        std::ptr::copy_nonoverlapping(ptr, new, layout.size().min(new_size));
+                        ptr.write_bytes(0, layout.size());
+                        System.dealloc(ptr, layout);
+                    }
+                    new
+                }
+            }
+        }
+    }
+
+    #[global_allocator]
+    static PROBE: probe::Probe = probe::Probe;
+
+    /// What the secret is in the requests below, written out so that a request is one `'static`
+    /// string, which holds no copy of it on the heap.
+    macro_rules! secret {
+        () => {
+            "hunter2-marker-4f1c9a"
+        };
+    }
+
+    /// A reader over bytes that are `'static`, which, once they are read, ends or fails with
+    /// `failure`. It makes no copy of them.
+    struct Fixed {
+        data: &'static [u8],
+        pos: usize,
+        failure: Option<io::ErrorKind>,
+    }
+
+    impl Fixed {
+        fn new(data: &'static str) -> Self {
+            Fixed {
+                data: data.as_bytes(),
+                pos: 0,
+                failure: None,
+            }
+        }
+
+        fn failing(mut self, kind: io::ErrorKind) -> Self {
+            self.failure = Some(kind);
+            self
+        }
+    }
+
+    impl Read for Fixed {
+        fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
+            let n = {
+                let buf = self.fill_buf()?;
+                let n = buf.len().min(out.len());
+                out[..n].copy_from_slice(&buf[..n]);
+                n
+            };
+            self.consume(n);
+            Ok(n)
+        }
+    }
+
+    impl BufRead for Fixed {
+        fn fill_buf(&mut self) -> io::Result<&[u8]> {
+            match (self.data.get(self.pos..), self.failure) {
+                (Some(rest), _) if !rest.is_empty() => Ok(rest),
+                (_, Some(kind)) => Err(kind.into()),
+                _ => Ok(&[]),
+            }
+        }
+
+        fn consume(&mut self, amt: usize) {
+            self.pos += amt;
+        }
+    }
+
+    /// The turn that a test that uses the secret takes for the whole of the test: the probe has
+    /// one count, and a test that frees a copy of the secret in another's scenario would be
+    /// taken for a leak of that scenario's.
+    fn turn() -> std::sync::MutexGuard<'static, ()> {
+        static ONE_AT_A_TIME: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        ONE_AT_A_TIME
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// How many blocks that held the secret were freed while `scenario` ran, with the probe armed.
+    /// The caller holds the [`turn`].
+    fn leaks_in(scenario: impl FnOnce()) -> usize {
+        probe::LEAKS.store(0, Ordering::SeqCst);
+        probe::ARMED.store(true, Ordering::SeqCst);
+        scenario();
+        probe::ARMED.store(false, Ordering::SeqCst);
+        probe::LEAKS.load(Ordering::SeqCst)
+    }
+
+    /// A login: the secret is the session id, in its header and in the target's query, and the
+    /// body, which is `21` bytes of it.
+    const LOGIN: &str = concat!(
+        "POST /api/auth?sid=",
+        secret!(),
+        " HTTP/1.1\r\nX-FTL-SID: ",
+        secret!(),
+        "\r\nContent-Length: 21\r\n\r\n",
+        secret!()
+    );
+    /// The same, whose body says 40 bytes and has 21.
+    const LOGIN_CUT: &str = concat!(
+        "POST /api/auth?sid=",
+        secret!(),
+        " HTTP/1.1\r\nX-FTL-SID: ",
+        secret!(),
+        "\r\nContent-Length: 40\r\n\r\n",
+        secret!()
+    );
+    /// A head whose body is over the limit, which is never read.
+    const LOGIN_LARGE: &str = concat!(
+        "POST /api/auth?sid=",
+        secret!(),
+        " HTTP/1.1\r\nX-FTL-SID: ",
+        secret!(),
+        "\r\nContent-Length: 5000\r\n\r\n"
+    );
+    /// A head that holds the secret and then breaks the rules of the API.
+    const CHUNKED: &str = concat!(
+        "POST /api/auth HTTP/1.1\r\nX-FTL-SID: ",
+        secret!(),
+        "\r\nTransfer-Encoding: chunked\r\n\r\n"
+    );
+
+    #[test]
+    fn nothing_secret_that_is_read_is_freed_without_being_wiped_on_any_path() {
+        let _turn = turn();
+        // The probe sees what it is meant to: a copy of the secret that is freed as it is.
+        assert_eq!(
+            leaks_in(|| drop(secret!().to_owned().into_bytes())),
+            1,
+            "the probe does not see a copy of the secret"
+        );
+
+        // Every one of these reads, answers or refuses a request that holds the secret three
+        // ways (the header, the query, the body); none may leave a copy of it on the heap.
+        let mut logins = 0;
+        let whole = leaks_in(|| {
+            let mut request = read_request(&mut Fixed::new(LOGIN)).unwrap();
+            assert_eq!(request.body, probe::MARKER);
+            assert_eq!(request.sid.as_deref(), Some(secret!()));
+            logins += 1;
+            // Left to be dropped, as a request that is answered and then left is.
+            request.close = true;
+        });
+        let wiped_first = leaks_in(|| {
+            let mut request = read_request(&mut Fixed::new(LOGIN)).unwrap();
+            request.wipe();
+            assert_eq!(
+                (
+                    request.body.len(),
+                    request.sid.is_none(),
+                    request.target.len()
+                ),
+                (0, true, 0)
+            );
+            logins += 1;
+        });
+        let cut_short = leaks_in(|| {
+            let read = read_request(&mut Fixed::new(LOGIN_CUT));
+            assert_eq!(read, Err(ReadError::Malformed("cut short")));
+        });
+        let reset = leaks_in(|| {
+            let read =
+                read_request(&mut Fixed::new(LOGIN_CUT).failing(io::ErrorKind::ConnectionReset));
+            assert_eq!(read, Err(ReadError::Io(io::ErrorKind::ConnectionReset)));
+        });
+        let too_large = leaks_in(|| {
+            let read = read_request(&mut Fixed::new(LOGIN_LARGE));
+            assert_eq!(read, Err(ReadError::TooLarge));
+        });
+        let head_only = leaks_in(|| {
+            let head = read_request_head(&mut Fixed::new(LOGIN_LARGE)).unwrap();
+            assert_eq!(head.sid.as_deref(), Some(secret!()));
+        });
+        let refused_head = leaks_in(|| {
+            let read = read_request_head(&mut Fixed::new(CHUNKED));
+            assert_eq!(
+                read.map(drop),
+                Err(ReadError::Malformed("no chunked requests"))
+            );
+        });
+        let reply = leaks_in(|| {
+            let mut reply = Reply {
+                status: 200,
+                body: secret!().as_bytes().to_vec(),
+            };
+            write_reply(&mut io::sink(), &reply, false).unwrap();
+            // What the connection does with the reply once it is written.
+            reply.body.zeroize();
+        });
+        assert_eq!(logins, 2);
+        assert_eq!(
+            [
+                whole,
+                wiped_first,
+                cut_short,
+                reset,
+                too_large,
+                head_only,
+                refused_head,
+                reply
+            ],
+            [0; 8],
+            "whole, wiped first, cut short, reset, too large, head only, refused head, reply"
+        );
+    }
+
+    #[test]
+    fn a_head_over_the_limit_is_wiped_too() {
+        let _turn = turn();
+        // The head's own buffer, which holds the session id, is the one place that a head that
+        // is never parsed leaves a secret.
+        static LONG: std::sync::LazyLock<Vec<u8>> = std::sync::LazyLock::new(|| {
+            let mut head = concat!("GET / HTTP/1.1\r\nX-FTL-SID: ", secret!(), "\r\nX-Pad: ")
+                .as_bytes()
+                .to_vec();
+            head.resize(head.len() + 2 * MAX_HEAD, b'a');
+            head
+        });
+        // Made while armed, which cleans off the copies that its growth leaves, so that none is
+        // taken for a leak in a later place.
+        leaks_in(|| {
+            std::sync::LazyLock::force(&LONG);
+        });
+        let long: &'static [u8] = &LONG;
+        let leaks = leaks_in(|| {
+            let mut reader = Fixed {
+                data: long,
+                pos: 0,
+                failure: None,
+            };
+            assert_eq!(read_request(&mut reader), Err(ReadError::TooLarge));
+        });
+        assert_eq!(leaks, 0);
+    }
+
+    #[test]
+    fn a_wiped_request_has_no_secret_left_and_keeps_what_is_not_one() {
+        let _turn = turn();
+        let mut request = read_request(&mut Fixed::new(LOGIN)).unwrap();
+        request.wipe();
+        assert_eq!((request.method.as_str(), request.close), ("POST", false));
+        assert!(request.body.is_empty() && request.sid.is_none() && request.target.is_empty());
+    }
+
     // ---- sid, close, method and target ----
 
     #[test]
@@ -887,6 +1255,7 @@ mod tests {
             read_str(&format!("GET / HTTP/1.1\r\n{h}\r\n\r\n"))
                 .unwrap()
                 .sid
+                .clone()
         };
         assert_eq!(with("x-FtL-sId: abc"), Some("abc".to_owned()));
         assert_eq!(with("X-FTL-SID: abc\r\nX-FTL-SID: abc"), None);

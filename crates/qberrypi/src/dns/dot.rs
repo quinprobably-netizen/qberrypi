@@ -1472,15 +1472,24 @@ mod tests {
     use crate::dns::client::{query, read_answer};
     use crate::dns::testutil::{
         Reply, TlsFakeUpstream, TlsMode, advertise_keepalive, closed_port, ip, ms, tls_for_fake,
-        tls_for_fake_as, tls_for_fake_noting_threads,
+        tls_for_fake_as, tls_for_fake_noting_threads, until,
     };
     use crate::services::testutil::{Jam, longest_gap};
 
-    /// Waits until `ready` holds, for ten seconds at most, and panics with `what` if it does not.
-    async fn until(what: &str, mut ready: impl FnMut() -> bool) {
-        let end = Instant::now() + Duration::from_secs(10);
-        while !ready() {
-            assert!(Instant::now() < end, "timed out waiting for {what}");
+    /// Waits until `count` reaches `goal`, for as long as it keeps rising: panics with `what` only
+    /// when it has not risen for ten seconds. For a job whose length depends on the host, which no
+    /// fixed deadline fits: a busy machine only takes longer.
+    async fn until_reached(what: &str, goal: usize, mut count: impl FnMut() -> usize) {
+        let (mut reached, mut moved) = (0, Instant::now());
+        while reached < goal {
+            let now = count();
+            if now != reached {
+                (reached, moved) = (now, Instant::now());
+            }
+            assert!(
+                moved.elapsed() < Duration::from_secs(10),
+                "stalled at {reached} of {goal} while waiting for {what}"
+            );
             sleep(ms(5)).await;
         }
     }
@@ -1824,7 +1833,7 @@ mod tests {
         let began = StdInstant::now();
         let (gap, conn) = longest_gap(async {
             let conn = Conn::spawn(fake.addr, tls, quick());
-            until("the flood to be written", || fake.flooded() >= FLOOD).await;
+            until_reached("the flood to be written", FLOOD, || fake.flooded()).await;
             conn
         })
         .await;

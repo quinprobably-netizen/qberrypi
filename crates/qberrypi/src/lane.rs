@@ -37,6 +37,10 @@ pub const LANE_NAME_BYTES: usize = 32;
 /// The names of the watched device that the feed keeps: the last two it asked.
 pub const WATCH_SLOTS: usize = 2;
 
+/// The bytes of a name of the watched device that its slot keeps: the longest a DNS name is, so that the
+/// device's screen has the whole name to open NAME with. Its row shows it cut as the lane's names are.
+pub const WATCH_NAME_BYTES: usize = qb_panel::os::world::NAME_BYTES_MAX;
+
 /// What `last_plain` holds before any plain name was sampled: no second a clock gives.
 const NO_SECOND: u64 = u64::MAX;
 
@@ -157,8 +161,11 @@ pub enum WatchedOutcome {
 /// A name that the watched device asked, taken from the feed for the panel's thread to show. Made
 /// only on the panel's side. It has no `Debug`: the name is the device's own business.
 pub struct WatchedName {
-    /// The name as the resolver recorded it, cut as a [`LaneName`] is.
+    /// The name as the resolver recorded it, cut as a [`LaneName`] is: what its row shows.
     pub name: String,
+    /// The name as the resolver recorded it, whole: what its row opens NAME with. `None` for a name longer
+    /// than [`WATCH_NAME_BYTES`], which is no DNS name and was not kept whole.
+    pub whole: Option<String>,
     /// How it was answered.
     pub outcome: WatchedOutcome,
 }
@@ -166,7 +173,7 @@ pub struct WatchedName {
 /// One name of the watched device in the ring: its bytes, in a slot of a fixed size.
 #[derive(Clone, Copy)]
 struct WatchSlot {
-    bytes: [u8; LANE_NAME_BYTES],
+    bytes: [u8; WATCH_NAME_BYTES],
     /// How many of `bytes` are the name's.
     len: u8,
     /// Whether the name was longer than the slot.
@@ -176,15 +183,16 @@ struct WatchSlot {
 
 impl WatchSlot {
     const EMPTY: Self = Self {
-        bytes: [0; LANE_NAME_BYTES],
+        bytes: [0; WATCH_NAME_BYTES],
         len: 0,
         cut: false,
         outcome: WatchedOutcome::Answered,
     };
 
-    /// The first [`LANE_NAME_BYTES`] bytes of `name`, less any part of a character at the end.
+    /// The first [`WATCH_NAME_BYTES`] bytes of `name`, less any part of a character at the end: a DNS name
+    /// whole.
     fn of(name: &str, outcome: WatchedOutcome) -> Self {
-        let mut end = name.len().min(LANE_NAME_BYTES);
+        let mut end = name.len().min(WATCH_NAME_BYTES);
         while !name.is_char_boundary(end) {
             end -= 1;
         }
@@ -192,7 +200,7 @@ impl WatchSlot {
         if let (Some(room), Some(kept)) = (slot.bytes.get_mut(..end), name.as_bytes().get(..end)) {
             room.copy_from_slice(kept);
         }
-        // At most `LANE_NAME_BYTES`, which is 32.
+        // At most `WATCH_NAME_BYTES`, which is 253.
         slot.len = u8::try_from(end).unwrap_or(u8::MAX);
         slot.cut = end < name.len();
         slot.outcome = outcome;
@@ -204,14 +212,22 @@ impl WatchSlot {
         self.bytes.get(..usize::from(self.len)).unwrap_or_default()
     }
 
-    /// The name for the panel's thread, which may allocate.
+    /// The name for the panel's thread, which may allocate: whole, and cut for its row as a [`LaneName`] is
+    /// (its first [`LANE_NAME_BYTES`] bytes at a character boundary, and a `~` after a name of wide characters
+    /// that this leaves shorter than that many characters).
     fn into_name(self) -> WatchedName {
-        let mut name = String::from_utf8_lossy(self.kept()).into_owned();
-        if self.cut && name.chars().count() < LANE_NAME_BYTES {
+        let kept = String::from_utf8_lossy(self.kept()).into_owned();
+        let mut end = kept.len().min(LANE_NAME_BYTES);
+        while !kept.is_char_boundary(end) {
+            end -= 1;
+        }
+        let mut name = kept.get(..end).unwrap_or_default().to_owned();
+        if (self.cut || end < kept.len()) && name.chars().count() < LANE_NAME_BYTES {
             name.push('~');
         }
         WatchedName {
             name,
+            whole: (!self.cut).then_some(kept),
             outcome: self.outcome,
         }
     }
@@ -711,7 +727,7 @@ mod tests {
         assert!(taken(&feed).is_empty());
     }
 
-    /// The names and outcomes of the watched device that the feed holds, newest first.
+    /// The names (as their rows show them) and outcomes of the watched device that the feed holds, newest first.
     fn watched(feed: &LaneFeed) -> Vec<(String, WatchedOutcome)> {
         let mut out = Vec::new();
         feed.watched_names(&mut out);
@@ -841,6 +857,49 @@ mod tests {
             format!("{}~", "\u{20ac}".repeat(10))
         );
         assert_eq!(out(&feed, &"\u{e9}".repeat(16)), "\u{e9}".repeat(16));
+    }
+
+    #[test]
+    fn a_watched_name_is_kept_whole_for_name_beside_what_its_row_shows() {
+        let feed = LaneFeed::new();
+        let whole = |feed: &LaneFeed, name: &str| -> (String, Option<String>) {
+            feed.watch_client(Some(Ipv4Addr::new(192, 0, 2, 7)));
+            feed.watch
+                .lock()
+                .unwrap()
+                .push(WatchSlot::of(name, WatchedOutcome::Refused));
+            let mut out = Vec::new();
+            feed.watched_names(&mut out);
+            let first = out.remove(0);
+            (first.name, first.whole)
+        };
+        // A short name is shown and kept as it is.
+        assert_eq!(
+            whole(&feed, "ads.example.org"),
+            (
+                "ads.example.org".to_owned(),
+                Some("ads.example.org".to_owned())
+            )
+        );
+        // A long one is shown cut at 32 bytes, as before, and kept whole: the longest DNS name too.
+        let long = format!("{}.example.org", "a".repeat(40));
+        assert_eq!(
+            whole(&feed, &long),
+            ("a".repeat(LANE_NAME_BYTES), Some(long.clone()))
+        );
+        let longest = "b".repeat(WATCH_NAME_BYTES);
+        assert_eq!(whole(&feed, &longest).1, Some(longest));
+        // One longer than any DNS name is shown cut and is not kept whole.
+        assert_eq!(
+            whole(&feed, &"c".repeat(WATCH_NAME_BYTES + 1)),
+            ("c".repeat(LANE_NAME_BYTES), None)
+        );
+        // Wide characters are cut at a boundary with their `~`, as the lane's are, and kept whole.
+        let wide = "\u{20ac}".repeat(12);
+        assert_eq!(
+            whole(&feed, &wide),
+            (format!("{}~", "\u{20ac}".repeat(10)), Some(wide.clone()))
+        );
     }
 
     #[test]

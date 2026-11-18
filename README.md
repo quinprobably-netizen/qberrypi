@@ -19,8 +19,11 @@ else, from joining your Wi-Fi to drawing the touchscreen.
 - **Touchscreen**: an optional 3.5-inch screen shows what's happening and lets you pause blocking,
   manage devices and see alerts without a computer.
 - **Hard to break**: updates install over the network into a spare slot, run on trial, and roll back
-  by themselves if anything goes wrong. Pulling the plug is always safe; it writes nothing to the
-  card while it runs.
+  by themselves if anything goes wrong. Your settings (ADS PASS devices, labels, your own allowed
+  and refused names, the PIN, the night hours) come back after a restart, even with your PC off.
+  Pulling the plug is still always safe: apart from updates (and a log, if you ask for one), the
+  only thing it writes while it runs is those settings, half a minute to a minute after you change
+  them, into one of two copies, so a cut mid-write leaves the other one whole.
 
 ## How fast
 

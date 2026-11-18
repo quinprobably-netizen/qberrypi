@@ -294,8 +294,8 @@ pub fn run(root: &Path, args: &ImageArgs, out: &mut dyn Write) -> Result<()> {
     let build = Build::read(&root.join(BOOT_FOLDER))?;
     let target = target_path(root, args)?;
 
-    let slot_a = build.slot_files(Slot::A, slot_config.as_bytes(), &tls_pem);
-    let slot_b = build.slot_files(Slot::B, slot_config.as_bytes(), &tls_pem);
+    let slot_a = build.slot_files(Slot::A, slot_config.as_bytes(), &tls_pem)?;
+    let slot_b = build.slot_files(Slot::B, slot_config.as_bytes(), &tls_pem)?;
     let files = card_files(&firmware, &slot_a, &slot_b, Slot::A)?;
     let image = sdimage::make(CARD_IMAGE_BYTES, &files)?;
     write_private_file(root, &target, &image)?;
@@ -495,6 +495,52 @@ mod tests {
                     (name.to_string(), bytes)
                 })
                 .collect();
+            assert_eq!(slot::boot_files_digest(&files).unwrap(), packed, "{slot}");
+        }
+    }
+
+    #[test]
+    fn a_configured_plate_resistance_is_on_both_slots_and_the_root_config_txt_with_the_packed_digest()
+     {
+        let (root, _) = ready();
+        fs::write(
+            root.path().join(slot::CONFIG_FILE),
+            format!("{}\n[panel]\ntouch_xohms = 40\n", api_config()),
+        )
+        .unwrap();
+        let bytes = |name: &str| name.as_bytes().to_vec();
+        let overlays: Vec<(&str, Vec<u8>)> = [
+            "ov-README",
+            "ov-overlay_map.dtb",
+            "ov-qb-piscreen.dtbo",
+            "ov-disable-bt.dtbo",
+        ]
+        .into_iter()
+        .map(|name| (name, bytes(name)))
+        .collect();
+        let packed = crate::build::boot_files_digest(
+            &bytes("kernel8.img"),
+            &bytes("bcm2710-rpi-3-b-plus.dtb"),
+            &overlays,
+        )
+        .unwrap();
+
+        image(root.path(), &default_args()).unwrap();
+
+        let mut card = Image::open(&default_image(&root)).unwrap();
+        let line = "dtoverlay=qb-piscreen,speed=16000000,rotate=270,xohms=40";
+        let root_config = String::from_utf8(card.read("config.txt").unwrap()).unwrap();
+        assert!(root_config.lines().any(|l| l == line), "{root_config}");
+        for slot in [Slot::A, Slot::B] {
+            let files: Vec<(String, Vec<u8>)> = SLOT_FILES
+                .iter()
+                .map(|name| {
+                    let bytes = card.read(&format!("{}/{name}", slot.dir())).unwrap();
+                    (name.to_string(), bytes)
+                })
+                .collect();
+            let config = files.iter().find(|(n, _)| n == "config.txt").unwrap();
+            assert_eq!(config.1, crate::build::slot_config_txt(slot, 40).as_bytes());
             assert_eq!(slot::boot_files_digest(&files).unwrap(), packed, "{slot}");
         }
     }
@@ -893,7 +939,7 @@ mod tests {
     fn a_slot_that_is_not_the_ten_files_of_a_slot_is_refused() {
         let (root, _) = ready();
         let build = Build::read(&root.path().join(BOOT_FOLDER)).unwrap();
-        let good = build.slot_files(Slot::A, b"", b"");
+        let good = build.slot_files(Slot::A, b"", b"").unwrap();
         let mut short = good.clone();
         short.pop();
         let mut swapped = good.clone();

@@ -23,7 +23,7 @@ use std::process::Command;
 use anyhow::{Context, Result, anyhow, bail};
 use qberrypi::lists::snapshot::{Header, SNAPSHOT_PATH};
 use qberrypi::modules::{DEFAULT_TABLE, MODULE_DIR, MODULE_LIST, ModuleTable};
-use qberrypi::slots::{self, Slot};
+use qberrypi::slots::{self, DEFAULT_TOUCH_XOHMS, Slot};
 use qberrypi::update::BOOT_FILES_PATH;
 use sha2::{Digest, Sha256};
 
@@ -38,7 +38,9 @@ pub const CMDLINE_TXT: &str = "console=tty1 panic=5 loglevel=4\n";
 /// The last four lines are the hardware's: the SPI bus, the prefix the
 /// firmware puts before an overlay's file name, the overlay that describes
 /// the touchscreen on the bus, with `rotate=270` for the way up the screen is
-/// mounted, and the overlay that disables the Bluetooth device-tree node
+/// mounted and the plate resistance its touch driver is told
+/// (`slots::DEFAULT_TOUCH_XOHMS`, which a slot's file replaces by the owner's
+/// `[panel] touch_xohms`), and the overlay that disables the Bluetooth device-tree node
 /// (`disable-bt`: on a Pi 3 B+ it also gives UART0 back to GPIO 14 and 15, which nothing here
 /// uses). With `os_prefix=qberrypi/` the firmware reads `qberrypi/ov-README`,
 /// `qberrypi/ov-qb-piscreen.dtbo` and `qberrypi/ov-disable-bt.dtbo`: qberrypi's
@@ -53,9 +55,17 @@ initramfs initramfs8 followkernel
 disable_overscan=1
 dtparam=spi=on
 overlay_prefix=ov-
-dtoverlay=qb-piscreen,speed=16000000,rotate=270
+dtoverlay=qb-piscreen,speed=16000000,rotate=270,xohms=25
 dtoverlay=disable-bt
 ";
+
+/// The touch screen's overlay line of `config.txt` up to its plate resistance, which comes last.
+const PISCREEN_LINE: &str = "dtoverlay=qb-piscreen,speed=16000000,rotate=270";
+
+/// The touch screen's overlay line of `config.txt` with the plate resistance `xohms`, and its line end.
+fn piscreen_line(xohms: u16) -> String {
+    format!("{PISCREEN_LINE},xohms={xohms}\n")
+}
 
 /// The lines that only a slot's `config.txt` has, for a faster boot. Each is in the official
 /// documentation of the Pi's firmware (`docs/bring-up/m8-only-os.md` has the source of each):
@@ -90,14 +100,23 @@ const SLOT_COMMENT: &str = "# qberrypi, two slots. A slot is selected by copying
 /// The firmware reads only the root `config.txt`, which is a copy of the selected slot's file
 /// (`slots::select`); this one is the record of the slot, which init checks before it copies it
 /// (`slots::check_slot_config`). Its overlay lines are [`CONFIG_TXT`]'s, so with `os_prefix` the
-/// firmware reads the slot's own `ov-` files. After [`CONFIG_TXT`]'s lines come the boot-speed
-/// lines that only a slot has ([`SLOT_BOOT_LINES`]); the old layout's text is left as it was.
-pub fn slot_config_txt(slot: Slot) -> String {
+/// firmware reads the slot's own `ov-` files, but the touch screen's tells its driver the plate
+/// resistance `touch_xohms`, the owner's `[panel] touch_xohms` (the caller's to have checked; the
+/// digest of the boot files refuses one out of `slots::TOUCH_XOHMS`, and takes any other as the
+/// default, so that it is no change of the boot files). After [`CONFIG_TXT`]'s lines come the
+/// boot-speed lines that only a slot has ([`SLOT_BOOT_LINES`]); the old layout's text is left as
+/// it was.
+pub fn slot_config_txt(slot: Slot, touch_xohms: u16) -> String {
     let (_comment, rest) = CONFIG_TXT
         .split_once('\n')
         .expect("CONFIG_TXT has a first line");
     let selects = format!("os_prefix={}", slot.os_prefix());
     let rest = rest.replacen("os_prefix=qberrypi/", &selects, 1);
+    let rest = rest.replacen(
+        &piscreen_line(DEFAULT_TOUCH_XOHMS),
+        &piscreen_line(touch_xohms),
+        1,
+    );
     format!("{SLOT_COMMENT}\n{rest}{SLOT_BOOT_LINES}")
 }
 
@@ -338,13 +357,15 @@ pub struct ExtractedFiles {
 /// The digest of the boot files of a build, as the running build reports it and the update
 /// receiver compares it (`slots::boot_files_digest`): the kernel, the device tree and the four
 /// overlay files as they are, and `config.txt` and `cmdline.txt` in their slot a forms, which
-/// `slot_config_txt` and `slot_cmdline_txt` make. The slot b forms give the same digest.
+/// `slot_config_txt` and `slot_cmdline_txt` make. The slot b forms give the same digest, and so
+/// does a slot's `config.txt` with any plate resistance the configuration takes: the build knows
+/// no `qberrypi.toml`, so it packs the digest with the default.
 pub fn boot_files_digest(
     kernel: &[u8],
     dtb: &[u8],
     overlays: &[(&str, Vec<u8>)],
 ) -> Result<String> {
-    let config = slot_config_txt(Slot::A);
+    let config = slot_config_txt(Slot::A, DEFAULT_TOUCH_XOHMS);
     let cmdline = slot_cmdline_txt(Slot::A);
     let mut entries: Vec<(&str, &[u8])> = vec![
         (KERNEL, kernel),
@@ -822,7 +843,7 @@ mod tests {
             CONFIG_TXT.lines().rev().take(4).collect::<Vec<_>>(),
             [
                 "dtoverlay=disable-bt",
-                "dtoverlay=qb-piscreen,speed=16000000,rotate=270",
+                "dtoverlay=qb-piscreen,speed=16000000,rotate=270,xohms=25",
                 "overlay_prefix=ov-",
                 "dtparam=spi=on"
             ]
@@ -834,7 +855,7 @@ mod tests {
                 .filter(|l| l.starts_with("dtoverlay="))
                 .collect::<Vec<_>>(),
             [
-                "dtoverlay=qb-piscreen,speed=16000000,rotate=270",
+                "dtoverlay=qb-piscreen,speed=16000000,rotate=270,xohms=25",
                 "dtoverlay=disable-bt"
             ]
         );
@@ -859,8 +880,14 @@ mod tests {
              disable_overscan=1\n\
              dtparam=spi=on\n\
              overlay_prefix=ov-\n\
-             dtoverlay=qb-piscreen,speed=16000000,rotate=270\n\
+             dtoverlay=qb-piscreen,speed=16000000,rotate=270,xohms=25\n\
              dtoverlay=disable-bt\n"
+        );
+        assert_eq!(
+            CONFIG_TXT
+                .matches(&piscreen_line(DEFAULT_TOUCH_XOHMS))
+                .count(),
+            1
         );
         assert_eq!(CMDLINE_TXT, "console=tty1 panic=5 loglevel=4\n");
     }
@@ -868,7 +895,7 @@ mod tests {
     #[test]
     fn a_slots_config_txt_is_the_shipped_one_with_its_own_prefix_and_a_line_about_slots() {
         for slot in [Slot::A, Slot::B] {
-            let text = slot_config_txt(slot);
+            let text = slot_config_txt(slot, DEFAULT_TOUCH_XOHMS);
             // It passes the check that init makes before it copies the file over the root one.
             assert_eq!(slots::check_slot_config(text.as_bytes(), slot), Ok(()));
             assert_eq!(slots::selected_slot(text.as_bytes()), Ok(slot));
@@ -899,11 +926,43 @@ mod tests {
         }
         // The two slots' files differ in the value of the prefix alone.
         assert_eq!(
-            slot_config_txt(Slot::A).replace("os_prefix=qberrypi-a/", "os_prefix=qberrypi-b/"),
-            slot_config_txt(Slot::B)
+            slot_config_txt(Slot::A, DEFAULT_TOUCH_XOHMS)
+                .replace("os_prefix=qberrypi-a/", "os_prefix=qberrypi-b/"),
+            slot_config_txt(Slot::B, DEFAULT_TOUCH_XOHMS)
         );
         // The shipped text of the old layout is untouched.
         assert!(CONFIG_TXT.lines().any(|l| l == "os_prefix=qberrypi/"));
+    }
+
+    #[test]
+    fn a_slots_config_txt_tells_the_touch_driver_the_configured_plate_resistance_and_nothing_else_changes()
+     {
+        for slot in [Slot::A, Slot::B] {
+            let default = slot_config_txt(slot, DEFAULT_TOUCH_XOHMS);
+            for ohms in [10, 40, 100, 1000] {
+                let text = slot_config_txt(slot, ohms);
+                let line = format!("dtoverlay=qb-piscreen,speed=16000000,rotate=270,xohms={ohms}");
+                assert_eq!(
+                    text.lines()
+                        .filter(|l| l.starts_with("dtoverlay=qb-piscreen"))
+                        .collect::<Vec<_>>(),
+                    [line.as_str()]
+                );
+                assert_eq!(
+                    text.replace(
+                        &line,
+                        "dtoverlay=qb-piscreen,speed=16000000,rotate=270,xohms=25"
+                    ),
+                    default
+                );
+                assert_eq!(slots::check_slot_config(text.as_bytes(), slot), Ok(()));
+                // The digest takes it as the default's: no change of the boot files.
+                assert_eq!(
+                    slots::slot_a_form("config.txt", text.as_bytes()).unwrap(),
+                    slots::slot_a_form("config.txt", default.as_bytes()).unwrap()
+                );
+            }
+        }
     }
 
     #[test]
@@ -920,7 +979,7 @@ mod tests {
             ]
         );
         for slot in [Slot::A, Slot::B] {
-            let text = slot_config_txt(slot);
+            let text = slot_config_txt(slot, DEFAULT_TOUCH_XOHMS);
             for line in SLOT_BOOT_LINES.lines() {
                 assert_eq!(text.lines().filter(|l| *l == line).count(), 1, "{line}");
                 assert!(!CONFIG_TXT.lines().any(|l| l == line), "{line}");
@@ -932,7 +991,7 @@ mod tests {
                 "kernel=kernel8.img",
                 "initramfs initramfs8 followkernel",
                 "dtparam=spi=on",
-                "dtoverlay=qb-piscreen,speed=16000000,rotate=270",
+                "dtoverlay=qb-piscreen,speed=16000000,rotate=270,xohms=25",
                 "dtoverlay=disable-bt",
             ] {
                 assert!(text.lines().any(|l| l == line), "{line}");
@@ -977,7 +1036,10 @@ mod tests {
     /// What the digest of the boot files of the fixture is, from the files of `slot` as a slot
     /// image holds them.
     fn digest_of_slot(extracted: &ExtractedFiles, slot: Slot) -> String {
-        let (config, cmdline) = (slot_config_txt(slot), slot_cmdline_txt(slot));
+        let (config, cmdline) = (
+            slot_config_txt(slot, DEFAULT_TOUCH_XOHMS),
+            slot_cmdline_txt(slot),
+        );
         let mut entries: Vec<(&str, &[u8])> = vec![
             (KERNEL, &extracted.kernel),
             (DEVICE_TREE, &extracted.dtb),

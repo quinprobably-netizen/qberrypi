@@ -8,7 +8,7 @@
 //!   right. The first empty place says `NEW ONES` and what a newcomer gets. With more than twelve devices
 //!   the wall pages: eleven to a page and a twelfth place, `MORE · n`, that turns the page.
 //! - **DEVICE** is its name, the last two names it asked (while the screen is open, spec §6.2), its state as
-//!   the floor's left key and its own gate as the right one. A name row opens NAME, which is P2's.
+//!   the floor's left key and its own gate as the right one. A name row opens NAME, by the name's whole text.
 //! - **CONFIRM** is the slab drawn as the state the device would take, over `KEEP …` and the change.
 //! - **ITS GATE** is the slab `OPEN ITS GATE` over GATE's four keys.
 //!
@@ -472,16 +472,29 @@ impl DeviceView {
     }
 }
 
+/// The watched name a press at row `y` is on: the rows from `NAME_ROW_Y0`, `NAME_ROW_PITCH` apart, over the
+/// floor; `None` above them, on the floor, or on a row that holds no name.
+fn name_row_hit(held: usize, y: u16) -> Option<usize> {
+    if y >= FLOOR_Y {
+        return None;
+    }
+    let k = usize::from(y.checked_sub(NAME_ROW_Y0)? / NAME_ROW_PITCH);
+    (k < MAX_WATCHED && k < held).then_some(k)
+}
+
 /// DEVICE's taps: the floor's left key, the device's state, opens CONFIRM (inert for a device the
 /// configuration decides and for the router and the Pi); the right key, its own gate, opens ITS GATE when
 /// ads are blocked and shuts the gate when it is open; it is inert for what the left key is inert for, as the
-/// Pi refuses every gate edit of those. A name row would open NAME, which is P2's.
+/// Pi refuses every gate edit of those. A name row opens NAME with the name's whole text, as a pipe of NAMES
+/// does; a row whose whole name is not known, and the waiting line, are no door.
 pub fn device_tap(world: &World, mac: Mac, x: u16, y: u16) -> Tap {
     let Some(row) = world.device(&mac) else {
         return Tap::None;
     };
     if y < FLOOR_Y {
-        return Tap::None;
+        return name_row_hit(world.watched.len(), y)
+            .and_then(|k| world.watched.get(k)?.whole.clone())
+            .map_or(Tap::None, |name| Tap::Nav(Change::Open(Screen::Name(name))));
     }
     if x < FLOOR_SPLIT_X {
         return flip_target(row).map_or(Tap::None, |pass| {
@@ -1517,9 +1530,53 @@ mod tests {
         );
         assert_eq!(press(Still::Device, 400, 280), open(Screen::ItsGate(tv)));
         assert_eq!(press(Still::Device, 240, 236), open(Screen::ItsGate(tv)));
-        // Above the floor are the slab's name rows, which open NAME in P2: nothing in P1.
-        for y in [100, 150, 200, 235] {
-            assert_eq!(press(Still::Device, 100, y), Tap::None, "y {y}");
+        // Above the floor are the rows of the names it asked, which open NAME: see their own test.
+        assert_eq!(
+            press(Still::Device, 100, 100),
+            Tap::None,
+            "its own name is no door"
+        );
+    }
+
+    #[test]
+    fn a_name_row_opens_name_with_the_whole_name_and_the_waiting_line_is_no_door() {
+        // The TV's screen has two names: rows 132 to 183 and 184 to 235, each the whole width.
+        let name = |text: &str| Tap::Nav(Change::Open(Screen::Name(text.to_owned())));
+        for (x, y) in [(0, 132), (100, 150), (479, 183)] {
+            assert_eq!(
+                press(Still::Device, x, y),
+                name("googlesyndication.com"),
+                "{x},{y}"
+            );
+        }
+        for (x, y) in [(0, 184), (300, 210), (479, 235)] {
+            assert_eq!(press(Still::Device, x, y), name("i.ytimg.com"), "{x},{y}");
+        }
+        assert_eq!(press(Still::Device, 100, 131), Tap::None, "above the rows");
+
+        // The row opens NAME with the whole name, not the one fitted to the row.
+        let mut w = world(Still::Device);
+        let long = "a.very.long.host.name.of.a.tracker.example.org";
+        w.watched[0] = WatchedName::new(long, Outcome::Refused);
+        assert_eq!(w.watched[0].name, "a.tracker.example.org");
+        let nav = Still::Device.nav(&w);
+        assert_eq!(crate::os::nav::decide(&nav, &w, 100, 150), name(long));
+        // A row whose whole name is not known is no door.
+        w.watched[0].whole = None;
+        assert_eq!(crate::os::nav::decide(&nav, &w, 100, 150), Tap::None);
+
+        // One name: its row is a door, and the waiting line under it is not.
+        w.watched.truncate(1);
+        w.watched[0] = WatchedName::new("one.example.org", Outcome::Answered);
+        assert_eq!(
+            crate::os::nav::decide(&nav, &w, 100, 150),
+            name("one.example.org")
+        );
+        assert_eq!(crate::os::nav::decide(&nav, &w, 100, 200), Tap::None);
+        // No names: nothing above the floor is a door.
+        w.watched.clear();
+        for y in [132, 150, 200, 235] {
+            assert_eq!(crate::os::nav::decide(&nav, &w, 100, y), Tap::None, "y {y}");
         }
     }
 

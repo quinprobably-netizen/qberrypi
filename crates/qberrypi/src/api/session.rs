@@ -34,6 +34,7 @@ use std::fmt;
 use std::net::Ipv4Addr;
 
 use subtle::{Choice, ConditionallySelectable, ConstantTimeEq};
+use zeroize::{Zeroize, Zeroizing};
 
 use super::hex;
 
@@ -82,9 +83,28 @@ impl Held {
 }
 
 /// The open sessions, at most [`MAX_SESSIONS`]. `Debug` shows how many, never a sid.
-#[derive(Default)]
 pub struct Sessions {
     held: Vec<Held>,
+}
+
+impl Default for Sessions {
+    /// No sessions, in a table with room for [`MAX_SESSIONS`], which is all it ever holds, so that
+    /// it is never moved to a larger one. The room is written, so that every byte of it is known.
+    fn default() -> Self {
+        let mut sessions = Self {
+            held: Vec::with_capacity(MAX_SESSIONS),
+        };
+        sessions.scrub_spare();
+        sessions
+    }
+}
+
+impl Drop for Sessions {
+    fn drop(&mut self) {
+        for held in &mut self.held {
+            held.sid.zeroize();
+        }
+    }
 }
 
 impl Sessions {
@@ -94,8 +114,11 @@ impl Sessions {
     /// Expired sessions are dropped first. If [`MAX_SESSIONS`] are still held, the least recently
     /// used one is ended to make room. If `random` is the sid of a session already held, which
     /// random bytes do not do, that session is renewed instead of a second one held.
-    pub fn open(&mut self, random: [u8; SID_LEN], mono_secs: u64) -> String {
+    pub fn open(&mut self, mut random: [u8; SID_LEN], mono_secs: u64) -> String {
         self.held.retain(|held| !held.expired(mono_secs));
+        // `retain` moves the sessions that stay down over those that go, and leaves the places
+        // it moved them from as they were.
+        self.scrub_spare();
         if let Some(held) = self.find(&random).and_then(|at| self.held.get_mut(at)) {
             held.last_used = mono_secs;
         } else {
@@ -107,7 +130,7 @@ impl Sessions {
                     .min_by_key(|(_, held)| held.last_used)
                     .map(|(at, _)| at);
                 if let Some(at) = oldest {
-                    self.held.remove(at);
+                    self.end(at);
                 }
             }
             self.held.push(Held {
@@ -115,7 +138,9 @@ impl Sessions {
                 last_used: mono_secs,
             });
         }
-        hex::encode(&random)
+        let sid = hex::encode(&random);
+        random.zeroize();
+        sid
     }
 
     /// Uses the session `sid` at `mono_secs`: if it is valid, its last use becomes `mono_secs`
@@ -123,10 +148,11 @@ impl Sessions {
     /// 32 lower-case hex digits, names no session, or names one that has expired, which is
     /// dropped.
     pub fn touch(&mut self, sid: &str, mono_secs: u64) -> Option<u64> {
-        let at = self.find(&hex::decode(sid)?)?;
+        let wanted = Zeroizing::new(hex::decode::<SID_LEN>(sid)?);
+        let at = self.find(&wanted)?;
         let held = self.held.get_mut(at)?;
         if held.expired(mono_secs) {
-            self.held.remove(at);
+            self.end(at);
             return None;
         }
         held.last_used = mono_secs;
@@ -136,15 +162,41 @@ impl Sessions {
     /// Ends the session `sid`; true only if it was valid at `mono_secs`. An expired session is
     /// dropped, and answers false like one that was never there.
     pub fn close(&mut self, sid: &str, mono_secs: u64) -> bool {
-        let Some(at) = hex::decode(sid).and_then(|sid| self.find(&sid)) else {
+        let Some(at) = hex::decode::<SID_LEN>(sid)
+            .map(Zeroizing::new)
+            .and_then(|wanted| self.find(&wanted))
+        else {
             return false;
         };
         let valid = self
             .held
             .get(at)
             .is_some_and(|held| !held.expired(mono_secs));
-        self.held.remove(at);
+        self.end(at);
         valid
+    }
+
+    /// Ends the session at `at`, wiping its sid where it lies; the others keep their order.
+    ///
+    /// `Vec::remove` would shift the later sessions down and leave a copy of the last one's sid
+    /// past the end of the table, where nothing would ever wipe it. So the ended session is
+    /// rotated to the end, wiped there, and popped.
+    fn end(&mut self, at: usize) {
+        let Some(tail) = self.held.get_mut(at..).filter(|tail| !tail.is_empty()) else {
+            return;
+        };
+        tail.rotate_left(1);
+        if let Some(ended) = self.held.last_mut() {
+            ended.sid.zeroize();
+        }
+        self.held.pop();
+    }
+
+    /// Overwrites the room of the table that no session uses with zeros: what a session that was
+    /// moved, or dropped in place, left there is a stale copy of its sid.
+    fn scrub_spare(&mut self) {
+        // Volatile, as every other wipe here: plain writes to room nothing reads may be left out.
+        self.held.spare_capacity_mut().zeroize();
     }
 
     /// The number of sessions held. That includes expired ones that no `open`, `touch` or
@@ -348,6 +400,61 @@ mod tests {
         s.open([99; 16], 21);
         assert_eq!(s.len(), MAX_SESSIONS);
         assert!(s.touch(&sids[0], 22).is_some() && s.touch(&sids[1], 22).is_none());
+    }
+
+    /// Every byte of the table's allocation, the room beyond its sessions included.
+    fn allocation(s: &Sessions) -> Vec<u8> {
+        let bytes = s.held.capacity() * std::mem::size_of::<Held>();
+        // SAFETY: the table is made whole (`scrub_spare`) and kept so, and a `Held` is a 16-byte
+        // array and a `u64` with no padding, so each of the `bytes` bytes is initialised.
+        unsafe { std::slice::from_raw_parts(s.held.as_ptr().cast::<u8>(), bytes) }.to_vec()
+    }
+
+    /// How many times the sid `[n; 16]` is in the table's allocation, side by side ones not
+    /// counted twice (the byte that follows a sid, a time of `n`, would make a second).
+    fn copies(s: &Sessions, n: u8) -> usize {
+        let bytes = allocation(s);
+        let (mut found, mut at) = (0, 0);
+        while let Some(window) = bytes.get(at..at + SID_LEN) {
+            if window.iter().all(|&byte| byte == n) {
+                found += 1;
+                at += SID_LEN;
+            } else {
+                at += 1;
+            }
+        }
+        found
+    }
+
+    #[test]
+    fn a_session_that_ends_leaves_no_copy_of_its_sid_and_no_stale_copy_of_another() {
+        let mut s = Sessions::default();
+        // The sids are one byte repeated, and the times keep each below its successor's.
+        let sids: Vec<String> = (1..=16u8).map(|n| s.open([n; 16], u64::from(n))).collect();
+        let held = |s: &Sessions, n: u8| copies(s, n);
+        assert!((1..=16).all(|n| held(&s, n) == 1));
+
+        // Closed from the middle: the sessions after it move down.
+        assert!(s.close(&sids[4], 20));
+        assert_eq!((held(&s, 5), held(&s, 16)), (0, 1));
+        // Closed from the end, and from the start.
+        assert!(s.close(&sids[15], 20) && s.close(&sids[0], 20));
+        assert_eq!((held(&s, 16), held(&s, 1), held(&s, 2)), (0, 0, 1));
+
+        // Ended for room: 13 are held, and four more make a 17th, which ends the oldest.
+        for (n, at) in [(20, 30), (21, 30), (22, 1_000), (23, 1_000)] {
+            s.open([n; 16], at);
+        }
+        assert_eq!((s.len(), held(&s, 2), held(&s, 3)), (MAX_SESSIONS, 0, 1));
+        // An opening at 1,830 drops those last used at 30 or before, and the others move down.
+        s.open([24; 16], 30 + SESSION_SECS);
+        let alive: Vec<u8> = (1..=24).filter(|&n| held(&s, n) > 0).collect();
+        assert_eq!(alive, [22, 23, 24]);
+        assert!(alive.iter().all(|&n| held(&s, n) == 1));
+        // A session that is used when it has expired is dropped by the use.
+        let late = hex::encode(&[22; 16]);
+        assert_eq!(s.touch(&late, 1_000 + SESSION_SECS), None);
+        assert_eq!((s.len(), held(&s, 22), held(&s, 23)), (2, 0, 1));
     }
 
     #[test]

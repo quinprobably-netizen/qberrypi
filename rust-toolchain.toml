@@ -1,3 +1,7 @@
+# The release this tree builds with, here and in CI (.github/workflows/ci.yml): a pinned release, so
+# that a new stable's lints cannot turn CI red on their own. Move it on in a commit of its own, with
+# `cargo clippy --workspace --all-targets -- -D warnings` and the tests green on the new one.
 [toolchain]
-channel = "stable"
+channel = "1.99.1"
+components = ["rustfmt", "clippy"]
 targets = ["aarch64-unknown-linux-musl"]

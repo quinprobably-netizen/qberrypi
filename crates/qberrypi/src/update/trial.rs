@@ -511,8 +511,8 @@ async fn give_up(ctl: &Arc<UpdateCtl>, from: Slot, build: u64, reason: String) -
 mod tests {
     use super::*;
 
+    use std::sync::Mutex;
     use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-    use std::sync::{Mutex, PoisonError};
     use std::thread::{self, ThreadId};
     use std::time::Duration;
 
@@ -523,15 +523,12 @@ mod tests {
     use crate::dns::testutil::{Reply, ip, ms, one};
     use crate::slots::{Marker, Mode};
 
-    /// Builds that no other test uses, so that a test finds its own lines in the shared log.
+    /// The build the tests run as.
     const BUILD: u64 = 1_794_470_001;
 
-    /// The log buffer every test of this binary shares; see `fault::tests`.
+    /// Everything the test's own log holds; see `fault::tests`.
     fn log_text() -> String {
-        crate::logbuf::install(Box::new(io::sink()))
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .text()
+        crate::logbuf::testlog::text()
     }
 
     /// The health that a test sets by hand: the three inputs, and what a self-query comes to.
@@ -701,7 +698,7 @@ mod tests {
 
     /// Starts the trial's `run`, and gives the task.
     fn start(ctl: &Arc<UpdateCtl>, health: &Arc<Fake>, settings: Settings) -> JoinHandle<Ended> {
-        crate::logbuf::install(Box::new(io::sink()));
+        crate::logbuf::testlog::start();
         let health: Arc<dyn Health> = health.clone();
         tokio::spawn(run(ctl.clone(), health, settings))
     }

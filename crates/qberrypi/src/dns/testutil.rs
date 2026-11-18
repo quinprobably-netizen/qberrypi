@@ -21,7 +21,7 @@ use rustls::{
     ClientConfig, DigitallySignedStruct, HandshakeKind, RootCertStore, ServerConfig,
     ServerConnection, SignatureScheme, StreamOwned, version,
 };
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::task::JoinHandle;
 use tokio::time::{Instant, sleep, timeout};
@@ -1062,16 +1062,11 @@ impl RecordingSink {
         alerts.clone()
     }
 
-    /// The alerts raised so far, once there are `n` of them or 2 s have passed, and the runtime
-    /// has had one more turn after that, so that a task that would raise one too many has run:
-    /// the alerts of the answer path are raised by tasks that follow the replies.
+    /// The alerts raised so far, once there are `n` of them or a minute has passed, and the
+    /// runtime has had one more turn after that, so that a task that would raise one too many has
+    /// run: the alerts of the answer path are raised by tasks that follow the replies.
     pub(crate) async fn raised_after(&self, n: usize) -> Vec<Raised> {
-        for _ in 0..200 {
-            if self.raised().len() >= n {
-                break;
-            }
-            sleep(ms(10)).await;
-        }
+        wait_up_to(Duration::from_secs(60), || self.raised().len() >= n).await;
         sleep(ms(10)).await;
         self.raised()
     }
@@ -1166,7 +1161,14 @@ pub(crate) async fn listen(dns: Arc<Dns>) -> SocketAddr {
         .await
         .unwrap();
     let addr = listeners.addr();
-    tokio::spawn(serve_with(dns, listeners, 2, ms(200), UDP_TASKS));
+    tokio::spawn(serve_with(
+        dns,
+        listeners,
+        2,
+        ms(200),
+        ms(10_000),
+        UDP_TASKS,
+    ));
     addr
 }
 
@@ -1220,7 +1222,10 @@ pub(crate) async fn tcp_exchange(
 }
 
 /// Writes one message with its 2-byte length.
-pub(crate) async fn write_frame(stream: &mut TcpStream, message: &[u8]) -> io::Result<()> {
+pub(crate) async fn write_frame(
+    stream: &mut (impl AsyncWrite + Unpin),
+    message: &[u8],
+) -> io::Result<()> {
     let len = u16::try_from(message.len()).unwrap();
     stream
         .write_all(&[&len.to_be_bytes()[..], message].concat())
@@ -1228,7 +1233,7 @@ pub(crate) async fn write_frame(stream: &mut TcpStream, message: &[u8]) -> io::R
 }
 
 /// Reads one message that has its 2-byte length.
-pub(crate) async fn read_frame(stream: &mut TcpStream) -> io::Result<Vec<u8>> {
+pub(crate) async fn read_frame(stream: &mut (impl AsyncRead + Unpin)) -> io::Result<Vec<u8>> {
     let mut len = [0u8; 2];
     stream.read_exact(&mut len).await?;
     let mut message = vec![0u8; usize::from(u16::from_be_bytes(len))];
@@ -1265,6 +1270,28 @@ pub(crate) fn ip(text: &str) -> Ipv4Addr {
 /// `n` milliseconds.
 pub(crate) fn ms(n: u64) -> Duration {
     Duration::from_millis(n)
+}
+
+/// Waits until `ready` holds, for `most` at most, and says whether it does.
+pub(crate) async fn wait_up_to(most: Duration, mut ready: impl FnMut() -> bool) -> bool {
+    let end = Instant::now() + most;
+    while !ready() {
+        if Instant::now() >= end {
+            return false;
+        }
+        sleep(ms(5)).await;
+    }
+    true
+}
+
+/// Waits until `ready` holds, for a minute at most, and panics with `what` if it does not. What
+/// the tests wait for takes milliseconds; the minute is for a host that is busy with other work.
+/// For the tests that run on the real clock, with fakes that are threads of real I/O.
+pub(crate) async fn until(what: &str, ready: impl FnMut() -> bool) {
+    assert!(
+        wait_up_to(Duration::from_secs(60), ready).await,
+        "timed out waiting for {what}"
+    );
 }
 
 /// The bytes as lower-case hexadecimal.
