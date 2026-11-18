@@ -1,7 +1,9 @@
 # Checks every push to main and every pull request against it: formatting, clippy with warnings
-# as errors, and the test suite, on the host. Tests that need root, network namespaces,
-# mac80211_hwsim, QEMU or the board are #[ignore]d and do not run here; nothing reads a
-# qberrypi.toml, and the only network used is crates.io and the toolchain download.
+# as errors, and the test suite, on the host. Tests that need root, mac80211_hwsim, QEMU or the
+# board are #[ignore]d and do not run here; nothing reads a qberrypi.toml, and the only network
+# used is crates.io and the toolchain download. The tests that change links, addresses and routes
+# run, each in an unprivileged user and network namespace of its own (crates/qberrypi/src/testns.rs),
+# which the runner's Ubuntu refuses until AppArmor's restriction is lifted.
 #
 # A second job builds the PID 1 binary for the Pi (aarch64-unknown-linux-musl, release), which is
 # pure Rust linked by rust-lld from the toolchain: no cross compiler and no download beyond the
@@ -57,7 +59,19 @@ jobs:
       - name: cargo clippy
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
+      # Ubuntu 24.04 lets an unprivileged process make a user namespace but, through AppArmor,
+      # gives it no capabilities in it, so `unshare --map-root-user` cannot write its uid_map.
+      # The setting lasts until the runner is gone; it makes the namespace tests run, not pass.
+      - name: Allow unprivileged user namespaces
+        run: |
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          unshare --user --map-root-user --net -- true
+
+      # QBERRYPI_REQUIRE_NAMESPACES: a namespace test fails here instead of skipping itself, as it
+      # does on a machine that refuses the namespace, so that a runner without them cannot pass.
       - name: cargo test
+        env:
+          QBERRYPI_REQUIRE_NAMESPACES: "1"
         run: cargo test --workspace --locked
 
   pi-binary:
